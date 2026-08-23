@@ -1,107 +1,113 @@
-# Build status — 2026-08-23
+# Build status — 2026-08-23 (session 2)
 
-Honest account of what exists after the first autonomous build session.
-The full spec is in [plan.md](plan.md); this file tracks reality against it.
+Honest account of what exists. The spec is in [plan.md](plan.md); this tracks reality against it.
 
-**Bottom line: this is a working foundation, not a finished app.** The plan describes 15 phases.
-Roughly phases 0–3 are implemented and verified, phase 11 (agent core) is implemented but
-unverified end-to-end, and phases 4–10 and 12–15 are not built. It compiles, builds, and the
-core engine is tested — but it cannot yet run a model, because no llama.cpp binary is bundled.
+**Every phase in the plan now has an implementation.** What that does *not* mean is that
+everything has been run: no llama.cpp binary has been executed, because `vendor/` is empty on this
+machine and the download is ~1.5 GB. So the code paths that require a live model — loading,
+generation, the agent loop end to end, RAG embedding, multimodal — are **written and typechecked
+but never executed**. Treat that as the headline caveat.
 
----
+## Verified
 
-## Verified working
+- `npm run typecheck` — clean on both tsconfigs.
+- `npm run build` — main, preload and renderer all bundle.
+- `npm test` — **78 assertions, 78 passing**, covering the auto-fit engine, GBNF compiler,
+  permission engine and hard-block list, the GGUF parser (against a synthesised GGUF file), and
+  quant recommendation.
 
-Both TypeScript projects typecheck clean and `electron-vite build` succeeds.
-`node scripts/smoke.mjs` runs 16 assertions against the auto-fit engine and GBNF compiler —
-**16 passed, 0 failed**.
-
-| Area | State | Notes |
-|------|-------|-------|
-| **Project scaffold** | Done | Electron + Vite + React 18 + TypeScript, strict mode, path aliases, electron-builder config pending. |
-| **GGUF parser** (`src/main/models/gguf.ts`) | Done, untested on real files | Full metadata + tensor directory parse via a sliding-window reader, so a 40 GB model costs a few MB of reads. Huge arrays (`tokenizer.ggml.tokens`) are walked and discarded. Layer vs non-layer weight split computed for the fit engine. **Not yet run against an actual .gguf** — no model file was available. |
-| **Hardware detection** (`src/main/hardware/gpu.ts`) | Done | nvidia-smi for exact free/total VRAM; WMI + display-class registry `qwMemorySize` as the vendor-neutral fallback (avoids the 4 GB `AdapterRAM` uint32 lie). Every device carries `freeIsMeasured`. |
-| **Auto-fit engine** (`src/main/autofit/engine.ts`) | Done, unit-tested | See below. |
-| **Model library** (`src/main/models/library.ts`) | Done | Scan, parse, cache by size+mtime, capability detection from mmproj metadata, auto-tags, disk usage. |
-| **Relocation** (`src/main/models/relocation.ts`) | Done, untested | Breadcrumb comparison, same-volume rename fast path, cross-volume copy with progress/cancel, size verification before the source is removed. |
-| **Permission engine** (`src/main/agent/permissions.ts`) | Done | Tiered auto-approve, remembered rules per folder, hard-block list, path canonicalisation so prompts show real targets. |
-| **GBNF compiler** (`src/main/agent/gbnf.ts`) | Done, unit-tested | JSON Schema → GBNF, one branch per tool with the name pinned as a literal. |
-| **Agent tools** | Done, untested | 20 tools: 10 filesystem, 7 exec, 3 web. |
-| **Agent loop** (`src/main/agent/loop.ts`) | Done, untested | Tool-call parse, authorise, checkpoint, execute, feed result back. Plan mode narrows the catalog to read-tier. |
-| **Checkpoints** (`src/main/agent/checkpoints.ts`) | Done, untested | Snapshot-before-write, rewind restores files and deletes ones the agent created. |
-| **llama-server supervision** | Written, unrunnable | Spawn/health-poll/unload and SSE streaming client are complete; needs the binary. |
-| **UI** | Minimal but real | Dashboard (live hardware meters), Models (fit plans + compatibility badges), Agent (collapsed tool cards, streaming), Settings. Permission modal wired end-to-end. |
-
-### What the smoke tests actually prove
+What the tests actually prove:
 
 ```
-KV cache maths ......... closed-form match at 128K q8_0; q4_0 ≈ half
-P1 free-vs-total VRAM .. 24 GB card with 6 GB free does NOT get a full-GPU plan
-P2 multi-GPU split ..... 24 GB + 8 GB pair splits 78/22, not 50/50
-never degrade silently . cramped 12 GB card returns needsUserChoice + real alternatives
-unmeasured VRAM ........ AMD path notes the estimate rather than pretending
-KV floor ............... never goes below q4_0
-P4 KV reservation ...... plan.kvBytes equals full-context KV, so no mid-chat OOM
-GBNF ................... root rule, literal tool names, both branches, primitives
+KV maths ............... closed-form match; linear in context; q4 ≈ 53% of q8
+flash attention ........ no-FA attention buffer is >10x larger at 128K (why FA defaults on)
+P1 free-vs-total ....... 24 GB card with 6 GB free gets no full-GPU plan
+P2 multi-GPU ........... 24+8 GB splits 78/22; three-way split is proportional
+P4 KV reservation ...... plan.kvBytes equals the whole configured context
+never degrades ......... cramped card returns needsUserChoice + rationale-carrying options
+overrides .............. kv type, batch, flash-attn and context overrides all survive planning
+trained ceiling ........ never plans past the model's trained context, and says why
+verification ........... over/under-prediction both flagged; silence when close
+GBNF ................... literal tool names, one branch per tool, required vs optional correct
+hard blocks ............ 7 destructive commands blocked, 5 lookalikes allowed
+                         (`rm -rf /` blocked, `rm -rf ./node_modules` allowed)
+permission tiers ....... reads silent, writes prompt, allow-tool remembered, denial explained
+prompts ................ relative paths resolved before display
+GGUF ................... real parse of a synthesised file: header, kv, elided arrays, tensors,
+                         head_dim derivation, per-layer vs non-layer weight split
+recommendation ......... picks best quant that fits, steps down on smaller cards, never an mmproj
 ```
 
-A design consequence worth recording: **flash attention defaults on**, because without it the
-attention buffer is `batch x context x heads x 2` — over 4 GB at 128K context on a 32-head model.
-At the context targets in the plan, FA is not an optimisation, it is a precondition.
+## Implemented
 
----
+| Area | Module | Notes |
+|---|---|---|
+| GGUF parsing | `models/gguf.ts` | Sliding-window reads; a 40 GB model costs a few MB. Tested against a synthesised file, **not a real one**. |
+| Hardware detection | `hardware/gpu.ts` | nvidia-smi for true free VRAM; registry `qwMemorySize` fallback avoids the 4 GB `AdapterRAM` uint32 lie. |
+| Auto-fit | `autofit/engine.ts` | Fully tested. Includes post-load verification that feeds back into the headroom margin. |
+| Model library | `models/library.ts` | Scan, cache by size+mtime, capability detection from mmproj, auto-tags, disk usage. |
+| Relocation | `models/relocation.ts` | Same-volume rename fast path; cross-volume copy with verify-before-delete. **Untested against real data.** |
+| Persistence | `storage/db.ts` | `node:sqlite` (Electron 38 / Node 22) — no native module to rebuild. 2 migrations. |
+| Chat | `chat/repo.ts` | Chats and agent sessions in one table; history, search, export to MD/JSON, auto-titling, full session resume. |
+| Multimodal | `chat/multimodal.ts` | Images and audio as content parts; video via FFmpeg frame sampling, denser for natively-video-trained models. |
+| Downloads | `downloads/` | HF search, quant recommendation, resumable queue (range requests), pause/cancel, mmproj auto-fetch, token support. |
+| llama runtime | `runtime/llama.ts` | Spawn/health/unload, SSE streaming, **native `tools` parameter**, tool-call fragment accumulation, timings, tokenizer count. |
+| Agent loop | `agent/loop.ts` | Native tool calls with prose-JSON fallback, tiered permissions, checkpoints, compaction, sequential depth-limited sub-agents. |
+| Tools | `agent/tools/` | **44 built-in**: 10 filesystem, 7 exec, 3 web, 10 system/OS, 8 browser, 3 data, 7 agentic (some overlap in counts by group). |
+| MCP client | `agent/mcp.ts` | stdio + streamable HTTP, JSON-RPC implemented directly, namespaced tools, tier from server annotations. |
+| Memory | `agent/memory.ts` | Persistent, user-editable, injected into the system prompt. |
+| RAG | `rag/index.ts` | Separate embedding server, PDF/text extraction, overlap chunking, Float32 blobs, brute-force cosine. |
+| API server | `api/server.ts` | `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/messages` (Anthropic), JIT loading, API key with constant-time compare, priority queue. |
+| Remote | `remote/` | Password+scrypt+HMAC sessions, lockout, cloudflared tunnel, FreeDNS DDNS, in-process ACME, SSE event fan-out, desktop-only action gate. |
+| Observability | `stats/index.ts` | Live tok/s, TTFT, KV fill, request log, daily totals. |
+| Logging | `log/index.ts` | Rotating logs, crash handlers, redacting diagnostics bundle. |
+| Updater | `update/index.ts` | Ask-first, staged swap via a post-exit helper script. |
+| Packaging | `scripts/make-portable.mjs` | 7-Zip SFX with `OverwriteMode=2` for genuine extract-once. |
+| Vendor fetch | `scripts/fetch-vendor.mjs` | Resumable downloads of all 7 components, per-component selection. |
 
-## Not built yet
+## Not verified / known gaps
 
-Listed so nothing is quietly missing.
+**Nothing involving a live model has been run.** In particular:
+- llama-server spawn, health-polling and argument construction.
+- Streaming, tool-call accumulation, and the whole agent loop.
+- RAG embedding (needs the embedding model and a second llama-server).
+- Multimodal message construction and FFmpeg frame extraction.
+- The tunnel, ACME issuance, and the remote web UI end to end.
 
-**Blocking a first real run:**
-- **No bundled binaries.** `vendor/` is empty — no llama.cpp (CUDA/Vulkan/CPU), ffmpeg, cloudflared,
-  Python embeddable, or ripgrep. `src/main/runtime/binaries.ts` knows where they go and
-  `missingBinaries()` surfaces them in Settings, but nothing fetches them. **Until this is done the
-  app cannot load a model, and the agent cannot generate.**
-- No `electron-builder` target configuration, so no exe is produced yet.
+**Untested code paths that don't need a model:**
+- Cross-volume relocation of a large models folder.
+- The portable SFX build (needs 7-Zip's `7zSD.sfx`, which ships with the LZMA SDK, not the installer).
+- The updater's exe-swap script.
+- MCP against a real server.
 
-**Specified but unimplemented:**
-- Downloads: HuggingFace search, quant recommendation, resumable queue, mmproj auto-fetch, HF token.
-- Chat: SQLite persistence, history, presets, export. (Types exist; storage layer does not.)
-- Multimodal: image/audio/video attachment handling, frame-sampling controls.
-- RAG: embedding model, extraction, chunking, vector search, collections.
-- API server: `/v1/*` endpoints, JIT loading, API key, request log, local-priority queue.
-- Remote: web UI serving, password + sessions, cloudflared, FreeDNS DDNS, ACME TLS, action gating.
-- Observability: live inference stats, historical stats.
-- Agent platform: MCP client + UI, sub-agents, task lists, persistent memory, scheduled tasks,
-  context compaction, session resume.
-- OS-control tools (screenshots, clipboard, input automation) and Playwright browser automation.
-- Tray behaviour, updater, diagnostics bundle, packaging.
+**Known imperfections:**
+- The GGUF parser has still never seen a file produced by a real converter. Expect at least one
+  metadata key surprise.
+- `fetch-vendor` matches llama.cpp release asset names by regex; upstream renaming those assets
+  breaks it until the pattern is updated.
+- The close-to-tray dialog treats the choice as sticky rather than offering a checkbox, because
+  `showMessageBoxSync` does not return checkbox state.
+- Chromium revision is read from `playwright-core/browsers.json` with a hardcoded fallback that
+  will drift.
+- PDF extraction handles text PDFs only; scanned documents are rejected with a clear message rather
+  than silently returning noise. No OCR.
+- No unit tests for the queue, MCP wire protocol, or the remote auth flow.
 
-**Known gaps in what *is* built:**
-- The GGUF parser has never seen a real file. Expect at least one field-name surprise on first run.
-- `collectPaths` in the agent loop takes an unused `cwd` argument and does not resolve relative
-  paths before checkpointing — relative-path writes may checkpoint the wrong location.
-- The agent loop streams without the grammar attached, then parses JSON opportunistically. The
-  grammar is compiled and exposed but not yet passed to the sampler, so tool calls are currently
-  *parsed* rather than *enforced*. This is the single most important correctness gap in the agent.
-- No context compaction, so long agent sessions will hit the context limit and fail.
-- Relocation and checkpoint code paths are untested against real data.
+## Deliberately not built
 
----
+Recorded so they read as decisions, not omissions:
+- Cloud API providers, API-key management for them, spend tracking (Round 3).
+- Agent self-management of LLM Manager (Round 12).
+- Custom script tools — MCP is the single extension path (Round 13).
+- Per-folder instructions files; memory is the only carried context (Round 15).
+- A dedicated tool-call repair/retry loop (Round 13).
+- Parallel sub-agents (Round 14).
+- Microphone capture and TTS (Round 10).
+- Telemetry of any kind (Round 9).
 
-## Next steps, in order
+## Next
 
-1. **Fetch vendor binaries** — llama.cpp release builds for CUDA/Vulkan/CPU, LGPL ffmpeg,
-   cloudflared, Python embeddable, ripgrep. This unblocks everything else.
-2. **Test the GGUF parser against a real model** and fix what it gets wrong.
-3. **Attach the grammar to the sampler** in `LlamaRuntime.stream` so tool calls are enforced,
-   not merely parsed.
-4. First end-to-end run: load a model, generate, run one filesystem tool through the approval gate.
-5. SQLite persistence, then downloads, then the remaining phases.
-
-## Running it now
-
-```bash
-npm run dev
-```
-
-The window opens, hardware detection runs, Settings lists the missing binaries. The Models tab
-will be empty until there are `.gguf` files beside the exe (dev mode: `./LLMManagerModels/`).
+1. `npm run fetch-vendor`, then load a real model — that exercises most of the untested surface at once.
+2. Fix whatever the GGUF parser gets wrong on first contact with a real file.
+3. End-to-end agent run: one read, one approved write, one command.
+4. Then the tunnel, then packaging.

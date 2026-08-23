@@ -1,44 +1,41 @@
 /**
  * Main process entry point.
+ *
+ * Responsibilities kept here: window and tray lifecycle, first-run relocation, wiring the
+ * bridge to IPC, and orderly shutdown. Everything else lives in its own module.
  */
 
-import { app, BrowserWindow, ipcMain, dialog } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, Tray, dialog, nativeImage, shell } from 'electron'
 import path from 'node:path'
-import type { AppSettings, FitResult, ModelRecord, PermissionDecision, PermissionRequest } from '@shared/types'
-import { ensureDirs, defaultModelsDir } from './storage/paths'
+import { ensureDirs } from './storage/paths'
 import { loadSettings, patchSettings } from './storage/settings'
-import { detectHardware, refreshFreeVram } from './hardware/gpu'
-import { scanLibrary, libraryDiskUsage } from './models/library'
-import { checkRelocation, keepInPlace, performMove } from './models/relocation'
-import { planFit, DEFAULT_CONSTRAINTS, fmtBytes } from './autofit/engine'
+import { getDb } from './storage/db'
+import { detectHardware } from './hardware/gpu'
+import { scanLibrary } from './models/library'
+import { checkRelocation } from './models/relocation'
+import { downloadQueue } from './downloads/queue'
+import { mcpManager } from './agent/mcp'
+import { getHfToken } from './remote/auth'
+import { apiServer } from './api/server'
+import { remoteWeb } from './remote/web'
 import { llama } from './runtime/llama'
-import { missingBinaries } from './runtime/binaries'
-import { Agent } from './agent/loop'
-import { killAllJobs } from './agent/tools/exec'
-import { listCheckpoints, rewindTo } from './agent/checkpoints'
-import type { HardwareSnapshot } from '@shared/types'
+import { handlers, invokeBridge, setEmitter, setLibrary, shutdown, modelsDir } from './bridge'
+import { installCrashHandlers, logger } from './log'
 
 let mainWindow: BrowserWindow | null = null
-let hardware: HardwareSnapshot | null = null
-let library: ModelRecord[] = []
-let agent: Agent | null = null
-
-/** Pending permission prompts, keyed by request id, resolved when the renderer answers. */
-const pendingPermissions = new Map<string, (d: PermissionDecision) => void>()
-
-function modelsDir(): string {
-  return loadSettings().modelsDir ?? defaultModelsDir()
-}
+let tray: Tray | null = null
+let quitting = false
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 1400,
-    height: 900,
-    minWidth: 1000,
-    minHeight: 640,
+    width: 1440,
+    height: 920,
+    minWidth: 1040,
+    minHeight: 660,
     show: false,
     backgroundColor: '#0f1115',
     title: 'LLM Manager',
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -49,192 +46,223 @@ function createWindow(): void {
 
   mainWindow.on('ready-to-show', () => mainWindow?.show())
 
-  if (process.env['ELECTRON_RENDERER_URL']) {
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
-  } else {
-    mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
-  }
-}
+  // Round 11: ask on first close, then remember the answer.
+  mainWindow.on('close', (event) => {
+    if (quitting) return
+    const settings = loadSettings()
 
-function send(channel: string, payload: unknown): void {
-  mainWindow?.webContents.send(channel, payload)
-}
+    if (settings.ui.closeAction === 'quit') return
+    if (settings.ui.closeAction === 'tray') {
+      event.preventDefault()
+      mainWindow?.hide()
+      return
+    }
 
-function getAgent(): Agent {
-  const s = loadSettings()
-  if (!agent) {
-    agent = new Agent({
-      cwd: process.cwd(),
-      planMode: s.agent.planMode,
-      maxToolCallsPerTurn: s.agent.maxToolCallsPerTurn,
-      commandTimeoutMs: s.agent.commandTimeoutMs,
-      hardBlocksDisabled: s.agent.hardBlocksDisabled,
-      hfToken: s.hfToken,
-      requestPermission: (req: PermissionRequest) =>
-        new Promise<PermissionDecision>((resolve) => {
-          pendingPermissions.set(req.id, resolve)
-          send('agent:permission-request', req)
-        })
+    event.preventDefault()
+    const choice = dialog.showMessageBoxSync(mainWindow!, {
+      type: 'question',
+      buttons: ['Minimise to tray', 'Quit'],
+      defaultId: 0,
+      cancelId: 0,
+      title: 'Close LLM Manager',
+      message: 'Keep running in the background?',
+      detail:
+        'Minimising to the tray keeps the loaded model in memory and the API server available. ' +
+        'Quitting stops both, and disconnects anyone using the remote web UI.\n\n' +
+        'This choice is remembered; change it in Settings.'
     })
 
-    agent.on('delta', (text: string) => send('agent:delta', text))
-    agent.on('message', (m) => send('agent:message', m))
-    agent.on('toolCall', (c) => send('agent:tool-call', c))
-    agent.on('toolResult', (r) => send('agent:tool-result', r))
-    agent.on('done', (reason) => send('agent:done', reason))
-    agent.on('error', (e) => send('agent:error', e))
-  }
-  return agent
-}
+    const action = choice === 1 ? 'quit' : 'tray'
+    patchSettings({ ui: { closeAction: action } })
 
-function registerIpc(): void {
-  ipcMain.handle('settings:get', () => loadSettings())
-  ipcMain.handle('settings:patch', (_e, patch: Partial<AppSettings>) => patchSettings(patch))
-
-  ipcMain.handle('hardware:get', async (_e, refresh?: boolean) => {
-    if (!hardware || refresh) hardware = await detectHardware()
-    else hardware = await refreshFreeVram(hardware)
-    return hardware
-  })
-
-  ipcMain.handle('runtime:missing-binaries', async () => {
-    if (!hardware) hardware = await detectHardware()
-    return missingBinaries(hardware.backend)
-  })
-
-  ipcMain.handle('library:scan', async () => {
-    library = await scanLibrary(modelsDir())
-    return library
-  })
-
-  ipcMain.handle('library:disk', async () => libraryDiskUsage(modelsDir()))
-
-  /**
-   * Compute a fit for one model. Free VRAM is re-measured immediately before planning —
-   * this is the P1 fix, and a snapshot from app start would defeat it.
-   */
-  ipcMain.handle('autofit:plan', async (_e, modelId: string): Promise<FitResult | { error: string }> => {
-    const model = library.find((m) => m.id === modelId)
-    if (!model) return { error: 'Model not found' }
-    if (!model.arch) return { error: model.error ?? 'Model metadata could not be parsed' }
-
-    if (!hardware) hardware = await detectHardware()
-    hardware = await refreshFreeVram(hardware)
-
-    const s = loadSettings()
-    return planFit(model.arch, hardware, {
-      ...DEFAULT_CONSTRAINTS,
-      minKvType: s.autoFit.minKvType,
-      preferredKvType: s.autoFit.preferredKvType,
-      targetContext: s.autoFit.targetContext,
-      idealContext: s.autoFit.idealContext,
-      headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
-      overrides: {}
-    })
-  })
-
-  ipcMain.handle('model:load', async (_e, modelId: string, planJson: string) => {
-    const model = library.find((m) => m.id === modelId)
-    if (!model) throw new Error('Model not found')
-    if (!hardware) hardware = await detectHardware()
-    const plan = JSON.parse(planJson)
-    const loaded = await llama.load(model, plan, hardware.backend)
-    return { port: loaded.port, model: loaded.model.filename, context: plan.contextLength }
-  })
-
-  ipcMain.handle('model:unload', async () => {
-    await llama.unload()
-    return true
-  })
-
-  ipcMain.handle('model:status', () => {
-    const l = llama.loaded
-    return l ? { model: l.model.filename, port: l.port, plan: l.plan, startedAt: l.startedAt } : null
-  })
-
-  ipcMain.handle('relocation:check', () => checkRelocation())
-  ipcMain.handle('relocation:keep', (_e, from: string) => {
-    keepInPlace(from)
-    return true
-  })
-  ipcMain.handle('relocation:move', async (_e, proposalJson: string) => {
-    const proposal = JSON.parse(proposalJson)
-    let cancelled = false
-    ipcMain.once('relocation:cancel', () => {
-      cancelled = true
-    })
-    return performMove(proposal, (p) => send('relocation:progress', p), () => cancelled)
-  })
-
-  // ------------------------------------------------------------------ agent
-  ipcMain.handle('agent:tools', () => getAgent().listTools())
-  ipcMain.handle('agent:grammar', () => getAgent().grammar())
-
-  ipcMain.handle('agent:run', async (_e, sessionJson: string, input: string) => {
-    const session = JSON.parse(sessionJson)
-    const s = loadSettings()
-    const a = getAgent()
-    a.updateOptions({
-      planMode: s.agent.planMode,
-      maxToolCallsPerTurn: s.agent.maxToolCallsPerTurn,
-      commandTimeoutMs: s.agent.commandTimeoutMs,
-      hardBlocksDisabled: s.agent.hardBlocksDisabled,
-      hfToken: s.hfToken
-    })
-    await a.run(session, input)
-    return session
-  })
-
-  ipcMain.handle('agent:stop', () => {
-    agent?.stop()
-    return true
-  })
-
-  ipcMain.on('agent:permission-response', (_e, id: string, decision: PermissionDecision) => {
-    const resolve = pendingPermissions.get(id)
-    if (resolve) {
-      pendingPermissions.delete(id)
-      resolve(decision)
+    if (action === 'quit') {
+      quitting = true
+      app.quit()
+    } else {
+      mainWindow?.hide()
     }
   })
 
-  ipcMain.handle('agent:set-cwd', async () => {
-    const result = await dialog.showOpenDialog({ properties: ['openDirectory'] })
-    if (result.canceled || !result.filePaths[0]) return null
-    getAgent().updateOptions({ cwd: result.filePaths[0] })
-    return result.filePaths[0]
+  if (process.env['ELECTRON_RENDERER_URL']) {
+    void mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+  } else {
+    void mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
+  }
+
+  // External links open in the real browser, never inside the app window.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    void shell.openExternal(url)
+    return { action: 'deny' }
+  })
+}
+
+function createTray(): void {
+  // A 1x1 transparent image is a valid tray icon; a real one replaces this at branding time.
+  const icon = nativeImage.createFromDataURL(
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAQUlEQVR42mNkYPhfz0AEYBxVSF+FjIyM/xkYGP4TowGmiGgFyIqIVoBLEVEKcCkiSgE+RQQV4FOEVwEhRXgVAABtaB1V8bkLbwAAAABJRU5ErkJggg=='
+  )
+  tray = new Tray(icon)
+  tray.setToolTip('LLM Manager')
+
+  const rebuild = (): void => {
+    const loaded = llama.loaded
+    tray?.setContextMenu(
+      Menu.buildFromTemplate([
+        { label: loaded ? `Loaded: ${loaded.model.filename}` : 'No model loaded', enabled: false },
+        { label: apiServer.running ? `API on port ${apiServer.port}` : 'API server stopped', enabled: false },
+        { type: 'separator' },
+        {
+          label: 'Show window',
+          click: () => {
+            mainWindow?.show()
+            mainWindow?.focus()
+          }
+        },
+        {
+          label: 'Unload model',
+          enabled: !!loaded,
+          click: () => void llama.unload()
+        },
+        { type: 'separator' },
+        {
+          label: 'Quit',
+          click: () => {
+            quitting = true
+            app.quit()
+          }
+        }
+      ])
+    )
+  }
+
+  rebuild()
+  llama.on('status', rebuild)
+  tray.on('double-click', () => {
+    mainWindow?.show()
+    mainWindow?.focus()
+  })
+}
+
+/** Register every bridge handler with ipcMain, so the desktop and remote share one surface. */
+function registerIpc(): void {
+  for (const channel of Object.keys(handlers)) {
+    ipcMain.handle(channel, async (_event, ...args: unknown[]) => invokeBridge(channel, args))
+  }
+  // Fire-and-forget variant for the permission reply, which must not block the renderer.
+  ipcMain.on('agent:permission-response', (_e, id: string, decision: string) => {
+    void invokeBridge('agent:permission-response', [id, decision])
+  })
+}
+
+async function firstRunChecks(): Promise<void> {
+  const proposal = await checkRelocation()
+  if (!proposal) return
+
+  const gb = (proposal.totalBytes / 1024 ** 3).toFixed(1)
+  const choice = dialog.showMessageBoxSync({
+    type: 'question',
+    buttons: ['Move them here', 'Keep them there', 'Choose a folder'],
+    defaultId: 0,
+    title: 'Models folder found elsewhere',
+    message: 'Your models are not beside the app.',
+    detail:
+      `Found ${proposal.fileCount} files (${gb} GB) at:\n${proposal.from}\n\n` +
+      `The app now lives at:\n${proposal.to}\n\n` +
+      (proposal.sameVolume
+        ? 'Both are on the same drive, so moving is instant.'
+        : 'These are on different drives, so moving means a real copy and will take a while.')
   })
 
-  ipcMain.handle('agent:checkpoints', (_e, sessionId: string) => listCheckpoints(sessionId))
-  ipcMain.handle('agent:rewind', (_e, sessionId: string, checkpointId: string) => rewindTo(sessionId, checkpointId))
+  if (choice === 1) {
+    await invokeBridge('relocation:keep', [proposal.from])
+    patchSettings({ modelsDir: proposal.from })
+    return
+  }
 
-  ipcMain.handle('util:fmt-bytes', (_e, n: number) => fmtBytes(n))
+  if (choice === 2) {
+    const picked = await dialog.showOpenDialog({ properties: ['openDirectory'] })
+    if (!picked.canceled && picked.filePaths[0]) {
+      patchSettings({ modelsDir: picked.filePaths[0] })
+      await invokeBridge('relocation:keep', [picked.filePaths[0]])
+    }
+    return
+  }
+
+  await invokeBridge('relocation:move', [proposal])
 }
 
 app.whenReady().then(async () => {
+  installCrashHandlers()
   ensureDirs()
+  getDb()
+
+  // One emitter feeds both surfaces: the desktop window over IPC, and every connected
+  // remote browser over SSE. Neither can silently miss an event the other gets.
+  setEmitter((channel, payload) => {
+    if (!mainWindow?.isDestroyed()) mainWindow?.webContents.send(channel, payload)
+    remoteWeb.broadcast(channel, payload)
+  })
+
   registerIpc()
   createWindow()
+  createTray()
 
-  // Warm the hardware snapshot so compatibility badges are accurate the moment the
-  // library opens — the plan calls for no wizard, but detection still runs on first launch.
-  detectHardware()
-    .then((hw) => {
-      hardware = hw
-      send('hardware:update', hw)
+  downloadQueue.setToken(getHfToken())
+  downloadQueue.recoverOnStart()
+  downloadQueue.on('update', (list) => mainWindow?.webContents.send('downloads:update', list))
+  downloadQueue.on('completed', () => {
+    void scanLibrary(modelsDir()).then((models) => {
+      setLibrary(models)
+      mainWindow?.webContents.send('library:update', models)
     })
-    .catch(() => undefined)
+  })
+
+  await firstRunChecks()
+
+  // Hardware detection runs on first launch without a wizard, so the library's compatibility
+  // badges are accurate the moment it is opened.
+  void detectHardware()
+    .then((hw) => {
+      logger.info('hardware', `backend=${hw.backend}`, hw.gpus.map((g) => g.name))
+      mainWindow?.webContents.send('hardware:update', hw)
+    })
+    .catch((err) => logger.warn('hardware', 'detection failed', String(err)))
+
+  void scanLibrary(modelsDir())
+    .then((models) => {
+      setLibrary(models)
+      mainWindow?.webContents.send('library:update', models)
+    })
+    .catch((err) => logger.warn('library', 'scan failed', String(err)))
+
+  void mcpManager.connectAll().then((results) => {
+    if (results.length) logger.info('mcp', `connected ${results.filter((r) => r.ok).length}/${results.length}`)
+    mainWindow?.webContents.send('mcp:update', mcpManager.status())
+  })
+
+  // Restart the API server if it was running when the app last closed.
+  const settings = loadSettings()
+  if (settings.server.enabled) {
+    void invokeBridge('server:start', []).catch((err) => logger.warn('api', 'autostart failed', String(err)))
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    else mainWindow?.show()
   })
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  // Deliberately does not quit: the tray keeps the model and API alive.
+  if (process.platform === 'darwin') return
+  if (loadSettings().ui.closeAction === 'quit') app.quit()
 })
 
-app.on('before-quit', async () => {
-  killAllJobs()
-  await llama.unload()
+app.on('before-quit', async (event) => {
+  if (quitting) return
+  quitting = true
+  event.preventDefault()
+  logger.info('app', 'shutting down')
+  await shutdown()
+  app.exit(0)
 })

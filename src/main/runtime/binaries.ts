@@ -71,12 +71,41 @@ export function childEnv(): NodeJS.ProcessEnv {
   }
 }
 
+/**
+ * The bundled Chromium used for browser automation.
+ * Returns null when it has not been fetched, so the browser tools can fail with a useful
+ * message instead of a Playwright launch error.
+ */
+export function chromiumExecutable(): string | null {
+  const root = path.join(vendorRoot(), 'chromium')
+  const candidates = [
+    path.join(root, 'chrome.exe'),
+    path.join(root, 'chrome-win', 'chrome.exe'),
+    path.join(root, 'chrome-win64', 'chrome.exe')
+  ]
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c
+  }
+  return null
+}
+
+export function vendorDir(): string {
+  return vendorRoot()
+}
+
 export function missingBinaries(backend: Backend): string[] {
   const missing: string[] = []
   if (!fs.existsSync(llamaServerPath(backend))) missing.push(`llama-server (${backend})`)
-  for (const n of ['ffmpeg', 'python'] as BinaryName[]) {
+  for (const n of ['ffmpeg', 'python', 'cloudflared', 'rg'] as BinaryName[]) {
     const p = runtimeBinary(n)
     if (!path.isAbsolute(p)) missing.push(n)
   }
+  if (!chromiumExecutable()) missing.push('chromium')
+  if (!fs.existsSync(embeddingModelPath())) missing.push('embedding model')
   return missing
+}
+
+/** The small embedding model bundled for RAG; users may point at another in Settings. */
+export function embeddingModelPath(): string {
+  return path.join(vendorRoot(), 'models', 'embedding.gguf')
 }

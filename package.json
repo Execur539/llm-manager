@@ -10,23 +10,69 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "node scripts/smoke.mjs",
     "start": "electron-vite preview",
-    "package": "electron-vite build && electron-builder --win --dir",
-    "dist": "electron-vite build && electron-builder --win"
+    "fetch-vendor": "node scripts/fetch-vendor.mjs",
+    "pack:dir": "electron-vite build && electron-builder --win --dir",
+    "pack:installer": "electron-vite build && electron-builder --win nsis",
+    "pack:portable": "npm run pack:dir && node scripts/make-portable.mjs",
+    "dist": "npm run pack:installer && npm run pack:portable"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
-    "electron": "^33.2.0",
+    "electron": "^38.8.6",
     "electron-builder": "^25.1.8",
     "electron-vite": "^2.3.0",
     "typescript": "^5.7.2",
     "vite": "^5.4.11"
   },
   "dependencies": {
+    "acme-client": "^5.4.0",
+    "playwright-core": "^1.62.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
+  },
+  "build": {
+    "appId": "dev.llmmanager.app",
+    "productName": "LLM Manager",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor",
+        "to": "vendor",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "LLM-Manager-${version}-setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "LLM Manager"
+    },
+    "asar": true,
+    "asarUnpack": [
+      "**/node_modules/playwright-core/**"
+    ],
+    "compression": "maximum"
   }
 }
