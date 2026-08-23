@@ -14,7 +14,7 @@
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
-import { defaultModelsDir, readBreadcrumb, writeBreadcrumb } from '../storage/paths'
+import { defaultModelsDir, isInsideRuntimeCache, readBreadcrumb, writeBreadcrumb } from '../storage/paths'
 
 export interface RelocationProposal {
   /** where the models are now */
@@ -73,6 +73,11 @@ async function dirStats(dir: string): Promise<{ bytes: number; files: number }> 
  */
 export async function checkRelocation(): Promise<RelocationProposal | null> {
   const target = defaultModelsDir()
+
+  // Never propose moving a library into the portable extraction cache. That directory is
+  // deleted on upgrade, so "bringing the models along" would quietly stage them for deletion.
+  if (isInsideRuntimeCache(target)) return null
+
   const crumb = readBreadcrumb()
 
   if (!crumb) {

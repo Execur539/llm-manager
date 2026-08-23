@@ -114,13 +114,30 @@ streaming, tool-call accumulation, prediction verification, and unload.
 payload        1.9 GB unpacked (vendor/.cache excluded — it held the archives the
                vendor files were extracted from, nearly doubling the exe)
 compressed     0.86 GB, 45% of payload
-first run      51.1s  (extracts to %LOCALAPPDATA%\LLMManageruntime-0.1.0, marker written)
+first run      51.1s  (extracts to %LOCALAPPDATA%\LLMManager
+untime-0.1.0, marker written)
 second run      1.9s
 third run       1.9s   -> 27x speedup, extraction genuinely skipped
 on exit        runtime dir survives (electron-builder's portable target deletes it)
 ```
 
-Two corrections this exposed, both mine:
+**A data-loss bug found by actually running the portable build.** `exeDir()` returned
+`path.dirname(app.getPath('exe'))`, which for a portable build is the *extraction cache*, not the
+folder holding the exe the user launched. So "models live beside the exe" resolved to
+`%LOCALAPPDATA%\LLMManageruntime-0.1.0\LLMManagerModels`, and the relocation feature
+faithfully moved an 18 GB library into it — filling the C: drive to 99%. Worse, the launcher's
+upgrade cleanup deletes old `runtime-*` directories, so the next version bump would have taken
+the models with it.
+
+Fixed in three layers, because one guard is not enough for something unrecoverable:
+1. The NSIS launcher exports `LLMM_PORTABLE_DIR=$EXEDIR`, and `exeDir()` prefers it.
+2. `defaultModelsDir()` falls back to Documents if anything still resolves inside the cache.
+3. `checkRelocation()` refuses to propose a move into the cache, and the launcher's cleanup
+   skips any runtime directory containing a model library.
+
+Covered by `scripts/paths-check.mjs` (16 assertions).
+
+Two further corrections this exposed, both mine:
 1. electron-builder's `portable` target does **not** give extract-once. `unpackDirName` only
    stabilises the directory *name*; the payload is re-extracted every launch (~24s measured) and
    the directory is deleted on exit. Replaced with a custom NSIS launcher.

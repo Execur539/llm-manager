@@ -43,6 +43,11 @@ Section
   StrCpy $RuntimeDir "$LOCALAPPDATA\LLMManager\runtime-${VERSION}"
   StrCpy $Marker "$RuntimeDir\.unpacked-${VERSION}"
 
+  ; The app must know where the *portable exe* lives, not where it was unpacked to. Without
+  ; this it treats the extraction cache as its own folder and puts the model library there —
+  ; a directory this script deletes on upgrade.
+  System::Call 'kernel32::SetEnvironmentVariable(t "LLMM_PORTABLE_DIR", t "$EXEDIR")'
+
   ; Fast path: a completed extraction of *this* version already exists.
   ${If} ${FileExists} "$Marker"
     ${AndIf} ${FileExists} "$RuntimeDir\${APPEXE}"
@@ -74,11 +79,20 @@ Section
   Exec '"$RuntimeDir\${APPEXE}"'
 SectionEnd
 
+; Remove superseded runtime directories so upgrades do not accumulate gigabytes.
+;
+; Guarded: an older build (before LLMM_PORTABLE_DIR existed) could have placed the user's model
+; library inside its runtime directory. Deleting that would destroy tens of gigabytes of models,
+; so any directory holding user data is left alone even though it is stale.
 Function CleanOldRuntimes
   FindFirst $0 $1 "$LOCALAPPDATA\LLMManager\runtime-*"
   loop:
     StrCmp $1 "" done
     StrCmp $1 "runtime-${VERSION}" next
+    ${If} ${FileExists} "$LOCALAPPDATA\LLMManager\$1\LLMManagerModels\*.*"
+      ; Contains a model library — never delete.
+      Goto next
+    ${EndIf}
     RMDir /r "$LOCALAPPDATA\LLMManager\$1"
   next:
     FindNext $0 $1

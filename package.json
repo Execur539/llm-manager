@@ -10,7 +10,7 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
-    "test": "node scripts/smoke.mjs",
+    "test": "node scripts/smoke.mjs && node scripts/paths-check.mjs",
     "start": "electron-vite preview",
     "fetch-vendor": "node scripts/fetch-vendor.mjs",
     "pack:dir": "electron-vite build && electron-builder --win --dir",
