@@ -70,15 +70,26 @@ failing mysteriously.
 
 ```bash
 npm run typecheck        # both tsconfigs
-npm test                 # 78 assertions over the pure logic
+npm test                 # 102 assertions over the pure logic
 npm run pack:installer   # NSIS installer
 npm run pack:portable    # single-file portable exe
 ```
 
-The portable build sets `portable.unpackDirName` to a fixed name, which makes electron-builder
-unpack to a stable directory and **reuse it** on subsequent launches. Without it the default is a
-fresh uuid-named temp directory per launch, which with a multi-gigabyte payload would mean
-re-extracting everything every single time.
+The portable build uses a custom NSIS launcher (`build/portable.nsi`) rather than
+electron-builder's `portable` target, because that target re-extracts the entire payload to TEMP
+on **every** launch and deletes it on exit — measured at ~24s per launch here.
+`portable.unpackDirName` only stabilises the directory name; it does not make the extraction
+skippable.
+
+Our launcher unpacks once to `%LOCALAPPDATA%\LLMManageruntime-<version>` and writes a
+completion marker, so later launches start immediately. The marker is written last, so a
+half-finished extraction is never mistaken for a good one, and old `runtime-*` directories are
+removed after a successful upgrade.
+
+Two constraints worth knowing:
+- **NSIS cannot produce an output above ~2 GB.** The payload has to stay under that compressed.
+- The download cache in `vendor/.cache` is excluded from packaging — it holds the archives the
+  vendor files were extracted from, and shipping both nearly doubles the exe.
 
 Builds are unsigned, so Windows SmartScreen warns on first run.
 

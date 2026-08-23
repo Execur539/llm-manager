@@ -100,13 +100,32 @@ in the plan's notes rather than applied silently, and both are covered by regres
 | Observability | `stats/index.ts` | Live tok/s, TTFT, KV fill, request log, daily totals. |
 | Logging | `log/index.ts` | Rotating logs, crash handlers, redacting diagnostics bundle. |
 | Updater | `update/index.ts` | Ask-first, staged swap via a post-exit helper script. |
-| Packaging | `package.json` build config | NSIS installer + portable target with a fixed `unpackDirName`, which is electron-builder's own extract-once mechanism. |
+| Packaging | `build/portable.nsi` + `scripts/make-portable.mjs` | Custom NSIS launcher giving genuine extract-once: unpack to a versioned LOCALAPPDATA dir, marker written last, old runtimes cleaned on upgrade. electron-builder's own `portable` target was measured re-extracting 3 GB on every launch. |
 | Vendor fetch | `scripts/fetch-vendor.mjs` | Resumable downloads of all 7 components, per-component selection. |
 
 ## Not verified / known gaps
 
 Verified by the end-to-end run: llama-server spawn and argument construction, health polling,
 streaming, tool-call accumulation, prediction verification, and unload.
+
+**Packaging verified.** `LLM-Manager-0.1.0-portable.exe`, 0.86 GB, built and launch-tested:
+
+```
+payload        1.9 GB unpacked (vendor/.cache excluded — it held the archives the
+               vendor files were extracted from, nearly doubling the exe)
+compressed     0.86 GB, 45% of payload
+first run      51.1s  (extracts to %LOCALAPPDATA%\LLMManageruntime-0.1.0, marker written)
+second run      1.9s
+third run       1.9s   -> 27x speedup, extraction genuinely skipped
+on exit        runtime dir survives (electron-builder's portable target deletes it)
+```
+
+Two corrections this exposed, both mine:
+1. electron-builder's `portable` target does **not** give extract-once. `unpackDirName` only
+   stabilises the directory *name*; the payload is re-extracted every launch (~24s measured) and
+   the directory is deleted on exit. Replaced with a custom NSIS launcher.
+2. NSIS cannot emit an output above ~2 GB. The first attempt failed at 1.94 GB, which is what
+   surfaced the `.cache` packaging bug.
 
 Still unexercised:
 - The full agent loop (the tool-call *mechanism* is verified; the loop around it is not).
