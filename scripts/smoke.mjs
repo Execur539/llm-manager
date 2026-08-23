@@ -97,6 +97,54 @@ section('KV cache maths')
   console.log(`  128K at q8_0 = ${fmtBytes(kv128)}`)
 }
 
+section('Hybrid attention/SSM models cache only on attention layers')
+{
+  // Real geometry from ggml-org/Qwen3.8-27B-GGUF: 64 blocks, full_attention_interval 4,
+  // so 16 attention layers and 48 state-space layers. Counting all 64 overestimates the KV
+  // cache ~3.9x and costs most of the achievable context.
+  const hybrid = {
+    ...arch,
+    architecture: 'qwen35',
+    blockCount: 64,
+    headCount: 24,
+    headCountKv: 4,
+    headDim: 256,
+    attentionLayers: 16,
+    ssmLayers: 48,
+    ssmStateBytesPerLayer: 3211264,
+    weightBytes: 17.66 * GB,
+    perLayerBytes: 16 * GB,
+    nonLayerBytes: 1.66 * GB
+  }
+
+  const naive = 2 * hybrid.headCountKv * hybrid.headDim * hybrid.blockCount * 131072 * (34 / 32)
+  const actual = kvCacheBytes(hybrid, 131072, 'q8_0')
+  check('hybrid KV is far below the all-layers estimate', actual < naive / 3, `${fmtBytes(actual)} vs ${fmtBytes(naive)}`)
+
+  // The SSM state is real memory, but constant — doubling context must not double it.
+  const at64k = kvCacheBytes(hybrid, 65536, 'q8_0')
+  const at128k = kvCacheBytes(hybrid, 131072, 'q8_0')
+  const stateBytes = hybrid.ssmLayers * hybrid.ssmStateBytesPerLayer
+  check('SSM state is included', at64k > stateBytes)
+  check('SSM state does not scale with context', Math.abs((at128k - at64k) - (at64k - stateBytes)) < 1)
+
+  // A dense model of the same block count must be unaffected by the hybrid path.
+  const dense = { ...hybrid, attentionLayers: 64, ssmLayers: 0, ssmStateBytesPerLayer: 0 }
+  check('dense models still count every layer', Math.abs(kvCacheBytes(dense, 131072, 'q8_0') - naive) < 1)
+
+  // Metadata written before hybrid support leaves these unset; fall back to block count.
+  const legacy = { ...dense, attentionLayers: undefined, ssmLayers: undefined, ssmStateBytesPerLayer: undefined }
+  check('missing hybrid fields fall back to block count', Math.abs(kvCacheBytes(legacy, 131072, 'q8_0') - naive) < 1)
+
+  // On this rig the fix is the difference between the ideal context and a degraded one.
+  const rig = hw([gpu('RTX 5080', 16, 13.4), gpu('RTX 4070 Ti', 12, 11.7, true, 1)])
+  const result = planFit(hybrid, rig, DEFAULT_CONSTRAINTS)
+  check('hybrid 27B reaches the ideal context on a 5080+4070Ti', result.chosen?.contextLength === 131072, `${result.chosen?.contextLength}`)
+  check('at the preferred KV quality, not the floor', result.chosen?.kvType === 'q8_0')
+  check('explains the hybrid layout', result.notes.some((n) => /hybrid architecture/i.test(n)))
+  console.log(`  128K KV: ${fmtBytes(naive)} naive -> ${fmtBytes(actual)} actual`)
+}
+
 section('Compute buffer: flash attention is a precondition at long context')
 {
   const withFa = computeBufferBytes(arch, 131072, 512, true)

@@ -39,33 +39,60 @@ const COMPONENTS = {
     label: 'llama.cpp (CPU + Vulkan + CUDA)',
     approxBytes: 1.2 * GB,
     async run() {
-      const release = await githubRelease('ggml-org/llama.cpp')
-      console.log(`  llama.cpp release ${release.tag_name}`)
+      // llama.cpp publishes every binary build as a GitHub *prerelease*, so /releases/latest
+      // skips them all and returns an unrelated stale tag. Walk the release list instead and
+      // take the newest build-numbered tag that actually carries Windows assets.
+      const release = await latestLlamaBuild()
+      console.log(`  llama.cpp build ${release.tag_name}`)
 
-      // Asset names look like: llama-<tag>-bin-win-cuda-x64.zip
-      const wanted = [
-        { match: /bin-win-(cpu-)?x64\.zip$/i, dest: 'llama.cpp/cpu', name: 'CPU' },
-        { match: /bin-win-vulkan-x64\.zip$/i, dest: 'llama.cpp/vulkan', name: 'Vulkan' },
-        { match: /bin-win-cuda[^/]*-x64\.zip$/i, dest: 'llama.cpp/cuda', name: 'CUDA' }
+      // The CUDA *runtime* asset is named `cudart-llama-bin-win-cuda-<ver>-x64.zip`, which ends
+      // identically to the build asset — so it must be excluded by prefix, or it gets picked up
+      // as the build and the real binaries are never downloaded.
+      const winAssets = release.assets.filter(
+        (a) => /-bin-win-.*-x64\.zip$/i.test(a.name) && !/^cudart-/i.test(a.name)
+      )
+
+      const cpu = winAssets.find((a) => /bin-win-cpu-x64\.zip$/i.test(a.name))
+      const vulkan = winAssets.find((a) => /bin-win-vulkan-x64\.zip$/i.test(a.name))
+
+      // Several CUDA builds ship per release (12.4, 13.3, ...). Take the highest: newer GPUs
+      // need newer toolkits — Blackwell (RTX 50-series, sm_120) is not supported by CUDA 12.4
+      // at all, so picking the first match would silently produce a build that cannot run.
+      const cudaBuilds = winAssets
+        .map((a) => ({ asset: a, version: a.name.match(/bin-win-cuda-([\d.]+)-x64\.zip$/i)?.[1] }))
+        .filter((x) => x.version)
+        .sort((a, b) => compareVersions(b.version, a.version))
+      const cuda = cudaBuilds[0]
+
+      const targets = [
+        { asset: cpu, dest: 'llama.cpp/cpu', name: 'CPU' },
+        { asset: vulkan, dest: 'llama.cpp/vulkan', name: 'Vulkan' },
+        { asset: cuda?.asset, dest: 'llama.cpp/cuda', name: `CUDA ${cuda?.version ?? ''}` }
       ]
 
-      for (const w of wanted) {
-        const asset = release.assets.find((a) => w.match.test(a.name))
-        if (!asset) {
-          console.log(`  ! no ${w.name} asset in this release; skipping`)
+      for (const t of targets) {
+        if (!t.asset) {
+          console.log(`  ! no ${t.name} asset in ${release.tag_name}; skipping`)
           continue
         }
-        const zip = await download(asset.browser_download_url, path.join(CACHE, asset.name), asset.size)
-        await unzipFlat(zip, path.join(VENDOR, w.dest))
-        console.log(`  ${w.name} -> vendor/${w.dest}`)
+        const zip = await download(t.asset.browser_download_url, path.join(CACHE, t.asset.name), t.asset.size)
+        await unzipFlat(zip, path.join(VENDOR, t.dest))
+        console.log(`  ${t.name} -> vendor/${t.dest}`)
       }
 
-      // CUDA builds need the CUDA runtime DLLs, shipped as a separate asset.
-      const runtime = release.assets.find((a) => /cudart-llama-bin-win.*\.zip$/i.test(a.name))
-      if (runtime) {
-        const zip = await download(runtime.browser_download_url, path.join(CACHE, runtime.name), runtime.size)
-        await unzipFlat(zip, path.join(VENDOR, 'llama.cpp/cuda'))
-        console.log('  CUDA runtime DLLs -> vendor/llama.cpp/cuda')
+      // The CUDA build needs matching runtime DLLs, shipped as a separate asset. Version must
+      // agree with the build we just took, or llama-server fails to start with a DLL error.
+      if (cuda) {
+        const runtime = release.assets.find((a) =>
+          new RegExp(`cudart-llama-bin-win-cuda-${cuda.version.replace('.', '\\.')}-x64\\.zip$`, 'i').test(a.name)
+        )
+        if (runtime) {
+          const zip = await download(runtime.browser_download_url, path.join(CACHE, runtime.name), runtime.size)
+          await unzipFlat(zip, path.join(VENDOR, 'llama.cpp/cuda'))
+          console.log(`  CUDA ${cuda.version} runtime DLLs -> vendor/llama.cpp/cuda`)
+        } else {
+          console.log(`  ! no cudart asset matching CUDA ${cuda.version}; the CUDA build may not start`)
+        }
       }
     }
   },
@@ -148,22 +175,29 @@ const COMPONENTS = {
     label: 'Chromium (Playwright build, for browser automation)',
     approxBytes: 150 * MB,
     async run() {
-      // Ask playwright-core which revision it expects, so the two never drift apart.
-      let revision = '1148'
+      // Playwright's own build CDN rejects direct requests, but its pinned Chromium is a
+      // "Chrome for Testing" build, which Google publishes at a stable public URL. Read the
+      // exact version playwright expects so the browser and the driver never drift apart.
+      let version = null
       try {
         const registry = JSON.parse(
           await fsp.readFile(path.join(ROOT, 'node_modules/playwright-core/browsers.json'), 'utf8')
         )
-        const chromium = registry.browsers.find((b) => b.name === 'chromium')
-        if (chromium?.revision) revision = chromium.revision
+        version = registry.browsers.find((b) => b.name === 'chromium')?.browserVersion ?? null
       } catch {
-        console.log('  ! could not read playwright browsers.json; using a default revision')
+        console.log('  ! could not read playwright browsers.json')
       }
 
-      const url = `https://cdn.playwright.dev/dbazure/download/playwright/builds/chromium/${revision}/chromium-win64.zip`
-      const zip = await download(url, path.join(CACHE, `chromium-${revision}.zip`))
+      if (!version) {
+        const res = await fetch('https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json')
+        version = (await res.json()).channels.Stable.version
+        console.log(`  falling back to Chrome for Testing stable ${version}`)
+      }
+
+      const url = `https://storage.googleapis.com/chrome-for-testing-public/${version}/win64/chrome-win64.zip`
+      const zip = await download(url, path.join(CACHE, `chromium-${version}.zip`))
       await unzipFlat(zip, path.join(VENDOR, 'chromium'))
-      console.log(`  Chromium r${revision} -> vendor/chromium`)
+      console.log(`  Chromium ${version} -> vendor/chromium`)
     }
   },
 
@@ -184,6 +218,42 @@ const COMPONENTS = {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/** Numeric version compare, so "13.3" sorts above "12.4" rather than lexically below it. */
+function compareVersions(a, b) {
+  const pa = String(a).split('.').map(Number)
+  const pb = String(b).split('.').map(Number)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0)
+    if (d !== 0) return d
+  }
+  return 0
+}
+
+/**
+ * The newest llama.cpp build release carrying Windows x64 binaries.
+ * Their binary releases are all flagged as prereleases, which /releases/latest ignores.
+ */
+async function latestLlamaBuild() {
+  const res = await fetch('https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20', {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'llm-manager-fetch-vendor',
+      ...(process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {})
+    }
+  })
+  if (res.status === 403) throw new Error('GitHub rate-limited this request. Set GITHUB_TOKEN and retry.')
+  if (!res.ok) throw new Error(`GitHub API ${res.status} listing llama.cpp releases`)
+
+  const releases = await res.json()
+  const build = releases
+    .filter((r) => /^b\d+$/.test(r.tag_name))
+    .filter((r) => r.assets.some((a) => /-bin-win-.*-x64\.zip$/i.test(a.name)))
+    .sort((a, b) => Number(b.tag_name.slice(1)) - Number(a.tag_name.slice(1)))[0]
+
+  if (!build) throw new Error('No llama.cpp release with Windows x64 binaries found in the last 20 releases')
+  return build
+}
 
 async function githubRelease(repo) {
   const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {

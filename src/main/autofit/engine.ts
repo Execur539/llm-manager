@@ -60,13 +60,25 @@ export const DEFAULT_CONSTRAINTS: FitConstraints = {
 /**
  * KV cache bytes for a given context length.
  *
- * 2 (K and V) x layers x kv_heads x head_dim x tokens x bytes-per-element.
- * GQA models have far fewer KV heads than attention heads, which is why a modern 27B can
- * hold a 128K context that an older MHA 13B cannot.
+ * 2 (K and V) x attention-layers x kv_heads x head_dim x tokens x bytes-per-element.
+ *
+ * Two things make this smaller than a naive estimate:
+ *   - GQA models have far fewer KV heads than attention heads, which is why a modern 27B can
+ *     hold a 128K context that an older MHA 13B cannot.
+ *   - Hybrid models only cache on their *attention* layers. Qwen3.8-27B has 64 blocks but a
+ *     `full_attention_interval` of 4, so just 16 of them grow with context. Counting all 64
+ *     overestimates the cache roughly fourfold and needlessly shrinks the planned context.
+ *
+ * The recurrent state on SSM layers is added separately: it is real memory, but a fixed amount
+ * that does not scale with context.
  */
 export function kvCacheBytes(arch: ModelArchInfo, contextLength: number, kvType: KvType): number {
+  // Older metadata (or a model parsed before hybrid support) leaves attentionLayers unset.
+  const attentionLayers = arch.attentionLayers || arch.blockCount
   const perTokenPerLayer = 2 * arch.headCountKv * arch.headDim * KV_ELEMENT_BYTES[kvType]
-  return perTokenPerLayer * arch.blockCount * contextLength
+  const attentionCache = perTokenPerLayer * attentionLayers * contextLength
+  const recurrentState = (arch.ssmLayers ?? 0) * (arch.ssmStateBytesPerLayer ?? 0)
+  return attentionCache + recurrentState
 }
 
 /**
@@ -329,6 +341,14 @@ export function planFit(
   )
   if (arch.contextLength > 0 && constraints.idealContext > arch.contextLength) {
     notes.push(`Model was trained for ${arch.contextLength.toLocaleString()} tokens; capping there.`)
+  }
+
+  if (arch.ssmLayers > 0) {
+    notes.push(
+      `Hybrid architecture: only ${arch.attentionLayers} of ${arch.blockCount} layers hold a KV cache ` +
+        `(the other ${arch.ssmLayers} are state-space layers with a fixed ` +
+        `${fmtBytes(arch.ssmLayers * arch.ssmStateBytesPerLayer)} state). Long context is far cheaper here than layer count suggests.`
+    )
   }
 
   const totalLayers = arch.blockCount

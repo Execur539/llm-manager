@@ -375,6 +375,24 @@ export function extractArchInfo(meta: GgufMetadata): ModelArchInfo {
     }
   }
 
+  // Hybrid attention/SSM layout. `full_attention_interval = 4` means one in every four layers
+  // is full attention and the rest are state-space layers, whose state is a fixed size rather
+  // than one that grows with context.
+  const fullAttentionInterval = p('full_attention_interval') ?? 0
+  const ssmInnerSize = p('ssm.inner_size') ?? 0
+  const ssmStateSize = p('ssm.state_size') ?? 0
+  const ssmConvKernel = p('ssm.conv_kernel') ?? 0
+  const isHybrid = fullAttentionInterval > 1 && ssmStateSize > 0
+
+  const attentionLayers = isHybrid ? Math.ceil(blockCount / fullAttentionInterval) : blockCount
+  const ssmLayers = isHybrid ? blockCount - attentionLayers : 0
+
+  // Recurrent state per SSM layer: the convolution window plus the recurrent state itself.
+  // llama.cpp keeps both in f32.
+  const ssmStateBytesPerLayer = isHybrid
+    ? (ssmInnerSize * Math.max(0, ssmConvKernel - 1) + ssmInnerSize * ssmStateSize) * 4
+    : 0
+
   return {
     architecture: arch,
     name: typeof kv['general.name'] === 'string' ? (kv['general.name'] as string) : null,
@@ -389,7 +407,10 @@ export function extractArchInfo(meta: GgufMetadata): ModelArchInfo {
     weightBytes: perLayerBytes + nonLayerBytes,
     perLayerBytes,
     nonLayerBytes,
-    expertCount
+    expertCount,
+    attentionLayers,
+    ssmLayers,
+    ssmStateBytesPerLayer
   }
 }
 

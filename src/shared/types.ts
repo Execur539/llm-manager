@@ -53,6 +53,18 @@ export interface ModelArchInfo {
   nonLayerBytes: number
   /** Mixture-of-experts expert count, 0 when dense */
   expertCount: number
+  /**
+   * Layers that actually hold a KV cache.
+   *
+   * Hybrid architectures (Qwen3.5/3.8, Jamba, Granite-hybrid) interleave full-attention layers
+   * with state-space layers. Only the attention layers grow with context; assuming every layer
+   * does overestimates the KV cache several-fold and needlessly shrinks the planned context.
+   */
+  attentionLayers: number
+  /** Layers using a recurrent/SSM state instead of a KV cache. */
+  ssmLayers: number
+  /** Per-layer SSM state in bytes. Constant — it does not grow with context length. */
+  ssmStateBytesPerLayer: number
 }
 
 export interface ModelCapabilities {
