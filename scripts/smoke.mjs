@@ -122,11 +122,12 @@ section('Hybrid attention/SSM models cache only on attention layers')
   check('hybrid KV is far below the all-layers estimate', actual < naive / 3, `${fmtBytes(actual)} vs ${fmtBytes(naive)}`)
 
   // The SSM state is real memory, but constant — doubling context must not double it.
+  // Asking for zero context isolates the state, so this holds whatever safety factor is applied.
+  const stateOnly = kvCacheBytes(hybrid, 0, 'q8_0')
   const at64k = kvCacheBytes(hybrid, 65536, 'q8_0')
   const at128k = kvCacheBytes(hybrid, 131072, 'q8_0')
-  const stateBytes = hybrid.ssmLayers * hybrid.ssmStateBytesPerLayer
-  check('SSM state is included', at64k > stateBytes)
-  check('SSM state does not scale with context', Math.abs((at128k - at64k) - (at64k - stateBytes)) < 1)
+  check('SSM state is included', stateOnly > 0 && at64k > stateOnly)
+  check('SSM state does not scale with context', Math.abs((at128k - at64k) - (at64k - stateOnly)) < 1)
 
   // A dense model of the same block count must be unaffected by the hybrid path.
   const dense = { ...hybrid, attentionLayers: 64, ssmLayers: 0, ssmStateBytesPerLayer: 0 }

@@ -2,11 +2,10 @@
 
 Honest account of what exists. The spec is in [plan.md](plan.md); this tracks reality against it.
 
-**Every phase in the plan now has an implementation.** What that does *not* mean is that
-everything has been run: no llama.cpp binary has been executed, because `vendor/` is empty on this
-machine and the download is ~1.5 GB. So the code paths that require a live model — loading,
-generation, the agent loop end to end, RAG embedding, multimodal — are **written and typechecked
-but never executed**. Treat that as the headline caveat.
+**Every phase has an implementation, and the core path now runs on a real model.**
+Qwen3.8-27B-Q4_K_M was fetched, parsed, fitted, loaded, generated from, tool-called, and
+unloaded on real hardware. What remains unverified is listed under "Not verified" below —
+principally RAG, the tunnel, and the remote UI.
 
 ## Verified
 
@@ -20,6 +19,24 @@ but never executed**. Treat that as the headline caveat.
   real hardware — `backend=cuda`, RTX 5080 + RTX 4070 Ti + AMD iGPU.
 - **The auto-fit engine was run against that real hardware** (`node scripts/hw-check.mjs`) and
   produced sane plans for 8B, 27B and 70B models.
+- **End-to-end run with a real model** (`scripts/load-test.ts`, executed inside Electron so it
+  exercises the shipping code paths, not mocks):
+
+```
+model    ggml-org/Qwen3.8-27B-GGUF, Q4_K_M, 17.67 GB + 0.59 GB mmproj
+parse    arch=qwen35, 64 blocks (16 attention + 48 SSM), vision+video+tools detected,
+         mmproj auto-paired, tags auto-assigned
+fit      131,072 ctx, 64/64 layers on GPU, split 51.4% / 48.6%
+load     llama-server ready in 8.8s
+verify   predicted 10.56 + 10.01 GB   actual 10.63 + 11.23 GB   (1.12x, self-correction fired)
+generate 60 tokens, TTFT 1668 ms, 44.9 tok/s, coherent answer
+tools    native tools parameter produced list_dir({"path":"C:Windows"})
+unload   llama.loaded === null, VRAM returned to 13.36 + 11.71 GB free, no stray processes
+```
+
+Note the tool call dropped a backslash (`C:Windows`). That is the documented limit of grammar
+enforcement: it guarantees a structurally valid call, not correct arguments. The tool would have
+returned an error, which the loop feeds back to the model.
 
 What the tests actually prove:
 
@@ -88,12 +105,15 @@ in the plan's notes rather than applied silently, and both are covered by regres
 
 ## Not verified / known gaps
 
-**Nothing involving a live model has been run.** In particular:
-- llama-server spawn, health-polling and argument construction.
-- Streaming, tool-call accumulation, and the whole agent loop.
-- RAG embedding (needs the embedding model and a second llama-server).
+Verified by the end-to-end run: llama-server spawn and argument construction, health polling,
+streaming, tool-call accumulation, prediction verification, and unload.
+
+Still unexercised:
+- The full agent loop (the tool-call *mechanism* is verified; the loop around it is not).
+- RAG embedding — needs the second llama-server for the embedding model.
 - Multimodal message construction and FFmpeg frame extraction.
 - The tunnel, ACME issuance, and the remote web UI end to end.
+- The API server's HTTP surface.
 
 **Untested code paths that don't need a model:**
 - Cross-volume relocation of a large models folder.
@@ -102,10 +122,13 @@ in the plan's notes rather than applied silently, and both are covered by regres
 - MCP against a real server.
 
 **Known imperfections:**
-- The GGUF parser has still never seen a file produced by a real converter. Expect at least one
-  metadata key surprise.
 - `fetch-vendor` matches llama.cpp release asset names by regex; upstream renaming those assets
   breaks it until the pattern is updated.
+- The recurrent-state and mmproj footprints use empirical correction factors
+  (`SSM_STATE_SAFETY`, `MMPROJ_OVERHEAD`) fitted to one model on one machine. They err high on
+  purpose, but they are calibration, not derivation.
+- Reserving for the projector cost enough budget to drop the chosen KV type from q8_0 to q4_0
+  on this rig. Still the full 131K context, but a real tradeoff worth surfacing better in the UI.
 - The close-to-tray dialog treats the choice as sticky rather than offering a checkbox, because
   `showMessageBoxSync` does not return checkbox state.
 - Chromium revision is read from `playwright-core/browsers.json` with a hardcoded fallback that

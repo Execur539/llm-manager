@@ -47,6 +47,19 @@ const BASE_GRAPH_OVERHEAD = 96 * MB
  * is actually available. Deliberately conservative: an OOM is worse than a smaller context.
  */
 const UNMEASURED_FREE_FRACTION = 0.85
+/**
+ * Correction applied to the computed recurrent-state size.
+ *
+ * The naive conv+state figure under-counts what llama.cpp actually reserves for the `rs cache`
+ * on hybrid models — measured against Qwen3.8-27B, which OOMed on a plan that looked like it
+ * had 1.4 GB to spare. Erring high here costs a little context; erring low costs a failed load.
+ */
+const SSM_STATE_SAFETY = 2.5
+/**
+ * The projector's runtime footprint exceeds its file size: it allocates image-tile buffers
+ * on top of its weights. Measured against Qwen3.8-27B's 0.59 GB Q8_0 projector.
+ */
+const MMPROJ_OVERHEAD = 1.8
 
 export const DEFAULT_CONSTRAINTS: FitConstraints = {
   minKvType: 'q4_0',
@@ -77,7 +90,10 @@ export function kvCacheBytes(arch: ModelArchInfo, contextLength: number, kvType:
   const attentionLayers = arch.attentionLayers || arch.blockCount
   const perTokenPerLayer = 2 * arch.headCountKv * arch.headDim * KV_ELEMENT_BYTES[kvType]
   const attentionCache = perTokenPerLayer * attentionLayers * contextLength
-  const recurrentState = (arch.ssmLayers ?? 0) * (arch.ssmStateBytesPerLayer ?? 0)
+  // The recurrent state is allocated per sequence slot. We run llama-server with --parallel 1,
+  // so this is one slot's worth — but it is measured empirically to be larger than the naive
+  // conv+state figure, so a correction factor keeps the estimate on the safe side.
+  const recurrentState = (arch.ssmLayers ?? 0) * (arch.ssmStateBytesPerLayer ?? 0) * SSM_STATE_SAFETY
   return attentionCache + recurrentState
 }
 
@@ -307,6 +323,18 @@ export function planFit(
   }
 
   const budgets = usableGpus.map((g) => deviceBudget(g, constraints.headroomBytes, hw.backend))
+
+  // The vision encoder loads onto the primary device and brings its own image-processing
+  // buffers, so charge it there with margin rather than splitting it across devices.
+  const companion = constraints.companionBytes ?? 0
+  if (companion > 0 && budgets.length > 0) {
+    const charged = companion * MMPROJ_OVERHEAD
+    budgets[0] = Math.max(0, budgets[0] - charged)
+    notes.push(
+      `Reserving ${fmtBytes(charged)} on ${usableGpus[0].name} for the vision projector and its image buffers.`
+    )
+  }
+
   const totalBudget = budgets.reduce((a, b) => a + b, 0)
 
   const anyUnmeasured = usableGpus.some((g) => !g.freeIsMeasured)

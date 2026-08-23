@@ -136,6 +136,12 @@ export interface FitConstraints {
   idealContext: number
   /** bytes of VRAM deliberately left unused per GPU */
   headroomBytes: number
+  /**
+   * Companion weights loaded alongside the model — currently the multimodal projector.
+   * llama.cpp places the vision encoder on the primary device, so this is charged there
+   * rather than split. Ignoring it is enough to turn a fitting plan into an OOM.
+   */
+  companionBytes?: number
   /** user overrides that must be honoured, not silently changed */
   overrides: Partial<{
     contextLength: number

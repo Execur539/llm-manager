@@ -134,6 +134,16 @@ function persistPermissionRules(): void {
   }
 }
 
+/** Size of the multimodal projector loaded alongside a model, if it has one. */
+function companionSize(model: ModelRecord): number {
+  if (!model.caps.mmprojPath) return 0
+  try {
+    return fs.statSync(model.caps.mmprojPath).size
+  } catch {
+    return 0
+  }
+}
+
 /** Load a model by id using a plan, or auto-fit one if no plan is supplied. */
 async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: number; plan: FitPlan }> {
   const model = library.find((m) => m.id === modelId || m.filename === modelId)
@@ -154,6 +164,7 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
       targetContext: s.autoFit.targetContext,
       idealContext: s.autoFit.idealContext,
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
+      companionBytes: companionSize(model),
       overrides: {}
     })
     chosen = result.chosen ?? result.alternatives[0]
@@ -306,6 +317,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       targetContext: s.autoFit.targetContext,
       idealContext: s.autoFit.idealContext,
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
+      companionBytes: companionSize(model),
       overrides: (overrides ?? {}) as never
     })
   },

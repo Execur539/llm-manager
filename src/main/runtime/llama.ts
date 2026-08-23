@@ -112,6 +112,11 @@ export class LlamaRuntime extends EventEmitter {
       '--ctx-size', String(plan.contextLength),
       '--n-gpu-layers', String(plan.gpuLayers),
       '--batch-size', String(plan.batchSize),
+      // llama-server defaults to 4 parallel slots. We serialise every request through a
+      // priority queue instead, so extra slots buy nothing — and they cost real memory:
+      // slots divide the context budget, and on hybrid models the recurrent-state cache is
+      // allocated *per slot*, which is enough to turn a fitting plan into an OOM.
+      '--parallel', '1',
       // Jinja templates enable llama.cpp's native tool-calling handlers.
       '--jinja'
     ]

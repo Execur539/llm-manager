@@ -15,6 +15,8 @@ import type { Backend } from '@shared/types'
 export type BinaryName = 'llama-server' | 'ffmpeg' | 'cloudflared' | 'python' | 'node' | 'rg'
 
 function vendorRoot(): string {
+  // Escape hatch for development and test harnesses, which may run with a different app path.
+  if (process.env.LLMM_VENDOR_DIR) return process.env.LLMM_VENDOR_DIR
   // Packaged: <exe dir>/.llmmanager-runtime/vendor  (written once on first run)
   // Dev:      <project>/vendor
   if (app.isPackaged) return path.join(path.dirname(app.getPath('exe')), '.llmmanager-runtime', 'vendor')
