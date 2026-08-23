@@ -15,7 +15,7 @@
     "fetch-vendor": "node scripts/fetch-vendor.mjs",
     "pack:dir": "electron-vite build && electron-builder --win --dir",
     "pack:installer": "electron-vite build && electron-builder --win nsis",
-    "pack:portable": "npm run pack:dir && node scripts/make-portable.mjs",
+    "pack:portable": "electron-vite build && electron-builder --win portable",
     "dist": "npm run pack:installer && npm run pack:portable"
   },
   "devDependencies": {
@@ -57,7 +57,8 @@
     ],
     "win": {
       "target": [
-        "nsis"
+        "nsis",
+        "portable"
       ],
       "artifactName": "LLM-Manager-${version}-setup.${ext}"
     },
@@ -73,6 +74,11 @@
     "asarUnpack": [
       "**/node_modules/playwright-core/**"
     ],
-    "compression": "maximum"
+    "compression": "maximum",
+    "portable": {
+      "unpackDirName": "LLMManager-0.1.0",
+      "artifactName": "LLM-Manager-${version}-portable.${ext}",
+      "requestExecutionLevel": "user"
+    }
   }
 }

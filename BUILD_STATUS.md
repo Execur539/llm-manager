@@ -100,7 +100,7 @@ in the plan's notes rather than applied silently, and both are covered by regres
 | Observability | `stats/index.ts` | Live tok/s, TTFT, KV fill, request log, daily totals. |
 | Logging | `log/index.ts` | Rotating logs, crash handlers, redacting diagnostics bundle. |
 | Updater | `update/index.ts` | Ask-first, staged swap via a post-exit helper script. |
-| Packaging | `scripts/make-portable.mjs` | 7-Zip SFX with `OverwriteMode=2` for genuine extract-once. |
+| Packaging | `package.json` build config | NSIS installer + portable target with a fixed `unpackDirName`, which is electron-builder's own extract-once mechanism. |
 | Vendor fetch | `scripts/fetch-vendor.mjs` | Resumable downloads of all 7 components, per-component selection. |
 
 ## Not verified / known gaps
@@ -117,7 +117,6 @@ Still unexercised:
 
 **Untested code paths that don't need a model:**
 - Cross-volume relocation of a large models folder.
-- The portable SFX build (needs 7-Zip's `7zSD.sfx`, which ships with the LZMA SDK, not the installer).
 - The updater's exe-swap script.
 - MCP against a real server.
 

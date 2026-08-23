@@ -72,13 +72,13 @@ failing mysteriously.
 npm run typecheck        # both tsconfigs
 npm test                 # 78 assertions over the pure logic
 npm run pack:installer   # NSIS installer
-npm run pack:portable    # single-file portable exe (needs 7-Zip + 7zSD.sfx)
+npm run pack:portable    # single-file portable exe
 ```
 
-The portable build uses a 7-Zip SFX with `OverwriteMode=2`, so it unpacks on first run and skips
-straight to launching on every run after that. This matters: electron-builder's stock `portable`
-target re-extracts its whole payload to `%TEMP%` on *every* launch, which with a ~2 GB payload is
-unusable.
+The portable build sets `portable.unpackDirName` to a fixed name, which makes electron-builder
+unpack to a stable directory and **reuse it** on subsequent launches. Without it the default is a
+fresh uuid-named temp directory per launch, which with a multi-gigabyte payload would mean
+re-extracting everything every single time.
 
 Builds are unsigned, so Windows SmartScreen warns on first run.
 
