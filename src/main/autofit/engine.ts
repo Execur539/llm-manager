@@ -16,6 +16,7 @@
  */
 
 import type {
+  Backend,
   FitConstraints,
   FitPlan,
   FitResult,
@@ -86,6 +87,28 @@ export function computeBufferBytes(
   const logits = arch.vocabSize * 4
   const attention = flashAttention ? batchSize * arch.headDim * arch.headCount * 2 * 4 : batchSize * contextLength * arch.headCount * 2
   return activations + logits + attention + BASE_GRAPH_OVERHEAD
+}
+
+/**
+ * Can this device actually participate under the selected backend?
+ *
+ * This matters on mixed rigs. Under CUDA, only NVIDIA devices are addressable — handing
+ * llama.cpp a tensor split that includes an AMD iGPU produces a broken invocation, and even
+ * on Vulkan an integrated GPU sharing system RAM is slower than spilling to the host, so it
+ * should never be given a share while discrete cards are present.
+ */
+export function usableForBackend(gpu: GpuDevice, backend: Backend, hasDiscrete: boolean): boolean {
+  if (gpu.totalVram <= 0) return false
+  if (backend === 'cuda') return gpu.vendor === 'nvidia'
+  if (backend === 'cpu') return false
+  // Vulkan: an iGPU is only worth using when it is the only thing available.
+  if (hasDiscrete && isIntegrated(gpu)) return false
+  return true
+}
+
+/** Integrated GPUs share system RAM; their "VRAM" is not a separate pool. */
+function isIntegrated(gpu: GpuDevice): boolean {
+  return /\bgraphics\b/i.test(gpu.name) && !/\b(rtx|gtx|rx|arc)\b/i.test(gpu.name)
 }
 
 /** Usable bytes on a device after headroom and fixed runtime overhead. */
@@ -257,19 +280,35 @@ export function planFit(
     }
   }
 
-  const budgets = hw.gpus.map((g) => deviceBudget(g, constraints.headroomBytes, hw.backend))
+  // Only devices the selected backend can actually address take part in the plan.
+  const hasDiscrete = hw.gpus.some((g) => g.totalVram > 0 && !/\bgraphics\b/i.test(g.name))
+  const usableGpus = hw.gpus.filter((g) => usableForBackend(g, hw.backend, hasDiscrete))
+  const excluded = hw.gpus.filter((g) => !usableGpus.includes(g) && g.totalVram > 0)
+
+  if (excluded.length) {
+    notes.push(
+      `Excluded from the split: ${excluded.map((g) => g.name).join(', ')} — ` +
+        (hw.backend === 'cuda'
+          ? 'the CUDA backend can only address NVIDIA devices.'
+          : 'integrated GPUs share system memory and would be slower than the discrete cards.')
+    )
+  }
+
+  const budgets = usableGpus.map((g) => deviceBudget(g, constraints.headroomBytes, hw.backend))
   const totalBudget = budgets.reduce((a, b) => a + b, 0)
 
-  const anyUnmeasured = hw.gpus.some((g) => !g.freeIsMeasured)
+  const anyUnmeasured = usableGpus.some((g) => !g.freeIsMeasured)
   if (anyUnmeasured) {
     notes.push(
-      `Free VRAM could not be measured on ${hw.gpus.filter((g) => !g.freeIsMeasured).map((g) => g.name).join(', ')}; ` +
+      `Free VRAM could not be measured on ${usableGpus.filter((g) => !g.freeIsMeasured).map((g) => g.name).join(', ')}; ` +
         `assuming ${Math.round(UNMEASURED_FREE_FRACTION * 100)}% of total is available.`
     )
   }
-  if (hw.gpus.length > 1) {
+  if (usableGpus.length > 1) {
     const pct = proportionalSplit(budgets).map((s) => `${Math.round(s * 100)}%`)
-    notes.push(`Multi-GPU split by free capacity: ${pct.join(' / ')} (not an even split).`)
+    notes.push(
+      `Split across ${usableGpus.length} GPUs by free capacity: ${pct.join(' / ')} — proportional, not even.`
+    )
   }
 
   // Honour user overrides exactly — they are respected, never silently changed.

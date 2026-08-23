@@ -100,7 +100,9 @@ $out | ConvertTo-Json -Compress
     const parsed = JSON.parse(out.trim())
     const list = Array.isArray(parsed) ? parsed : [parsed]
     return list
-      .filter((g: { name?: string; bytes?: number }) => g && g.name)
+      .filter((g: { name?: string; bytes?: number }) => g && g.name && !isVirtualAdapter(g.name))
+      // An adapter reporting no memory cannot be budgeted against, so it is not a compute device.
+      .filter((g: { bytes?: number }) => Number(g.bytes) > 0)
       .map((g: { name: string; bytes: number }, i: number) => ({
         index: i,
         name: g.name,
@@ -114,6 +116,26 @@ $out | ConvertTo-Json -Compress
   } catch {
     return []
   }
+}
+
+/**
+ * Screen-sharing and remote-desktop tools install display adapters that look like GPUs to WMI
+ * but have no compute capability. Counting them produces phantom devices in the fit plan.
+ */
+const VIRTUAL_ADAPTER_PATTERNS = [
+  /virtual/i,
+  /parsec/i,
+  /remote\s*display/i,
+  /\bidd\b/i,
+  /sunshine/i,
+  /moonlight/i,
+  /mirror\s*driver/i,
+  /basic\s+display/i,
+  /meta\b.*\bdriver/i
+]
+
+export function isVirtualAdapter(name: string): boolean {
+  return VIRTUAL_ADAPTER_PATTERNS.some((re) => re.test(name))
 }
 
 function guessVendor(name: string): GpuDevice['vendor'] {

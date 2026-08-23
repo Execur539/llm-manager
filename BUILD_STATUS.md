@@ -12,9 +12,14 @@ but never executed**. Treat that as the headline caveat.
 
 - `npm run typecheck` — clean on both tsconfigs.
 - `npm run build` — main, preload and renderer all bundle.
-- `npm test` — **78 assertions, 78 passing**, covering the auto-fit engine, GBNF compiler,
-  permission engine and hard-block list, the GGUF parser (against a synthesised GGUF file), and
-  quant recommendation.
+- `npm test` — **94 assertions, 94 passing**, covering the auto-fit engine, GBNF compiler,
+  permission engine and hard-block list, the GGUF parser (against a synthesised GGUF file),
+  quant recommendation, and adapter filtering.
+- **The app launches.** Verified on this machine: it initialised `%APPDATA%\LLMManager`, created
+  the SQLite schema, wrote the relocation breadcrumb, scanned the (empty) library, and detected
+  real hardware — `backend=cuda`, RTX 5080 + RTX 4070 Ti + AMD iGPU.
+- **The auto-fit engine was run against that real hardware** (`node scripts/hw-check.mjs`) and
+  produced sane plans for 8B, 27B and 70B models.
 
 What the tests actually prove:
 
@@ -36,7 +41,23 @@ prompts ................ relative paths resolved before display
 GGUF ................... real parse of a synthesised file: header, kv, elided arrays, tensors,
                          head_dim derivation, per-layer vs non-layer weight split
 recommendation ......... picks best quant that fits, steps down on smaller cards, never an mmproj
+mixed rigs ............. CUDA excludes an AMD iGPU; Vulkan skips it only when discrete cards exist
+phantom adapters ....... Parsec / Virtual Desktop / IDD / Basic Display rejected; real GPUs kept
 ```
+
+### Two bugs found by running against real hardware
+
+Worth recording, because both were invisible to synthetic tests:
+
+1. **Virtual display adapters counted as GPUs.** Screen-sharing tools (Parsec, Virtual Desktop)
+   install adapters that WMI reports like graphics cards. They appeared in the device list with
+   0 VRAM.
+2. **The AMD iGPU was given a 2.6% tensor split under the CUDA backend** — where it cannot
+   participate at all. That would have produced a broken `llama-server` invocation.
+
+Together they were stealing budget share: Qwen3.8-27B planned **20,480 tokens** of context before
+the fix and **89,088** after, on the same machine. Both are now filtered, with the exclusion stated
+in the plan's notes rather than applied silently, and both are covered by regression tests.
 
 ## Implemented
 

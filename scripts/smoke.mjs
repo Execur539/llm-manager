@@ -23,6 +23,7 @@ const { toolCallGrammar, schemaGrammar } = await import('./built/gbnf.js')
 const { checkHardBlock, describeCall, PermissionEngine } = await import('./built/permissions.js')
 const { readGguf, extractArchInfo, tensorByteSize } = await import('./built/gguf.js')
 const { recommendQuant, findMmprojFor } = await import('./built/hf.js')
+ const { isVirtualAdapter } = await import('./built/gpu.js')
 
 const GB = 1024 ** 3
 let pass = 0
@@ -154,6 +155,61 @@ section('Never degrades silently')
   cramped.alternatives.forEach((a) =>
     console.log(`  option: ${a.label} — ${a.contextLength.toLocaleString()} ctx, ${a.gpuLayers}/${a.totalLayers} layers, speed ${a.speedScore}`)
   )
+}
+
+section('Mixed rigs — only addressable devices take part')
+{
+  // Regression: this was found by running against a real machine that had an RTX 5080, an
+  // RTX 4070 Ti, an AMD iGPU, and two virtual display adapters from screen-sharing tools.
+  // The phantom devices stole budget share and cut a 27B model from 89K to 20K context.
+  const mixed = hw([
+    gpu('NVIDIA GeForce RTX 5080', 16, 13.2),
+    gpu('NVIDIA GeForce RTX 4070 Ti', 12, 11.7, true, 1),
+    { ...gpu('AMD Radeon(TM) Graphics', 2, -1, false, 2), vendor: 'amd' }
+  ])
+
+  const result = planFit(arch, mixed, DEFAULT_CONSTRAINTS)
+  const plan = result.chosen ?? result.alternatives[0]
+
+  check('CUDA backend excludes the AMD iGPU', plan?.tensorSplit.length === 2, JSON.stringify(plan?.tensorSplit))
+  check('says why it excluded it', result.notes.some((n) => /excluded from the split.*AMD/i.test(n)))
+  check('split still favours the bigger card', (plan?.tensorSplit[0] ?? 0) > (plan?.tensorSplit[1] ?? 1))
+  check('the 27B fits fully on GPU on this rig', plan?.gpuLayers === arch.blockCount)
+  check('reaches a useful context', (plan?.contextLength ?? 0) >= 65536, `${plan?.contextLength}`)
+  console.log(`  ${plan?.contextLength.toLocaleString()} ctx across ${plan?.tensorSplit.length} GPUs`)
+
+  // Under Vulkan an iGPU is usable, but not while discrete cards are present.
+  const vulkanMixed = planFit(arch, { ...mixed, backend: 'vulkan' }, DEFAULT_CONSTRAINTS)
+  const vplan = vulkanMixed.chosen ?? vulkanMixed.alternatives[0]
+  check('Vulkan also skips the iGPU when discrete cards exist', vplan?.tensorSplit.length === 2)
+
+  const igpuOnly = planFit(
+    { ...arch, weightBytes: 1 * GB, perLayerBytes: 0.9 * GB, nonLayerBytes: 0.1 * GB, blockCount: 8 },
+    hw([{ ...gpu('AMD Radeon(TM) Graphics', 8, -1, false), vendor: 'amd' }], 'vulkan'),
+    DEFAULT_CONSTRAINTS
+  )
+  const iplan = igpuOnly.chosen ?? igpuOnly.alternatives[0]
+  check('an iGPU is used when it is the only device', (iplan?.tensorSplit.length ?? 0) === 1)
+}
+
+section('Virtual display adapters are not GPUs')
+{
+  // Screen-sharing tools install display adapters that WMI reports like GPUs.
+  const virtual = [
+    'Virtual Desktop Monitor',
+    'Parsec Virtual Display Adapter',
+    'IDD HDR',
+    'Sunshine Gamestream Mirror',
+    'Microsoft Basic Display Adapter'
+  ]
+  for (const name of virtual) {
+    check(`rejects phantom adapter: ${name}`, isVirtualAdapter(name))
+  }
+
+  const real = ['NVIDIA GeForce RTX 5080', 'AMD Radeon RX 7900 XTX', 'Intel Arc A770', 'AMD Radeon(TM) Graphics']
+  for (const name of real) {
+    check(`keeps real adapter: ${name}`, !isVirtualAdapter(name))
+  }
 }
 
 section('Honest about unmeasurable hardware')

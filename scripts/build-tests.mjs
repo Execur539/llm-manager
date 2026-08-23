@@ -11,7 +11,8 @@ await build({
     gbnf: path.join(ROOT, 'src/main/agent/gbnf.ts'),
     permissions: path.join(ROOT, 'src/main/agent/permissions.ts'),
     hf: path.join(ROOT, 'src/main/downloads/hf.ts'),
-    gguf: path.join(ROOT, 'src/main/models/gguf.ts')
+    gguf: path.join(ROOT, 'src/main/models/gguf.ts'),
+    gpu: path.join(ROOT, 'src/main/hardware/gpu.ts')
   },
   outdir: path.join(ROOT, 'scripts/built'),
   bundle: true,
