@@ -1,0 +1,7 @@
+node_modules/
+out/
+dist/
+vendor/
+scripts/built/
+LLMManagerModels/
+*.log
