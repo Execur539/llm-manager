@@ -67,10 +67,18 @@ class EmbeddingService {
       }
 
       const port = await freePort()
-      const exe = llamaServerPath(backend)
+
+      // Same stand-in as the chat runtime when running under test: the embedding server is a
+      // second llama-server process, so it needs the same seam or RAG cannot be exercised
+      // without a GPU.
+      const useMock = process.env.LLMM_MOCK_LLAMA === '1'
+      const exe = useMock ? process.execPath : llamaServerPath(backend)
+      const mockScript = process.env.LLMM_MOCK_SCRIPT ?? ''
+
       const child = spawn(
         exe,
         [
+          ...(useMock ? [mockScript] : []),
           '--model', wanted,
           '--host', '127.0.0.1',
           '--port', String(port),
@@ -80,7 +88,10 @@ class EmbeddingService {
           '--n-gpu-layers', '0',
           '--ctx-size', '8192'
         ],
-        { windowsHide: true, env: childEnv() }
+        {
+          windowsHide: true,
+          env: useMock ? { ...childEnv(), ELECTRON_RUN_AS_NODE: '1' } : childEnv()
+        }
       )
       this.child = child
       child.on('exit', () => {

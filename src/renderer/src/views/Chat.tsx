@@ -182,7 +182,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
           )}
 
           {messages.map((m) => (
-            <div className="msg" key={m.id}>
+            <div className={`msg from-${m.role}`} key={m.id}>
               <div className="who">{m.role}</div>
               {m.role === 'assistant' ? (
                 <Markdown source={m.content} />
@@ -193,7 +193,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
           ))}
 
           {partial && (
-            <div className="msg" data-testid="streaming-message">
+            <div className="msg from-assistant" data-testid="streaming-message">
               <div className="who">assistant</div>
               <div className="body streaming">
                 <Markdown source={partial} />
@@ -202,7 +202,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
             </div>
           )}
           {busy && !partial && (
-            <div className="msg">
+            <div className="msg from-assistant">
               <div className="who">assistant</div>
               <div className="body dim">Thinking…</div>
             </div>

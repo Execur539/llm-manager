@@ -222,7 +222,7 @@ const AUDIT_FN = () => {
     }
   }
 
-  // 8. Values that should never reach the screen.
+  // 9. Values that should never reach the screen.
   const leaked = []
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
   let node
@@ -240,9 +240,19 @@ const AUDIT_FN = () => {
   for (const l of leaked) add('leaked-value', `${l.where}: "${l.text}"`, null)
 
   // 7. Overlapping interactive controls — a strong signal of broken layout.
-  const controls = [...document.querySelectorAll('button, input, select, textarea')]
+  // A modal deliberately covers the page behind it, so comparing its controls against the
+  // inert background is meaningless. When one is open, audit only inside it.
+  const modal = document.querySelector('.overlay [role="dialog"], .overlay .modal')
+  const scope = modal ?? document
+  const controls = [...scope.querySelectorAll('button, input, select, textarea')]
     .map((el) => ({ el, r: el.getBoundingClientRect() }))
-    .filter(({ el, r }) => r.width > 0 && r.height > 0 && getComputedStyle(el).position !== 'absolute')
+    .filter(({ el, r }) => {
+      if (r.width === 0 || r.height === 0) return false
+      const pos = getComputedStyle(el).position
+      if (pos === 'absolute' || pos === 'fixed') return false
+      // Anything inside a positioned overlay floats over the layout by design.
+      return !el.closest('.overlay') || Boolean(modal)
+    })
   for (let i = 0; i < controls.length; i++) {
     for (let j = i + 1; j < controls.length; j++) {
       const a = controls[i].r
@@ -300,6 +310,24 @@ const AUDIT_FN = () => {
     for (let i = layers.length - 1; i >= 0; i--) result = over(layers[i], result)
     return result
   }
+  // Controls left with the browser default styling. In a dark theme an unstyled input is a
+  // white box, and the contrast check misses it because dark-on-white reads as legible.
+  const pageLuminance = (() => {
+    const c = parseRgba(getComputedStyle(document.body).backgroundColor)
+    return c ? luminance(c.slice(0, 3)) : 0
+  })()
+  if (pageLuminance < 0.3) {
+    for (const el of document.querySelectorAll('input, select, textarea')) {
+      const type = el.getAttribute('type')
+      if (type === 'checkbox' || type === 'radio' || type === 'range') continue
+      const c = parseRgba(getComputedStyle(el).backgroundColor)
+      if (!c || c[3] === 0) continue
+      if (luminance(c.slice(0, 3)) > 0.4) {
+        add('unthemed-control', `background ${getComputedStyle(el).backgroundColor} on a dark theme`, el)
+      }
+    }
+  }
+
   const textEls = all.filter(
     (el) => [...el.childNodes].some((n) => n.nodeType === 3 && (n.nodeValue ?? '').trim().length > 2)
   )

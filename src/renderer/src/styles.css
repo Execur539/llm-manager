@@ -168,6 +168,27 @@ h1 {
 .kv dd {
   margin: 0;
   font-family: var(--mono);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/*
+ * The monospace face is for the value itself. Helper text sitting beside it is prose and
+ * reads badly in a mono face, so it opts back out.
+ */
+.kv dd .faint,
+.kv dd label,
+.kv dd .note-text {
+  font-family: 'Segoe UI', system-ui, sans-serif;
+}
+
+/* Give inputs inside a definition row room to show their content. */
+.kv dd input[type='text'],
+.kv dd input[type='password'] {
+  flex: 1 1 220px;
+  min-width: 0;
 }
 
 button {
@@ -357,14 +378,33 @@ input:focus {
   border-color: var(--accent-dim);
 }
 
-input[type='text'],
-input[type='number'] {
+/*
+ * Every textual control, selected by exclusion rather than by listing types. Enumerating
+ * text and number left password, search, email and url inputs with the browser default —
+ * a white box in a dark theme.
+ */
+input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='file']),
+select,
+textarea {
   background: var(--bg-inset);
   border: 1px solid var(--border);
   border-radius: 5px;
   color: var(--text);
   font: inherit;
   padding: 5px 8px;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-faint);
+  opacity: 1;
+}
+
+input:disabled,
+textarea:disabled,
+select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* ---------------------------------------------------------------- modal */
@@ -995,4 +1035,91 @@ h6.md-heading { font-size: 13px; color: var(--text-dim); }
   flex: 1;
   min-width: 0;
   color: var(--text-dim);
+}
+
+/* ---------------------------------------------------------------- confirm dialog */
+
+.confirm-modal {
+  width: min(520px, 90vw);
+}
+
+.confirm-body p {
+  margin: 0 0 10px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.confirm-body p:last-child {
+  margin-bottom: 0;
+}
+
+.confirm-phrase {
+  display: block;
+  margin-top: 14px;
+}
+
+.confirm-phrase span {
+  display: block;
+  font-size: 11px;
+  margin-bottom: 5px;
+}
+
+.confirm-phrase input {
+  width: 100%;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 7px 9px;
+}
+
+/* ---------------------------------------------------------------- definition rows */
+
+/* Buttons are chrome, not data — they should not inherit the value column's mono face. */
+.kv dd button,
+.kv dd select {
+  font-family: 'Segoe UI', system-ui, sans-serif;
+}
+
+/*
+ * Cap field width. Stretching a domain or email box across the full pane makes the form read
+ * as a wall of empty boxes and puts the label a long way from its value.
+ */
+.kv dd input {
+  max-width: 420px;
+}
+
+/* ---------------------------------------------------------------- messages */
+
+.msg {
+  margin-bottom: 16px;
+}
+
+/*
+ * The user's own turns get a quiet surface so the conversation has a visible rhythm. The
+ * assistant stays on the page background: it is the longer, more-read text, and boxing it
+ * would fight the markdown structure inside it.
+ */
+.msg.from-user .body {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 12px;
+}
+
+.msg .who {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.msg.from-user .who {
+  color: var(--accent);
+}
+
+/* Tool cards are steps in a transcript, so they sit slightly inset from the messages. */
+.tool-card {
+  margin-left: 2px;
 }

@@ -8,7 +8,15 @@
 
 import type { GgufValue, HardwareSnapshot, ModelArchInfo } from '@shared/types'
 
-const HF_API = 'https://huggingface.co/api'
+/**
+ * HuggingFace API root.
+ *
+ * Overridable so the download flow can be exercised end to end without network access, and so a
+ * user behind a mirror can point at it. Only the API base moves; resolved file URLs come from
+ * the API response itself.
+ */
+const HF_BASE = process.env.LLMM_HF_BASE ?? 'https://huggingface.co'
+const HF_API = `${HF_BASE}/api`
 
 export interface HfModelSummary {
   id: string
@@ -95,7 +103,7 @@ export async function listFiles(repo: string, token: string | null): Promise<HfF
         filename,
         bytes: f.lfs?.size ?? f.size ?? 0,
         quant: base.match(QUANT_RE)?.[0]?.toUpperCase() ?? null,
-        url: `https://huggingface.co/${repo}/resolve/main/${encodeURI(filename)}`,
+        url: `${HF_BASE}/${repo}/resolve/main/${encodeURI(filename)}`,
         isMmproj: /mmproj/i.test(base),
         shard: shardMatch ? { index: Number(shardMatch[1]), total: Number(shardMatch[2]) } : null
       }

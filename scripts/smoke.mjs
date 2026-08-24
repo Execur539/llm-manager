@@ -503,6 +503,12 @@ section('Quant recommendation')
   check('finds the mmproj companion', findMmprojFor(files)?.filename === 'mmproj-f16.gguf')
 }
 
+// ---------------------------------------------------------------- markdown
+
+// Lives in its own module: the grammar has enough cases to be worth grouping.
+const { runMarkdownTests } = await import('./markdown-tests.mjs')
+await runMarkdownTests(check, section)
+
 // ---------------------------------------------------------------- summary
 
 console.log(`\n${'='.repeat(60)}`)

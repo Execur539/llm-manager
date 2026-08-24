@@ -156,6 +156,54 @@ export async function cleanupEnv(env) {
   }
 }
 
+/** Start the HuggingFace stand-in and return its base URL. */
+export async function startMockHf() {
+  const { spawn } = await import('node:child_process')
+  const child = spawn(process.execPath, [path.join(ROOT, 'scripts', 'e2e', 'mock-hf.mjs'), '--port', '0'], {
+    stdio: ['ignore', 'pipe', 'inherit']
+  })
+  const port = await new Promise((resolve, reject) => {
+    let buf = ''
+    child.stdout.on('data', (d) => {
+      buf += d
+      const first = buf.trim().split(/\r?\n/)[0]
+      if (/^\d+$/.test(first)) resolve(Number(first))
+    })
+    child.on('error', reject)
+    setTimeout(() => reject(new Error('mock-hf did not start')), 10000)
+  })
+  return {
+    base: `http://127.0.0.1:${port}`,
+    async control(params) {
+      const qs = new URLSearchParams(params).toString()
+      await fetch(`http://127.0.0.1:${port}/__control?${qs}`)
+    },
+    stop() {
+      child.kill()
+    }
+  }
+}
+
+/** Write a plain-text document for RAG ingestion. */
+export async function addDocument(env, name, content) {
+  const dir = path.join(env.base, 'docs')
+  await fsp.mkdir(dir, { recursive: true })
+  const file = path.join(dir, name)
+  await fsp.writeFile(file, content, 'utf8')
+  return file
+}
+
+/** Place a stand-in embedding model where the app expects to find one. */
+export async function addEmbeddingModel(env) {
+  const dir = path.join(ROOT, 'vendor', 'models')
+  await fsp.mkdir(dir, { recursive: true })
+  const file = path.join(dir, 'embedding.gguf')
+  if (!fs.existsSync(file)) {
+    await fsp.writeFile(file, buildGguf({ architecture: 'nomic-bert', name: 'embed', ssm: false, vocabSize: 512 }))
+  }
+  return file
+}
+
 export function envVars(env, extra = {}) {
   return {
     ...process.env,

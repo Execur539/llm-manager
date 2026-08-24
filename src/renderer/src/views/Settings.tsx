@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { AppSettings } from '@shared/types'
 import { invoke, on } from '../lib/api'
+import ConfirmDialog from '../components/ConfirmDialog'
 
 interface McpStatus {
   id: string
@@ -26,6 +27,7 @@ export default function Settings(): JSX.Element {
   const [update, setUpdate] = useState<{ available: boolean; latestVersion: string | null; notes: string | null; downloadUrl: string | null; error?: string } | null>(null)
   const [version, setVersion] = useState('')
   const [info, setInfo] = useState<string | null>(null)
+  const [confirmHardBlocks, setConfirmHardBlocks] = useState(false)
 
   // New MCP server form
   const [mcpName, setMcpName] = useState('')
@@ -199,16 +201,13 @@ export default function Settings(): JSX.Element {
           <button
             className="danger"
             style={{ marginTop: 10 }}
-            onClick={async () => {
+            data-testid="toggle-hard-blocks"
+            onClick={() => {
+              // Re-enabling protection is safe and immediate; removing it is not.
               if (settings.agent.hardBlocksDisabled) {
-                await patch({ agent: { ...settings.agent, hardBlocksDisabled: false } })
-                return
-              }
-              const typed = prompt(
-                'Disabling hard blocks lets the model run irreversible commands — formatting drives, deleting system roots, disabling Defender.\n\nType DISABLE HARD BLOCKS to confirm:'
-              )
-              if (typed === 'DISABLE HARD BLOCKS') {
-                await patch({ agent: { ...settings.agent, hardBlocksDisabled: true } })
+                void patch({ agent: { ...settings.agent, hardBlocksDisabled: false } })
+              } else {
+                setConfirmHardBlocks(true)
               }
             }}
           >
@@ -339,6 +338,32 @@ export default function Settings(): JSX.Element {
           </div>
         )}
       </div>
+
+      <ConfirmDialog
+        open={confirmHardBlocks}
+        danger
+        title="Disable hard blocks?"
+        confirmLabel="Disable hard blocks"
+        requirePhrase="DISABLE HARD BLOCKS"
+        body={
+          <>
+            <p>
+              Hard blocks are the last thing standing between a confused model and an
+              unrecoverable command. With them off the agent can format drives, delete system
+              roots, overwrite the bootloader and disable security tooling.
+            </p>
+            <p className="faint">
+              Approval prompts still apply. This only removes the refusals that no approval can
+              override.
+            </p>
+          </>
+        }
+        onCancel={() => setConfirmHardBlocks(false)}
+        onConfirm={() => {
+          setConfirmHardBlocks(false)
+          void patch({ agent: { ...settings.agent, hardBlocksDisabled: true } })
+        }}
+      />
     </>
   )
 }
