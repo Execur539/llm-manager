@@ -90,6 +90,17 @@ export interface ModelRecord {
   lastUsedAt: number | null
   favourite: boolean
   tags: string[]
+  /**
+   * Quant as advertised by the filename, e.g. "UD-Q4_K_XL".
+   *
+   * Distinct from `arch.quant`, which is the dominant tensor type by bytes. Mixed-precision
+   * quants (Unsloth's UD series, and others that bump important tensors) legitimately disagree:
+   * a file called Q4_K_XL can be mostly Q5_K tensors. Showing the tensor type as though it were
+   * the file's quant contradicts its own name, so display prefers this.
+   */
+  quantLabel: string | null
+  /** true when the filename quant and the dominant tensor type disagree */
+  mixedQuant: boolean
   /** set when the file could not be parsed */
   error?: string
 }

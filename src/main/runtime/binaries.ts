@@ -17,9 +17,14 @@ export type BinaryName = 'llama-server' | 'ffmpeg' | 'cloudflared' | 'python' | 
 function vendorRoot(): string {
   // Escape hatch for development and test harnesses, which may run with a different app path.
   if (process.env.LLMM_VENDOR_DIR) return process.env.LLMM_VENDOR_DIR
-  // Packaged: <exe dir>/.llmmanager-runtime/vendor  (written once on first run)
-  // Dev:      <project>/vendor
-  if (app.isPackaged) return path.join(path.dirname(app.getPath('exe')), '.llmmanager-runtime', 'vendor')
+
+  // Packaged: electron-builder copies `extraResources` into the resources directory, so the
+  // vendor tree sits at <resources>/vendor. This must not be derived from the exe path —
+  // the portable build's exe lives in an extraction cache and LLMM_PORTABLE_DIR deliberately
+  // points elsewhere, so anything computed from `exe` would look in the wrong place.
+  if (app.isPackaged) return path.join(process.resourcesPath, 'vendor')
+
+  // Dev: <project>/vendor
   return path.join(app.getAppPath(), 'vendor')
 }
 
@@ -93,6 +98,26 @@ export function chromiumExecutable(): string | null {
 
 export function vendorDir(): string {
   return vendorRoot()
+}
+
+/**
+ * Diagnostic detail for the "setup incomplete" panel.
+ *
+ * Reports the directory that was searched, because a wrong vendor root looks exactly like
+ * missing downloads — which is precisely how this went unnoticed in the first packaged build.
+ */
+export function vendorDiagnostics(backend: Backend): {
+  root: string
+  rootExists: boolean
+  missing: string[]
+  present: string[]
+} {
+  const root = vendorRoot()
+  const missing = missingBinaries(backend)
+  const present = ['llama.cpp', 'ffmpeg', 'python', 'cloudflared', 'rg', 'chromium', 'models'].filter((d) =>
+    fs.existsSync(path.join(root, d))
+  )
+  return { root, rootExists: fs.existsSync(root), missing, present }
 }
 
 export function missingBinaries(backend: Backend): string[] {

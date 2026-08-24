@@ -27,7 +27,7 @@ import { scanLibrary, libraryDiskUsage } from './models/library'
 import { checkRelocation, keepInPlace, performMove } from './models/relocation'
 import { DEFAULT_CONSTRAINTS, planFit, verifyPrediction } from './autofit/engine'
 import { llama } from './runtime/llama'
-import { missingBinaries, embeddingModelPath } from './runtime/binaries'
+import { missingBinaries, embeddingModelPath, vendorDiagnostics } from './runtime/binaries'
 import { Agent } from './agent/loop'
 import { killAllJobs } from './agent/tools/exec'
 import { closeBrowser } from './agent/tools/browser'
@@ -227,6 +227,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     return hardware
   },
   'runtime:missing-binaries': async () => missingBinaries((await getHardware()).backend),
+  'runtime:vendor-diagnostics': async () => vendorDiagnostics((await getHardware()).backend),
   'runtime:vendor-info': async () => ({
     exeDir: exeDir(),
     modelsDir: modelsDir(),

@@ -31,7 +31,7 @@ export default function Dashboard({
 }): JSX.Element {
   const [live, setLive] = useState<LiveStats | null>(null)
   const [history, setHistory] = useState<History | null>(null)
-  const [missing, setMissing] = useState<string[]>([])
+  const [vendor, setVendor] = useState<{ root: string; rootExists: boolean; missing: string[]; present: string[] } | null>(null)
 
   useEffect(() => {
     const tick = async (): Promise<void> => {
@@ -43,7 +43,7 @@ export default function Dashboard({
     }
     void tick()
     void invoke<History>('stats:history').then(setHistory).catch(() => undefined)
-    void invoke<string[]>('runtime:missing-binaries').then(setMissing).catch(() => undefined)
+    void invoke<typeof vendor>('runtime:vendor-diagnostics').then(setVendor).catch(() => undefined)
     const timer = setInterval(tick, 2000)
     return () => clearInterval(timer)
   }, [])
@@ -53,15 +53,31 @@ export default function Dashboard({
       <h1>Dashboard</h1>
       <p className="subtitle">Everything here is measured at runtime. No hardware values are assumed.</p>
 
-      {missing.length > 0 && (
+      {vendor && vendor.missing.length > 0 && (
         <div className="card" style={{ borderColor: '#5a4515' }}>
           <div className="card-title">
-            Setup incomplete <span className="badge warn">{missing.length} missing</span>
+            Setup incomplete <span className="badge warn">{vendor.missing.length} missing</span>
           </div>
           <div className="dim">
-            These bundled components have not been fetched, so the features that need them are unavailable:
-            <div className="mono" style={{ margin: '8px 0' }}>{missing.join(', ')}</div>
-            Run <code className="mono">npm run fetch-vendor</code> to download them.
+            These bundled components could not be found, so the features that need them are unavailable:
+            <div className="mono" style={{ margin: '8px 0' }}>{vendor.missing.join(', ')}</div>
+            <div style={{ marginTop: 8 }}>
+              Searched: <span className="mono">{vendor.root}</span>{' '}
+              <span className={`badge ${vendor.rootExists ? 'good' : 'bad'}`}>
+                {vendor.rootExists ? 'exists' : 'not found'}
+              </span>
+            </div>
+            {vendor.rootExists && vendor.present.length > 0 && (
+              <div className="faint" style={{ marginTop: 4, fontSize: 11 }}>
+                Found there: {vendor.present.join(', ')}
+              </div>
+            )}
+            <div style={{ marginTop: 8 }}>
+              {vendor.rootExists
+                ? 'Some components are absent from that directory.'
+                : 'That directory does not exist.'}{' '}
+              Run <code className="mono">npm run fetch-vendor</code> to download them.
+            </div>
           </div>
         </div>
       )}

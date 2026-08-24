@@ -19,6 +19,7 @@ import { getHfToken } from './remote/auth'
 import { apiServer } from './api/server'
 import { remoteWeb } from './remote/web'
 import { llama } from './runtime/llama'
+import { vendorDiagnostics } from './runtime/binaries'
 import { handlers, invokeBridge, setEmitter, setLibrary, shutdown, modelsDir } from './bridge'
 import { installCrashHandlers, logger } from './log'
 
@@ -224,6 +225,13 @@ app.whenReady().then(async () => {
   void detectHardware()
     .then((hw) => {
       logger.info('hardware', `backend=${hw.backend}`, hw.gpus.map((g) => g.name))
+      // Log where the bundled binaries were looked for. A wrong vendor root is indistinguishable
+      // from missing downloads in the UI, so record the resolved path on every launch.
+      const vendor = vendorDiagnostics(hw.backend)
+      logger.info('vendor', `root=${vendor.root} exists=${vendor.rootExists}`, {
+        present: vendor.present,
+        missing: vendor.missing
+      })
       mainWindow?.webContents.send('hardware:update', hw)
     })
     .catch((err) => logger.warn('hardware', 'detection failed', String(err)))

@@ -212,7 +212,19 @@ export default function Library({
             <div className="row" style={{ flexWrap: 'wrap', marginBottom: 8 }}>
               <FitBadge fit={fits[m.id] ?? null} />
               <span className="badge">{fmtBytes(m.bytes)}</span>
-              {m.arch && <span className="badge">{m.arch.quant}</span>}
+              {(m.quantLabel || m.arch) && (
+                <span
+                  className="badge"
+                  title={
+                    m.mixedQuant && m.arch
+                      ? `Filename says ${m.quantLabel}; most tensors are ${m.arch.quant} (mixed-precision quant)`
+                      : undefined
+                  }
+                >
+                  {m.quantLabel ?? m.arch?.quant}
+                  {m.mixedQuant && ' *'}
+                </span>
+              )}
               {m.arch && m.arch.contextLength > 0 && (
                 <span className="badge">{(m.arch.contextLength / 1024).toFixed(0)}K trained</span>
               )}

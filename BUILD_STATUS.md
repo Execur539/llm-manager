@@ -121,10 +121,29 @@ third run       1.9s   -> 27x speedup, extraction genuinely skipped
 on exit        runtime dir survives (electron-builder's portable target deletes it)
 ```
 
+**The packaged build could not find its own bundled binaries.** `vendorRoot()` returned
+`<exe dir>/.llmmanager-runtime/vendor`, a path left over from the first packaging design that
+electron-builder never creates. All 2.7 GB of binaries were correctly bundled at
+`resources/vendor`, so the dashboard reported "7 missing" and `model:load` failed with ENOENT —
+both from one wrong constant. Fixed to use `process.resourcesPath`.
+
+Because a wrong vendor root is indistinguishable from missing downloads, two diagnostics were
+added so this cannot hide again: the resolved root is logged on every launch, and the
+"Setup incomplete" panel now names the directory it searched and whether it exists.
+
+Verified from the portable exe's own log:
+
+```
+[vendor] root=...untime-0.1.0esourcesendor exists=true
+         present: llama.cpp, ffmpeg, python, cloudflared, rg, chromium, models
+         missing: []
+```
+
 **A data-loss bug found by actually running the portable build.** `exeDir()` returned
 `path.dirname(app.getPath('exe'))`, which for a portable build is the *extraction cache*, not the
 folder holding the exe the user launched. So "models live beside the exe" resolved to
-`%LOCALAPPDATA%\LLMManageruntime-0.1.0\LLMManagerModels`, and the relocation feature
+`%LOCALAPPDATA%\LLMManager
+untime-0.1.0\LLMManagerModels`, and the relocation feature
 faithfully moved an 18 GB library into it — filling the C: drive to 99%. Worse, the launcher's
 upgrade cleanup deletes old `runtime-*` directories, so the next version bump would have taken
 the models with it.

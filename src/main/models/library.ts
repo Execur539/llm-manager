@@ -28,6 +28,20 @@ interface IndexEntry {
  */
 const NATIVE_VIDEO_HINTS = [/qwen3\.?8/i, /qwen3-?vl/i, /qwen2\.5-?vl/i, /omni/i, /video/i]
 
+/**
+ * Quant advertised by the filename. Handles plain quants (Q4_K_M) and vendor-prefixed
+ * mixed-precision variants (UD-Q4_K_XL, i1-Q4_K_S).
+ */
+const FILENAME_QUANT_RE = /(?:^|[-_.])((?:UD|i1|IQ)?[-_]?(?:IQ\d[A-Z_]*|Q\d(?:_[A-Z0-9]+)*|BF16|F16|F32))(?=[-_.]|$)/i
+
+export function quantFromFilename(filename: string): string | null {
+  const base = filename.replace(/\.gguf$/i, '')
+  const matches = [...base.matchAll(new RegExp(FILENAME_QUANT_RE, 'gi'))]
+  if (!matches.length) return null
+  // The quant is conventionally the last such token in the name.
+  return matches[matches.length - 1][1].replace(/^[-_]/, '').toUpperCase()
+}
+
 function idFor(filePath: string): string {
   return crypto.createHash('sha1').update(filePath.toLowerCase()).digest('hex').slice(0, 16)
 }
@@ -159,6 +173,7 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
       const meta = await readGguf(file)
       const arch = extractArchInfo(meta)
       const caps = await detectCapabilities(file, arch.architecture, arch.name, mmproj, templateSupportsTools(meta))
+      const quantLabel = quantFromFilename(path.basename(file))
       record = {
         id: idFor(file),
         repo: null,
@@ -170,7 +185,11 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
         addedAt: st.birthtimeMs || Date.now(),
         lastUsedAt: null,
         favourite: false,
-        tags: autoTags(arch.quant, arch.contextLength, caps, st.size)
+        quantLabel,
+        // Mixed-precision quants advertise one thing and are mostly another; flag the mismatch
+        // rather than silently showing whichever we happened to compute.
+        mixedQuant: !!quantLabel && !quantLabel.includes(arch.quant) && !arch.quant.includes(quantLabel),
+        tags: autoTags(quantLabel ?? arch.quant, arch.contextLength, caps, st.size)
       }
     } catch (err) {
       record = {
@@ -184,6 +203,8 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
         addedAt: Date.now(),
         lastUsedAt: null,
         favourite: false,
+        quantLabel: quantFromFilename(path.basename(file)),
+        mixedQuant: false,
         tags: [],
         error: err instanceof Error ? err.message : String(err)
       }
