@@ -16,7 +16,8 @@
     "pack:dir": "electron-vite build && electron-builder --win --dir",
     "pack:installer": "electron-vite build && electron-builder --win nsis",
     "pack:portable": "npm run pack:dir && node scripts/make-portable.mjs",
-    "dist": "npm run pack:installer && npm run pack:portable"
+    "dist": "npm run pack:installer && npm run pack:portable",
+    "test:e2e": "node scripts/e2e/run.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

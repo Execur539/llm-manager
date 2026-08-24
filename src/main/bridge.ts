@@ -66,6 +66,14 @@ let agent: Agent | null = null
 
 const pendingPermissions = new Map<string, (d: PermissionDecision) => void>()
 
+/**
+ * The session the agent is currently working on.
+ *
+ * Every agent event carries this, so the renderer can attribute streamed text to the right
+ * conversation even when that conversation's view is not mounted.
+ */
+let activeAgentSessionId = ''
+
 type Emitter = (channel: string, payload: unknown) => void
 let emit: Emitter = () => undefined
 
@@ -101,14 +109,15 @@ function getAgent(): Agent {
         })
     })
 
-    agent.on('delta', (t: string) => emit('agent:delta', t))
-    agent.on('message', (m) => emit('agent:message', m))
-    agent.on('toolCall', (c) => emit('agent:tool-call', c))
-    agent.on('toolResult', (r) => emit('agent:tool-result', r))
-    agent.on('subToolCall', (c) => emit('agent:sub-tool-call', c))
-    agent.on('compacted', (info) => emit('agent:compacted', info))
-    agent.on('done', (reason) => emit('agent:done', reason))
-    agent.on('error', (e) => emit('agent:error', e))
+    const sid = (): string => activeAgentSessionId
+    agent.on('delta', (t: string) => emit('agent:delta', { sessionId: sid(), text: t }))
+    agent.on('message', (m) => emit('agent:message', { sessionId: sid(), message: m }))
+    agent.on('toolCall', (c) => emit('agent:tool-call', { sessionId: sid(), call: c }))
+    agent.on('toolResult', (r) => emit('agent:tool-result', { sessionId: sid(), result: r }))
+    agent.on('subToolCall', (c) => emit('agent:sub-tool-call', { sessionId: sid(), call: c }))
+    agent.on('compacted', (info) => emit('agent:compacted', { sessionId: sid(), ...(info as object) }))
+    agent.on('done', (reason) => emit('agent:done', { sessionId: sid(), reason }))
+    agent.on('error', (e) => emit('agent:error', { sessionId: sid(), message: e }))
 
     // Remembered approvals are per folder and survive restarts.
     agent.loadPermissionRules(
@@ -518,6 +527,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     })
 
     const before = session.messages.length
+    activeAgentSessionId = sessionId
     a.hydrate(session)
     await a.run(session, input)
 

@@ -90,8 +90,28 @@ body {
 /* ---------------------------------------------------------------- main */
 
 .main {
-  overflow: auto;
   padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/*
+ * Full-height views (chat, agent, documents) fill the pane instead of scrolling it.
+ *
+ * These previously sized themselves with calc(100vh - 44px) while nested inside .main's 40px of
+ * padding, so the child was taller than its parent by construction: the page grew a second
+ * scrollbar and the top of the content clipped. Flexbox derives the height from what is actually
+ * available, so there is no constant to keep in sync.
+ */
+.main.fill {
+  overflow: hidden;
+}
+
+.main.fill > * {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 h1 {
@@ -249,11 +269,14 @@ pre {
 .chat {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 40px);
+  min-height: 0;
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
 .messages {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   padding-right: 6px;
 }
@@ -297,12 +320,15 @@ pre {
   display: none;
 }
 
+/*
+ * The detail body must not scroll: the <pre> blocks inside it already do, and nesting the two
+ * put a scrollbar inside a scrollbar — you had to scroll the code, then scroll the card, to
+ * reach the rest. The card grows instead, and the message list is the single scroll region.
+ */
 .tool-card .detail {
   border-top: 1px solid var(--border);
   padding: 8px 10px;
-  white-space: pre-wrap;
-  max-height: 300px;
-  overflow: auto;
+  white-space: normal;
 }
 
 .composer {
@@ -310,6 +336,7 @@ pre {
   gap: 8px;
   padding-top: 10px;
   border-top: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 textarea {
@@ -394,14 +421,15 @@ input[type='number'] {
 .split {
   display: flex;
   gap: 16px;
-  height: calc(100vh - 44px);
   min-height: 0;
+  flex: 1 1 auto;
 }
 
 .side-list {
   width: 220px;
   flex-shrink: 0;
   overflow-y: auto;
+  min-height: 0;
   border-right: 1px solid var(--border);
   padding-right: 12px;
 }
@@ -591,4 +619,380 @@ code.mono {
 input[type='checkbox'],
 input[type='radio'] {
   accent-color: var(--accent);
+}
+
+/* ---------------------------------------------------------------- conversation list */
+
+.side-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.new-button {
+  width: 100%;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+
+.side-item {
+  position: relative;
+  padding: 8px 9px;
+}
+
+.side-item-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.side-item-meta {
+  font-size: 10px;
+  margin-top: 2px;
+}
+
+/* Actions stay out of the way until the row is hovered or focused within. */
+.side-item-actions {
+  display: none;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.side-item:hover .side-item-actions,
+.side-item:focus-within .side-item-actions {
+  display: flex;
+}
+
+button.tiny {
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  line-height: 1.5;
+}
+
+.rename-input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--accent-dim);
+  border-radius: 4px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
+/* A quiet pulse marks a conversation still receiving tokens. */
+.dot-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+/* ---------------------------------------------------------------- chat surfaces */
+
+.row.head {
+  margin-bottom: 10px;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.error-card {
+  border-color: #5c2626;
+}
+
+.dismissible {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.empty.small {
+  font-size: 12px;
+  padding: 20px 0;
+}
+
+.tiny-note {
+  font-size: 11px;
+  margin-top: 6px;
+}
+
+/* ---------------------------------------------------------------- tool cards */
+
+.tool-card summary {
+  gap: 8px;
+  min-width: 0;
+}
+
+.tool-name {
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.tool-detail {
+  color: var(--text-dim);
+  flex: 1;
+  min-width: 0;
+}
+
+.tool-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.detail-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-faint);
+  margin: 2px 0 4px;
+}
+
+/* Long output scrolls inside the card rather than stretching the page. */
+.detail-pre {
+  margin: 0 0 10px;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg);
+}
+
+/* ---------------------------------------------------------------- modal */
+
+.modal-label {
+  margin-bottom: 4px;
+}
+
+.resolved-action {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+}
+
+/* ---------------------------------------------------------------- control sizing */
+
+/*
+ * Browser-default checkboxes render at 13x13, which is an uncomfortably small target and looks
+ * undersized next to 13px text. Sizing them explicitly also makes them align with their labels
+ * instead of sitting a pixel high.
+ */
+input[type='checkbox'],
+input[type='radio'] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  flex-shrink: 0;
+  vertical-align: -2px;
+  cursor: pointer;
+}
+
+label {
+  cursor: pointer;
+}
+
+/*
+ * Inputs default to a content-based min-width, so a flex row of input + button overflows its
+ * container rather than letting the input shrink. This is what pushed the Documents sidebar
+ * 3px past its width.
+ */
+.row > input[type='text'],
+.row > input[type='password'],
+.row > input[type='number'],
+.row > select {
+  min-width: 0;
+}
+
+.side-list .row > input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.side-list .row > button {
+  flex: 0 0 auto;
+}
+
+/* ---------------------------------------------------------------- markdown */
+
+.markdown {
+  line-height: 1.62;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* Collapse the outer margins so a reply starts and ends flush with its label. */
+.markdown > *:first-child { margin-top: 0; }
+.markdown > *:last-child { margin-bottom: 0; }
+
+.md-p {
+  margin: 0 0 10px;
+  white-space: pre-wrap;
+}
+
+.md-heading {
+  margin: 16px 0 8px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--text);
+}
+
+h3.md-heading { font-size: 15px; }
+h4.md-heading { font-size: 14px; }
+h5.md-heading,
+h6.md-heading { font-size: 13px; color: var(--text-dim); }
+
+.md-list {
+  margin: 0 0 10px;
+  padding-left: 22px;
+}
+
+.md-list li {
+  margin-bottom: 3px;
+}
+
+/* Nested lists sit tighter than the outer one. */
+.md-list .md-list {
+  margin: 3px 0 0;
+}
+
+.md-code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.md-pre {
+  position: relative;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 0 0 10px;
+  /* Code scrolls inside its own box; it must never widen the message column. */
+  overflow-x: auto;
+  max-height: 420px;
+}
+
+.md-pre code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre;
+  display: block;
+}
+
+.md-lang {
+  position: absolute;
+  top: 5px;
+  right: 8px;
+  font-size: 9px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  pointer-events: none;
+}
+
+.md-quote {
+  margin: 0 0 10px;
+  padding: 2px 0 2px 12px;
+  border-left: 2px solid var(--accent-dim);
+  color: var(--text-dim);
+}
+
+.md-table-wrap {
+  overflow-x: auto;
+  margin: 0 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.md-table {
+  border-collapse: collapse;
+  font-size: 12px;
+  width: 100%;
+}
+
+.md-table th,
+.md-table td {
+  padding: 6px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.md-table th {
+  background: var(--bg-inset);
+  color: var(--text-dim);
+  font-weight: 600;
+  position: static;
+}
+
+.md-table tr:last-child td {
+  border-bottom: none;
+}
+
+.md-hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 14px 0;
+}
+
+.markdown a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.markdown a:hover {
+  text-decoration: underline;
+}
+
+/* The caret trails the last rendered block while a reply streams in. */
+.body.streaming {
+  position: relative;
+}
+
+.body.streaming .cursor {
+  vertical-align: baseline;
+}
+
+/* ---------------------------------------------------------------- app banner */
+
+/*
+ * A one-line notice, sized to its content. Previously this reused .card, which gave a
+ * ~130px block for a single sentence and pushed the view it sat above out of place.
+ */
+.app-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  margin-bottom: 12px;
+  background: var(--bg-raised);
+  border: 1px solid var(--accent-dim);
+  border-radius: 6px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.app-banner-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-dim);
 }

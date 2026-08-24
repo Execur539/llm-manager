@@ -35,6 +35,9 @@ const NAV: { id: View; label: string; group: string }[] = [
   { id: 'settings', label: 'Settings', group: 'Serve' }
 ]
 
+/** Views whose layout owns the full height and scrolls internally. */
+const FILL_VIEWS = new Set<View>(['chat', 'agent', 'documents'])
+
 export interface LoadedModel {
   model: string
   modelId: string
@@ -131,14 +134,15 @@ export default function App(): JSX.Element {
         </div>
       </nav>
 
-      <main className="main">
+      {/* Chat-like views fill the pane; the rest scroll normally. */}
+      <main className={`main${FILL_VIEWS.has(view) ? ' fill' : ''}`}>
         {banner && (
-          <div className="card" style={{ borderColor: 'var(--accent-dim)' }}>
-            <div className="row">
-              <span className="badge">note</span>
-              <span style={{ flex: 1 }}>{banner}</span>
-              <button onClick={() => setBanner(null)}>Dismiss</button>
-            </div>
+          <div className="app-banner" role="status">
+            <span className="badge">note</span>
+            <span className="app-banner-text">{banner}</span>
+            <button className="tiny" onClick={() => setBanner(null)} aria-label="Dismiss">
+              Dismiss
+            </button>
           </div>
         )}
 

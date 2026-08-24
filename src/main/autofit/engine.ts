@@ -520,11 +520,21 @@ export function verifyPrediction(plan: FitPlan, actualPerGpu: number[]): {
   const ratios = plan.predictedVramPerGpu.map((p, i) => (p > 0 ? (actualPerGpu[i] ?? 0) / p : 1))
   const worstRatio = ratios.length ? Math.max(...ratios) : 1
 
+  // A reading of zero means the measurement failed, not that the model used no memory —
+  // driver hiccup, a device we cannot poll, or a stand-in server during testing. Reporting
+  // "100% below prediction" from that is worse than saying nothing.
+  const measured = actualPerGpu.filter((v) => v > 0)
+  if (measured.length === 0) {
+    return { deltas, worstRatio, suggestion: null }
+  }
+
   let suggestion: string | null = null
   if (worstRatio > 1.1) {
-    suggestion = `Actual VRAM use ran ${Math.round((worstRatio - 1) * 100)}% above prediction; increasing the headroom margin.`
+    const over = fmtBytes(Math.max(...deltas))
+    suggestion = `Used ${over} more VRAM than predicted (${Math.round((worstRatio - 1) * 100)}% over). Widening the safety margin for next time.`
   } else if (worstRatio < 0.85) {
-    suggestion = `Actual VRAM use ran ${Math.round((1 - worstRatio) * 100)}% below prediction; the margin can be tightened to buy context.`
+    const spare = fmtBytes(Math.abs(Math.min(...deltas)))
+    suggestion = `Used ${spare} less VRAM than predicted. There is room to raise the context on this model.`
   }
   return { deltas, worstRatio, suggestion }
 }

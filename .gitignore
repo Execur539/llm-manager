@@ -6,3 +6,6 @@ scripts/built/
 LLMManagerModels/
 *.log
 release/
+scripts/e2e/screenshots/
+scripts/e2e/last-run.json
+scripts/e2e/probe.png

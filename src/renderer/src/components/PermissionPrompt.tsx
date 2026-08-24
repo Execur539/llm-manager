@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
-import type { PermissionDecision, PermissionRequest } from '@shared/types'
-import { on, send } from '../lib/api'
+import { useEffect } from 'react'
+import type { PermissionDecision } from '@shared/types'
+import { send } from '../lib/api'
+import { dismissPermission, useStream } from '../lib/store'
 
 /**
  * The approval gate.
@@ -8,53 +9,74 @@ import { on, send } from '../lib/api'
  * Shows the fully-resolved action as computed in the main process — never the model's own
  * description of what it is doing — so intent injected through a file or web page has nowhere
  * to hide. Paths are canonicalised before they reach here.
+ *
+ * The queue lives in the store rather than in this component, so a prompt raised while the user
+ * is on another page is still waiting when they return, instead of being lost with the unmount.
  */
 export default function PermissionPrompt(): JSX.Element | null {
-  const [queue, setQueue] = useState<PermissionRequest[]>([])
+  const { permissionQueue } = useStream()
+  const current = permissionQueue[0]
 
-  useEffect(() => on<PermissionRequest>('agent:permission-request', (r) => setQueue((q) => [...q, r])), [])
+  // Keyboard handling: Escape denies. There is deliberately no Enter-to-approve, because a
+  // stray keypress should never be able to authorise a write or a shell command.
+  useEffect(() => {
+    if (!current) return
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        respond('deny')
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [current])
 
-  const current = queue[0]
   if (!current) return null
 
-  const respond = (decision: PermissionDecision): void => {
+  function respond(decision: PermissionDecision): void {
+    if (!current) return
     send('agent:permission-response', current.id, decision)
-    setQueue((q) => q.slice(1))
+    dismissPermission(current.id)
   }
 
   return (
-    <div className="overlay">
-      <div className="modal">
+    <div className="overlay" data-testid="permission-overlay">
+      <div className="modal" role="dialog" aria-modal="true" aria-label="Approve action">
         <h2>
-          {current.hardBlocked ? 'Blocked action' : 'Approve action'}
+          <span>{current.hardBlocked ? 'Blocked action' : 'Approve action'}</span>
           <span className={`badge ${current.tier === 'execute' ? 'bad' : 'warn'}`}>{current.tier}</span>
         </h2>
 
         {current.hardBlocked && (
-          <div className="card" style={{ borderColor: '#5c2626' }}>
+          <div className="card error-card">
             <span className="badge bad">hard-blocked</span> {current.blockReason}
-            <div className="faint" style={{ marginTop: 6 }}>
-              This cannot be approved here. Hard blocks are only disabled in Settings, behind a typed confirmation.
+            <div className="faint tiny-note">
+              This cannot be approved here. Hard blocks are only disabled in Settings, behind a typed
+              confirmation.
             </div>
           </div>
         )}
 
-        <div className="faint" style={{ marginBottom: 4 }}>
+        <div className="faint modal-label">
           Tool: <span className="mono">{current.tool}</span>
         </div>
-        <pre>{current.resolved}</pre>
+        <pre className="resolved-action">{current.resolved}</pre>
 
-        {queue.length > 1 && (
-          <div className="faint" style={{ fontSize: 11 }}>{queue.length - 1} more waiting</div>
+        {permissionQueue.length > 1 && (
+          <div className="faint tiny-note">{permissionQueue.length - 1} more waiting</div>
         )}
 
         <div className="actions">
-          <button className="danger" onClick={() => respond('deny')}>Deny</button>
+          <button className="danger" onClick={() => respond('deny')} data-testid="permission-deny">
+            Deny
+          </button>
           {!current.hardBlocked && (
             <>
               <button onClick={() => respond('allow-exact')}>Always allow this exact call</button>
               <button onClick={() => respond('allow-tool')}>Always allow {current.tool}</button>
-              <button className="primary" onClick={() => respond('allow-once')}>Allow once</button>
+              <button className="primary" onClick={() => respond('allow-once')} data-testid="permission-allow">
+                Allow once
+              </button>
             </>
           )}
         </div>

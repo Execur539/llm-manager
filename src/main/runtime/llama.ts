@@ -14,7 +14,14 @@ import { spawn, ChildProcess } from 'node:child_process'
 import net from 'node:net'
 import { EventEmitter } from 'node:events'
 import type { Backend, FitPlan, ModelRecord, ToolDefinition } from '@shared/types'
+import path from 'node:path'
+import { app } from 'electron'
 import { childEnv, llamaServerPath } from './binaries'
+
+/** Location of the stand-in server used when LLMM_MOCK_LLAMA=1. */
+function mockServerPath(): string {
+  return process.env.LLMM_MOCK_SCRIPT ?? path.join(app.getAppPath(), 'scripts', 'mock-llama.mjs')
+}
 
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -138,12 +145,20 @@ export class LlamaRuntime extends EventEmitter {
 
     this.starting = (async () => {
       const port = await freePort()
-      const exe = llamaServerPath(backend)
       const args = this.buildArgs(model, plan, port)
 
       this.emit('status', { phase: 'starting', model: model.filename, args })
 
-      const child = spawn(exe, args, { windowsHide: true, env: childEnv() })
+      // Test mode: swap in a stand-in server that speaks the same HTTP surface. Everything
+      // above the process boundary — health polling, SSE parsing, tool-call accumulation,
+      // timings, unload — runs unchanged; only the inference is fake. Guarded by an env var so
+      // it can never engage in a normal run.
+      const useMock = process.env.LLMM_MOCK_LLAMA === '1'
+      const exe = useMock ? process.execPath : llamaServerPath(backend)
+      const spawnArgs = useMock ? [mockServerPath(), ...args] : args
+      const env = useMock ? { ...childEnv(), ELECTRON_RUN_AS_NODE: '1' } : childEnv()
+
+      const child = spawn(exe, spawnArgs, { windowsHide: true, env })
       this.child = child
 
       let stderr = ''

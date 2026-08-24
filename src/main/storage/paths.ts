@@ -10,7 +10,17 @@ import { app } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 
-export const APPDATA_DIR = path.join(app.getPath('appData'), 'LLMManager')
+/**
+ * Root for all persistent state.
+ *
+ * LLMM_APPDATA_DIR redirects it, which end-to-end tests use to run against a throwaway
+ * directory. Electron's own `appData` path ignores the APPDATA environment variable, so without
+ * an explicit override a test would read and write the user's real settings, chat history and
+ * relocation breadcrumb.
+ */
+export const APPDATA_DIR = process.env.LLMM_APPDATA_DIR
+  ? path.resolve(process.env.LLMM_APPDATA_DIR)
+  : path.join(app.getPath('appData'), 'LLMManager')
 export const SETTINGS_FILE = path.join(APPDATA_DIR, 'settings.json')
 export const SECRETS_FILE = path.join(APPDATA_DIR, 'secrets.json')
 export const DB_FILE = path.join(APPDATA_DIR, 'llmmanager.db')
