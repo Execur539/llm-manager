@@ -81,7 +81,8 @@ on **every** launch and deletes it on exit — measured at ~24s per launch here.
 `portable.unpackDirName` only stabilises the directory name; it does not make the extraction
 skippable.
 
-Our launcher unpacks once to `%LOCALAPPDATA%\LLMManageruntime-<version>` and writes a
+Our launcher unpacks once to `%LOCALAPPDATA%\LLMManager
+untime-<version>` and writes a
 completion marker, so later launches start immediately. The marker is written last, so a
 half-finished extraction is never mistaken for a good one, and old `runtime-*` directories are
 removed after a successful upgrade.

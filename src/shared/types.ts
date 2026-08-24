@@ -65,6 +65,13 @@ export interface ModelArchInfo {
   ssmLayers: number
   /** Per-layer SSM state in bytes. Constant — it does not grow with context length. */
   ssmStateBytesPerLayer: number
+  /**
+   * GGML tensor type ids this build has no block layout for.
+   *
+   * Non-empty means the weight total was reconciled against the file size rather than computed
+   * per tensor. The fit is still sound, but the per-layer split is approximate.
+   */
+  unknownTensorTypes: number[]
 }
 
 export interface ModelCapabilities {

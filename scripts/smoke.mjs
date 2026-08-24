@@ -21,7 +21,7 @@ const { planFit, kvCacheBytes, computeBufferBytes, proportionalSplit, DEFAULT_CO
   await import('./built/engine.js')
 const { toolCallGrammar, schemaGrammar } = await import('./built/gbnf.js')
 const { checkHardBlock, describeCall, PermissionEngine } = await import('./built/permissions.js')
-const { readGguf, extractArchInfo, tensorByteSize } = await import('./built/gguf.js')
+const { readGguf, extractArchInfo, tensorByteSize, isKnownGgmlType } = await import('./built/gguf.js')
 const { recommendQuant, findMmprojFor } = await import('./built/hf.js')
  const { isVirtualAdapter } = await import('./built/gpu.js')
 
@@ -431,6 +431,54 @@ section('GGUF parser')
 
 // ---------------------------------------------------------------- recommendation
 
+section('Unknown quant types reconcile against file size')
+{
+  // llama.cpp keeps adding tensor types (TQ1_0, TQ2_0, MXFP4, Q1_0...). A type this build has no
+  // block layout for would otherwise be counted at 1 byte/element — an under-estimate, which is
+  // the dangerous direction: the engine would plan more context than fits and the load OOMs.
+  check('known types are recognised', isKnownGgmlType(12) && isKnownGgmlType(14))
+  check('a future type is flagged unknown', !isKnownGgmlType(99))
+  check('unknown types fall back to 1 byte/element', tensorByteSize(99, [1000]) === 1000)
+
+  const file = path.join(os.tmpdir(), `llmm-unknown-${Date.now()}.gguf`)
+  // Same fixture, but the weight tensors claim a type this build does not know.
+  fs.writeFileSync(file, buildTestGguf(99))
+  try {
+    const meta = await readGguf(file)
+    const naive = extractArchInfo(meta)
+    // Pretend the real file is far larger than the naive 1-byte-per-element arithmetic suggests.
+    const realSize = meta.dataOffset + 8 * 1024 ** 3
+    const reconciled = extractArchInfo(meta, realSize)
+
+    check('flags the unrecognised type', reconciled.unknownTensorTypes.includes(99))
+    check('naive total under-counts', naive.weightBytes < 8 * 1024 ** 3)
+    check(
+      'reconciled total matches the file',
+      Math.abs(reconciled.weightBytes - 8 * 1024 ** 3) < 1024,
+      `${reconciled.weightBytes}`
+    )
+    check('per-layer and non-layer both scale', reconciled.perLayerBytes > naive.perLayerBytes && reconciled.nonLayerBytes > naive.nonLayerBytes)
+    check('the split ratio is preserved', Math.abs(
+      reconciled.perLayerBytes / reconciled.weightBytes - naive.perLayerBytes / naive.weightBytes
+    ) < 1e-6)
+  } finally {
+    fs.rmSync(file, { force: true })
+  }
+
+  // A known-type file must be left alone: small deltas are padding, not error.
+  const known = path.join(os.tmpdir(), `llmm-known-${Date.now()}.gguf`)
+  fs.writeFileSync(known, buildTestGguf(12))
+  try {
+    const meta = await readGguf(known)
+    const plain = extractArchInfo(meta)
+    const withSize = extractArchInfo(meta, meta.dataOffset + plain.weightBytes)
+    check('no unknown types on a normal file', withSize.unknownTensorTypes.length === 0)
+    check('an accurate total is not rewritten', Math.abs(withSize.weightBytes - plain.weightBytes) < 1)
+  } finally {
+    fs.rmSync(known, { force: true })
+  }
+}
+
 section('Quant recommendation')
 {
   const files = [
@@ -469,7 +517,7 @@ process.exit(fail ? 1 : 0)
 // ---------------------------------------------------------------- helpers
 
 /** Construct a minimal valid GGUF v3 file in memory. */
-function buildTestGguf() {
+function buildTestGguf(weightType = 12) {
   const chunks = []
   const u32 = (n) => {
     const b = Buffer.alloc(4)
@@ -504,8 +552,8 @@ function buildTestGguf() {
   for (let i = 0; i < 32000; i++) chunks.push(str(`t${i}`))
 
   // Tensor directory: one block tensor and one output tensor.
-  chunks.push(str('blk.0.attn_q.weight'), u32(2), u64(512), u64(512), u32(12), u64(0))
-  chunks.push(str('output.weight'), u32(2), u64(512), u64(32000), u32(12), u64(1024))
+  chunks.push(str('blk.0.attn_q.weight'), u32(2), u64(512), u64(512), u32(weightType), u64(0))
+  chunks.push(str('output.weight'), u32(2), u64(512), u64(32000), u32(weightType), u64(1024))
 
   return Buffer.concat(chunks)
 }

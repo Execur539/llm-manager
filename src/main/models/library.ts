@@ -171,7 +171,7 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
     let record: ModelRecord
     try {
       const meta = await readGguf(file)
-      const arch = extractArchInfo(meta)
+      const arch = extractArchInfo(meta, st.size)
       const caps = await detectCapabilities(file, arch.architecture, arch.name, mmproj, templateSupportsTools(meta))
       const quantLabel = quantFromFilename(path.basename(file))
       record = {

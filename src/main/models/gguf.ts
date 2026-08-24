@@ -82,9 +82,14 @@ const GGML_TYPE_NAMES: Record<number, string> = {
 export function tensorByteSize(ggmlType: number, dims: number[]): number {
   const traits = GGML_TYPE_TRAITS[ggmlType]
   const elements = dims.reduce((a, b) => a * b, 1)
-  if (!traits) return elements // unknown type: assume 1 byte/element rather than throwing
+  if (!traits) return elements // unknown type; reconciled against file size in extractArchInfo
   const [blockSize, bytesPerBlock] = traits
   return Math.ceil(elements / blockSize) * bytesPerBlock
+}
+
+/** True when this build has no block layout for the type, so its size is a guess. */
+export function isKnownGgmlType(ggmlType: number): boolean {
+  return ggmlType in GGML_TYPE_TRAITS
 }
 
 /**
@@ -327,7 +332,15 @@ function num(kv: Record<string, GgufValue>, key: string): number | null {
  * offloaded per-layer, so budgeting has to treat them separately from embeddings and
  * the output head.
  */
-export function extractArchInfo(meta: GgufMetadata): ModelArchInfo {
+/**
+ * @param fileSize actual size of the .gguf on disk. Used to reconcile the computed weight total
+ *   against reality, which is what keeps an unrecognised quantisation type from silently
+ *   under-sizing the model. llama.cpp gains new types regularly (TQ1_0, TQ2_0, MXFP4, ...) and a
+ *   type this build does not know would otherwise be counted at one byte per element — an
+ *   under-estimate, which is the dangerous direction: the fit engine would plan more context
+ *   than fits and the load would OOM.
+ */
+export function extractArchInfo(meta: GgufMetadata, fileSize?: number): ModelArchInfo {
   const kv = meta.kv
   const arch = typeof kv['general.architecture'] === 'string' ? (kv['general.architecture'] as string) : 'unknown'
   const p = (suffix: string) => num(kv, `${arch}.${suffix}`)
@@ -357,12 +370,32 @@ export function extractArchInfo(meta: GgufMetadata): ModelArchInfo {
   let perLayerBytes = 0
   let nonLayerBytes = 0
   const quantCounts = new Map<number, number>()
+  const unknownTypes = new Set<number>()
   for (const t of meta.tensors) {
+    if (!isKnownGgmlType(t.ggmlType)) unknownTypes.add(t.ggmlType)
     if (/^blk\.\d+\./.test(t.name)) perLayerBytes += t.bytes
     else nonLayerBytes += t.bytes
     // Only count 2D+ weight tensors toward "the" quant; 1D norms are always F32.
     if (t.dims.length >= 2) {
       quantCounts.set(t.ggmlType, (quantCounts.get(t.ggmlType) ?? 0) + t.bytes)
+    }
+  }
+
+  // Reconcile against the file. Tensor data runs from dataOffset to EOF, so that span is the
+  // ground truth for how much weight there actually is. If our per-type arithmetic disagrees —
+  // because of an unrecognised quantisation, or a layout change — scale to match rather than
+  // trusting a total we know is wrong.
+  if (fileSize && fileSize > meta.dataOffset) {
+    const actualWeightBytes = fileSize - meta.dataOffset
+    const computed = perLayerBytes + nonLayerBytes
+    const ratio = computed > 0 ? actualWeightBytes / computed : 0
+    // Only correct a real discrepancy; small deltas are padding and alignment.
+    if (computed > 0 && (ratio > 1.02 || ratio < 0.98)) {
+      perLayerBytes *= ratio
+      nonLayerBytes *= ratio
+    } else if (computed === 0) {
+      // Nothing parsed at all: attribute everything to layers, which the fit engine can offload.
+      perLayerBytes = actualWeightBytes
     }
   }
 
@@ -410,7 +443,8 @@ export function extractArchInfo(meta: GgufMetadata): ModelArchInfo {
     expertCount,
     attentionLayers,
     ssmLayers,
-    ssmStateBytesPerLayer
+    ssmStateBytesPerLayer,
+    unknownTensorTypes: [...unknownTypes]
   }
 }
 
