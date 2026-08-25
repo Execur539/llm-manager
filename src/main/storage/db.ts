@@ -12,10 +12,11 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite'
 import fs from 'node:fs'
 import path from 'node:path'
 import { APPDATA_DIR, DB_FILE } from './paths'
+import { exportFilename, uniquePath } from './filenames'
 
 let db: DatabaseSync | null = null
 
-const MIGRATIONS: { id: number; sql: string }[] = [
+export const MIGRATIONS: { id: number; sql: string }[] = [
   {
     id: 1,
     sql: `
@@ -204,6 +205,39 @@ const MIGRATIONS: { id: number; sql: string }[] = [
       created_at INTEGER NOT NULL
     );
     `
+  },
+  {
+    id: 3,
+    sql: `
+    -- Reasoning models return their chain of thought separately from the answer. Stored so it
+    -- survives a reload rather than existing only for the life of the stream.
+    ALTER TABLE messages ADD COLUMN reasoning TEXT;
+    `
+  },
+  {
+    id: 4,
+    sql: `
+    -- tasks.chat_id was declared without a foreign key, so deleting a chat left its task list
+    -- behind forever — every sibling table cascades. SQLite cannot add a constraint in place,
+    -- so the table is rebuilt. Rows whose chat is already gone are dropped on the way across,
+    -- which is the cleanup the missing cascade should have been doing all along.
+    CREATE TABLE tasks_new (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      done INTEGER NOT NULL DEFAULT 0,
+      ord INTEGER NOT NULL DEFAULT 0
+    );
+
+    INSERT INTO tasks_new (id, chat_id, text, done, ord)
+      SELECT t.id, t.chat_id, t.text, t.done, t.ord
+      FROM tasks t
+      WHERE EXISTS (SELECT 1 FROM chats c WHERE c.id = t.chat_id);
+
+    DROP TABLE tasks;
+    ALTER TABLE tasks_new RENAME TO tasks;
+    CREATE INDEX IF NOT EXISTS idx_tasks_chat ON tasks(chat_id, ord);
+    `
   }
 ]
 
@@ -274,9 +308,13 @@ export function exportChat(chatId: string, format: 'md' | 'json'): string {
     role: string
     content: string
     created_at: number
+    reasoning: string | null
     tool_calls: string | null
     tool_result: string | null
-  }>('SELECT role, content, created_at, tool_calls, tool_result FROM messages WHERE chat_id = ? ORDER BY created_at', chatId)
+  }>(
+    'SELECT role, content, created_at, reasoning, tool_calls, tool_result FROM messages WHERE chat_id = ? ORDER BY created_at',
+    chatId
+  )
 
   if (format === 'json') {
     return JSON.stringify({ chat, messages }, null, 2)
@@ -288,17 +326,30 @@ export function exportChat(chatId: string, format: 'md' | 'json'): string {
       const call = JSON.parse(m.tool_calls)[0] as { name: string; args: Record<string, unknown> }
       lines.push(`### tool: ${call.name}`, '', '```json', JSON.stringify(call.args, null, 2), '```', '', '```', m.content, '```', '')
     } else {
-      lines.push(`### ${m.role}`, '', m.content, '')
+      lines.push(`### ${m.role}`, '')
+      // Reasoning is stored alongside the answer; an export that drops it loses the part of a
+      // thinking model's transcript the user most often wanted to keep.
+      if (m.reasoning) lines.push('<details><summary>Reasoning</summary>', '', m.reasoning, '', '</details>', '')
+      lines.push(m.content, '')
     }
   }
   return lines.join('\n')
 }
 
-export function writeExport(chatId: string, format: 'md' | 'json', dir: string): string {
+export function writeExport(chatId: string, format: 'md' | 'json', dirOrFile: string): string {
   const content = exportChat(chatId, format)
-  const chat = get<{ title: string }>('SELECT title FROM chats WHERE id = ?', chatId)
-  const safe = (chat?.title ?? chatId).replace(/[^a-z0-9._-]+/gi, '-').slice(0, 60)
-  const file = path.join(dir, `${safe}.${format}`)
+
+  // A save dialog hands back a full path; a directory picker hands back a folder.
+  let file: string
+  if (path.extname(dirOrFile).toLowerCase() === `.${format}`) {
+    file = dirOrFile
+  } else {
+    const chat = get<{ title: string }>('SELECT title FROM chats WHERE id = ?', chatId)
+    const base = exportFilename(chat?.title ?? '', `chat-${chatId.slice(0, 8)}`)
+    file = uniquePath(dirOrFile, base, format, (p) => fs.existsSync(p))
+  }
+
+  fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, content, 'utf8')
   return file
 }

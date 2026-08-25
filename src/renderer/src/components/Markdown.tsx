@@ -58,7 +58,11 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
 
 // ---------------------------------------------------------------- render
 
-function renderList(block: Extract<Block, { kind: 'list' }>, key: string): JSX.Element {
+function renderList(
+  block: Extract<Block, { kind: 'list' }>,
+  key: string,
+  tail: ReactNode = null
+): JSX.Element {
   // Flat items with a depth are turned into real nesting, so indentation is structural.
   const render = (items: { text: string; depth: number }[], depth: number, prefix: string): JSX.Element => {
     const Tag = block.ordered && depth === 0 ? 'ol' : 'ul'
@@ -71,9 +75,11 @@ function renderList(block: Extract<Block, { kind: 'list' }>, key: string): JSX.E
         nested.push(items[j])
         j++
       }
+      const isFinalItem = j >= items.length
       children.push(
         <li key={`${prefix}-${i}`}>
           {renderInline(item.text, `${prefix}-${i}`)}
+          {nested.length === 0 && isFinalItem && tail}
           {nested.length > 0 && render(nested, depth + 1, `${prefix}-${i}-n`)}
         </li>
       )
@@ -85,19 +91,30 @@ function renderList(block: Extract<Block, { kind: 'list' }>, key: string): JSX.E
   return <Fragment key={key}>{render(block.items, top, key)}</Fragment>
 }
 
-export default function Markdown({ source }: { source: string }): JSX.Element {
+/**
+ * The streaming caret.
+ *
+ * It has to be rendered *inside* the last block, not after the markdown. Markdown blocks are
+ * block-level elements, so a sibling `<span>` after the last `<p>` starts a new line — the
+ * caret sat one line below the text it was supposed to be trailing.
+ */
+export default function Markdown({ source, caret = false }: { source: string; caret?: boolean }): JSX.Element {
   const blocks = parseBlocks(source)
+  const lastIndex = blocks.length - 1
 
   return (
     <div className="markdown">
       {blocks.map((block, i) => {
         const key = `b${i}`
+        // Only the final block trails the caret, and only while text is still arriving.
+        const tail = caret && i === lastIndex ? <span className="cursor" key={`${key}-caret`} /> : null
         switch (block.kind) {
           case 'heading': {
             const Tag = `h${Math.min(block.level + 2, 6)}` as 'h3' | 'h4' | 'h5' | 'h6'
             return (
               <Tag className="md-heading" key={key}>
                 {renderInline(block.text, key)}
+                {tail}
               </Tag>
             )
           }
@@ -105,15 +122,19 @@ export default function Markdown({ source }: { source: string }): JSX.Element {
             return (
               <pre className="md-pre" key={key}>
                 {block.lang && <span className="md-lang">{block.lang}</span>}
-                <code>{block.lines.join('\n')}</code>
+                <code>
+                  {block.lines.join('\n')}
+                  {tail}
+                </code>
               </pre>
             )
           case 'list':
-            return renderList(block, key)
+            return renderList(block, key, tail)
           case 'quote':
             return (
               <blockquote className="md-quote" key={key}>
                 {renderInline(block.lines.join(' '), key)}
+                {tail}
               </blockquote>
             )
           case 'table':
@@ -137,14 +158,21 @@ export default function Markdown({ source }: { source: string }): JSX.Element {
                     ))}
                   </tbody>
                 </table>
+                {tail}
               </div>
             )
           case 'hr':
-            return <hr className="md-hr" key={key} />
+            return (
+              <Fragment key={key}>
+                <hr className="md-hr" />
+                {tail}
+              </Fragment>
+            )
           default:
             return (
               <p className="md-p" key={key}>
                 {renderInline(block.lines.join('\n'), key)}
+                {tail}
               </p>
             )
         }

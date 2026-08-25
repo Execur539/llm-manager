@@ -6,7 +6,7 @@
  * same shape over HTTP, so the React app cannot tell which one it is running against.
  */
 
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 /** Channels the renderer is allowed to subscribe to. */
 const EVENT_CHANNELS = [
@@ -17,9 +17,11 @@ const EVENT_CHANNELS = [
   'relocation:progress',
   'downloads:update',
   'chat:delta',
+  'chat:reasoning',
   'chat:message',
   'chat:notes',
   'agent:delta',
+  'agent:reasoning',
   'agent:message',
   'agent:tool-call',
   'agent:tool-result',
@@ -55,6 +57,21 @@ const api = {
     const listener = (_e: Electron.IpcRendererEvent, payload: unknown): void => cb(payload as never)
     ipcRenderer.on(channel, listener)
     return () => ipcRenderer.removeListener(channel, listener)
+  },
+
+  /**
+   * The on-disk path of a dropped File.
+   *
+   * `File.path` was removed in Electron 32, and it is the only way to attach a 4 GB video
+   * without reading it into memory first. Returns '' for anything the browser synthesised
+   * (a paste, a remote session), which is the caller's cue to send the bytes instead.
+   */
+  pathForFile: (file: File): string => {
+    try {
+      return webUtils.getPathForFile(file)
+    } catch {
+      return ''
+    }
   },
 
   /** Tells the renderer it is running in the desktop shell rather than a remote browser. */

@@ -78,11 +78,25 @@ export function buildGguf(opts = {}) {
     addU32(`${architecture}.ssm.group_count`, 16)
   }
 
+  const REASONING_TEMPLATES = {
+    // Levels enumerated by a validation tuple, with 'high' aliased onto 'xhigh'.
+    effort:
+      "{%- set r = reasoning_effort|default('xhigh') %}" +
+      "{%- if r == 'high' %}{%- set r = 'xhigh' %}{%- endif %}" +
+      "{%- if r not in ('xhigh', 'medium', 'low') %}{{- raise_exception('bad effort') }}{%- endif %}" +
+      '{%- if enable_thinking is undefined or enable_thinking is true %}{{- "<think>" }}{%- endif %}',
+    // A plain on/off switch and nothing more.
+    toggle: '{%- if enable_thinking is defined and enable_thinking is false %}{{- "<think></think>" }}{%- endif %}',
+    none: ''
+  }
+
+  const reasoningTemplate = REASONING_TEMPLATES[opts.reasoning ?? 'none'] ?? ''
+
   addStr(
     'tokenizer.chat_template',
-    chatTemplateMentionsTools
+    (chatTemplateMentionsTools
       ? '{%- if tools %}{{- "You may call tools." }}{%- endif %}{% for m in messages %}{{ m.content }}{% endfor %}'
-      : '{% for m in messages %}{{ m.content }}{% endfor %}'
+      : '{% for m in messages %}{{ m.content }}{% endfor %}') + reasoningTemplate
   )
   addStr('tokenizer.ggml.model', 'gpt2')
 

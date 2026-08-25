@@ -1,6 +1,17 @@
 import { useEffect, useState } from 'react'
 import type { FitPlan, FitResult, ModelRecord } from '@shared/types'
 import { fmtBytes, invoke } from '../lib/api'
+import ConfirmDialog from '../components/ConfirmDialog'
+import Icon from '../components/Icon'
+import { Skeleton, Spinner } from '../components/Spinner'
+import { toast } from '../lib/store'
+
+interface ImportResult {
+  imported: string[]
+  skipped: string[]
+  failed: { file: string; error: string }[]
+  linked: number
+}
 
 function CapBadges({ model }: { model: ModelRecord }): JSX.Element {
   return (
@@ -65,6 +76,7 @@ function PlanCard({ plan, onLoad, busy }: { plan: FitPlan; onLoad: (p: FitPlan) 
         ))}
       </ul>
       <button className="primary" disabled={busy} onClick={() => onLoad(plan)}>
+        {busy ? <Spinner size={13} /> : null}
         {busy ? 'Loading…' : 'Load with this plan'}
       </button>
     </div>
@@ -85,6 +97,17 @@ export default function Library({
   const [fits, setFits] = useState<Record<string, FitResult | { error: string }>>({})
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<ModelRecord | null>(null)
+  const [scanning, setScanning] = useState(false)
+
+  const rescan = async (): Promise<void> => {
+    setScanning(true)
+    try {
+      await onRefresh()
+    } finally {
+      setScanning(false)
+    }
+  }
   const [disk, setDisk] = useState<{ totalBytes: number; freeBytes: number; partialBytes: number } | null>(null)
   const [filter, setFilter] = useState('')
   const [showFavourites, setShowFavourites] = useState(false)
@@ -135,8 +158,12 @@ export default function Library({
     }
   }
 
+  /**
+   * Deleting a model erases tens of gigabytes that took a long download to obtain, and nothing
+   * puts it back. The confirmation therefore names the file and the size, and — above a
+   * threshold where re-downloading is a genuine cost — asks for the filename to be typed.
+   */
   const remove = async (m: ModelRecord): Promise<void> => {
-    if (!confirm(`Delete ${m.filename}? This removes ${fmtBytes(m.bytes)} from disk permanently.`)) return
     try {
       await invoke('library:delete-model', m.id)
       if (selected?.id === m.id) setSelected(null)
@@ -170,9 +197,57 @@ export default function Library({
         <button className={showFavourites ? 'primary' : ''} onClick={() => setShowFavourites((v) => !v)}>
           Favourites
         </button>
-        <button onClick={() => void onRefresh()}>Rescan</button>
-        <button onClick={() => void invoke('library:import').then(() => onRefresh())}>Import GGUF…</button>
-        <button onClick={() => void invoke('library:clean-partials').then(() => onRefresh())}>Clean partials</button>
+        <button onClick={() => void rescan()} disabled={scanning} data-testid="rescan">
+          {scanning ? <Spinner size={13} /> : null}
+          {scanning ? 'Scanning…' : 'Rescan'}
+        </button>
+        <button
+          onClick={() => {
+            void invoke<ImportResult>('library:import')
+              .then(async (r) => {
+                await onRefresh()
+                if (!r) return
+                const parts: string[] = []
+                if (r.imported.length) {
+                  // Say when nothing was duplicated — on a 20 GB model that is the difference
+                  // between "instant" and "20 GB of disk gone".
+                  parts.push(
+                    `Imported ${r.imported.length} model${r.imported.length === 1 ? '' : 's'}` +
+                      (r.linked === r.imported.length ? ' (linked, no extra disk used)' : '')
+                  )
+                }
+                if (r.skipped.length) parts.push(`${r.skipped.length} already in the library`)
+                if (r.failed.length) parts.push(`${r.failed.length} failed`)
+                if (parts.length) {
+                  toast(parts.join(' · '), r.failed.length ? 'error' : 'success')
+                }
+                for (const f of r.failed) toast(`${f.file}: ${f.error}`, 'error')
+              })
+              .catch((err: unknown) => toast(`Import failed: ${String(err)}`, 'error'))
+          }}
+          data-testid="import-gguf"
+        >
+          Import GGUF…
+        </button>
+        <button
+          onClick={() => {
+            void invoke<{ removed: number; bytes: number }>('library:clean-partials')
+              .then(async (r) => {
+                await onRefresh()
+                // Silence here read as a broken button when there was nothing to clean.
+                toast(
+                  r && r.removed > 0
+                    ? `Removed ${r.removed} partial download${r.removed === 1 ? '' : 's'}, freeing ${fmtBytes(r.bytes)}`
+                    : 'No leftover partial downloads to clean up',
+                  'success'
+                )
+              })
+              .catch((err: unknown) => toast(`Clean-up failed: ${String(err)}`, 'error'))
+          }}
+          data-testid="clean-partials"
+        >
+          Clean partials
+        </button>
       </div>
 
       {error && (
@@ -241,13 +316,31 @@ export default function Library({
               </div>
             )}
 
-            <div className="row" style={{ marginTop: 10 }}>
+            {/*
+              * Delete used to be the only button on the card, which made the destructive action
+              * the most prominent thing on screen while the primary one — loading the model —
+              * had no affordance at all beyond "the card happens to be clickable".
+              */}
+            <div className="row model-actions" style={{ marginTop: 10 }}>
               <button
-                className="danger"
+                className="primary"
                 onClick={(e) => {
                   e.stopPropagation()
-                  void remove(m)
+                  void select(m)
                 }}
+                title="Plan the fit for this model and choose how to load it"
+                data-testid="plan-model"
+              >
+                {selected?.id === m.id ? 'Planning below…' : 'Load…'}
+              </button>
+              <button
+                className="danger subtle"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setPendingDelete(m)
+                }}
+                title={`Delete ${m.filename} from disk`}
+                data-testid="delete-model"
               >
                 Delete
               </button>
@@ -268,9 +361,19 @@ export default function Library({
 
           {fit && !('error' in fit) && (
             <>
-              {fit.notes.map((n, i) => (
-                <div className="card note" key={i}>{n}</div>
-              ))}
+              {fit.notes.length > 0 && (
+                <div className="card fit-notes">
+                  <div className="card-title">Why this plan</div>
+                  <ul>
+                    {fit.notes.map((n, i) => (
+                      <li key={i}>
+                        <Icon name="info" size={13} />
+                        <span>{n}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
               {fit.chosen && <PlanCard plan={fit.chosen} onLoad={(p) => void load(p)} busy={busy} />}
 
@@ -291,6 +394,32 @@ export default function Library({
           )}
         </>
       )}
+
+      <ConfirmDialog
+        open={!!pendingDelete}
+        danger
+        title="Delete this model?"
+        confirmLabel="Delete permanently"
+        // Above 4 GB, re-downloading is a real cost — make it a deliberate, typed act.
+        requirePhrase={pendingDelete && pendingDelete.bytes > 4 * 1024 ** 3 ? pendingDelete.filename : undefined}
+        body={
+          <>
+            <p>
+              <strong>{pendingDelete?.filename}</strong> will be erased from disk, freeing{' '}
+              {fmtBytes(pendingDelete?.bytes)}. This cannot be undone and the file is not sent to the Recycle Bin.
+            </p>
+            {pendingDelete && pendingDelete.bytes > 4 * 1024 ** 3 && (
+              <p className="subtitle">Type the filename to confirm.</p>
+            )}
+          </>
+        }
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          const target = pendingDelete
+          setPendingDelete(null)
+          if (target) void remove(target)
+        }}
+      />
     </>
   )
 }

@@ -24,6 +24,8 @@ const { checkHardBlock, describeCall, PermissionEngine } = await import('./built
 const { readGguf, extractArchInfo, tensorByteSize, isKnownGgmlType } = await import('./built/gguf.js')
 const { recommendQuant, findMmprojFor } = await import('./built/hf.js')
  const { isVirtualAdapter } = await import('./built/gpu.js')
+const { exportFilename, uniquePath } = await import('./built/filenames.js')
+const { detectReasoning } = await import('./built/reasoning.js')
 
 const GB = 1024 ** 3
 let pass = 0
@@ -501,6 +503,212 @@ section('Quant recommendation')
 
   check('never recommends an mmproj as the model', ![big, small, tiny].some((r) => r?.filename.includes('mmproj')))
   check('finds the mmproj companion', findMmprojFor(files)?.filename === 'mmproj-f16.gguf')
+}
+
+section('Byte formatting')
+{
+  // A missing kilobyte step printed "438009 B" where "428 KB" was meant.
+  check('bytes below a kilobyte', fmtBytes(512) === '512 B', fmtBytes(512))
+  check('kilobytes', fmtBytes(438009) === '428 KB', fmtBytes(438009))
+  check('megabytes', fmtBytes(17_000_000) === '16 MB', fmtBytes(17_000_000))
+  check('gigabytes keep two decimals below ten', fmtBytes(4 * GB) === '4.00 GB', fmtBytes(4 * GB))
+  check('gigabytes drop a decimal above ten', fmtBytes(18_973_870_432) === '17.7 GB', fmtBytes(18_973_870_432))
+  check('zero is not a raw number with no unit', fmtBytes(0) === '0 B', fmtBytes(0))
+  check('non-finite input is handled', fmtBytes(Number.NaN) === '?', fmtBytes(Number.NaN))
+}
+
+
+section('Reasoning detection')
+{
+  // Shaped after the templates actually shipped by these models. The local-file check in
+  // scripts/reasoning-check.mjs covers the real thing; these pin the awkward cases.
+
+  // Qwen3.8: validates against a tuple *after* remapping 'high' onto 'xhigh'.
+  const qwen38 = `
+    {%- if enable_thinking is undefined or enable_thinking is true %}
+    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+    {%- if resolved_reasoning_effort == 'high' %}
+    {%- set resolved_reasoning_effort = 'xhigh' %}
+    {%- endif %}
+    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
+    {{- raise_exception('Unexpected reasoning effort') }}
+    {%- endif %}
+  `
+  const a = detectReasoning(qwen38)
+  check('effort model is detected', a.kind === 'effort', a.kind)
+  check('levels come from the validation tuple', a.levels.join(',') === 'low,medium,xhigh', a.levels.join(','))
+  // 'high' is an alias for 'xhigh' here; offering it would be a stop that changes nothing.
+  check('an aliased level is not offered', !a.levels.includes('high'), a.levels.join(','))
+  check('the template default is used', a.defaultLevel === 'xhigh', String(a.defaultLevel))
+  check('enable_thinking implies it can be switched off', a.canDisable === true)
+
+  // gpt-oss: no validation tuple, only equality branches, and different level names.
+  const gptoss = `
+    {%- if reasoning_effort == 'low' %}Reasoning: low
+    {%- elif reasoning_effort == 'medium' %}Reasoning: medium
+    {%- elif reasoning_effort == 'high' %}Reasoning: high
+    {%- endif %}
+  `
+  const b = detectReasoning(gptoss)
+  check('equality branches are used when there is no tuple', b.kind === 'effort', b.kind)
+  check('gpt-oss levels are read, not assumed', b.levels.join(',') === 'low,medium,high', b.levels.join(','))
+  check('without a template default, the strongest level is assumed', b.defaultLevel === 'high', String(b.defaultLevel))
+  check('no enable_thinking means it cannot be switched off', b.canDisable === false)
+
+  // Qwen3.6 / nanbeige: a toggle and nothing more.
+  const toggle = `{%- if enable_thinking is defined and enable_thinking is false %}<think></think>{%- endif %}`
+  const c = detectReasoning(toggle)
+  check('a toggle-only template is detected', c.kind === 'toggle', c.kind)
+  check('a toggle exposes no levels', c.levels.length === 0)
+
+  // Hermes-3 and friends.
+  check('a plain template reports none', detectReasoning('{{ messages }}').kind === 'none')
+  check('an absent template reports none', detectReasoning(undefined).kind === 'none')
+  check('an empty template reports none', detectReasoning('').kind === 'none')
+
+  // 'none' is llama.cpp's off switch, not a level.
+  const withNone = `{%- if reasoning_effort in ('none', 'low', 'high') %}{%- endif %}`
+  const d = detectReasoning(withNone)
+  check("'none' is treated as off, not a level", d.levels.join(',') === 'low,high', d.levels.join(','))
+  check("'none' implies it can be switched off", d.canDisable === true)
+
+  // A derived variable with an unrelated name: templates normalise reasoning_effort before
+  // branching on it, and the name they pick is arbitrary. Matching only names that happen to
+  // contain 'reasoning_effort' worked for Qwen3.8 by luck and lost the control entirely for a
+  // template that used a short name.
+  const aliased = `
+    {%- set r = reasoning_effort|default('medium') %}
+    {%- if r not in ('low', 'medium', 'high') %}{{- raise_exception('nope') }}{%- endif %}
+  `
+  const f = detectReasoning(aliased)
+  check('a renamed effort variable is still detected', f.kind === 'effort', f.kind)
+  check('its levels are read from the tuple', f.levels.join(',') === 'low,medium,high', f.levels.join(','))
+  check('its default is read too', f.defaultLevel === 'medium', String(f.defaultLevel))
+
+  // A single level is not a choice worth a slider.
+  const one = `{%- if reasoning_effort == 'high' %}{%- endif %}`
+  check('one level alone is not an effort control', detectReasoning(one).kind === 'none', detectReasoning(one).kind)
+
+  // Unknown names must still order deterministically rather than throwing them away.
+  const exotic = `{%- if reasoning_effort in ('turbo', 'low', 'max') %}{%- endif %}`
+  const e = detectReasoning(exotic)
+  check('unknown level names are kept', e.levels.includes('turbo'), e.levels.join(','))
+  check('known names still order correctly around them', e.levels.indexOf('low') < e.levels.indexOf('max'),
+    e.levels.join(','))
+}
+
+section('Export filenames')
+{
+  const F = (t) => exportFilename(t, 'fallback')
+
+  check('ordinary titles pass through', F('State space models') === 'State space models', F('State space models'))
+  check('forbidden characters are replaced', F('a/b:c*d?e') === 'a-b-c-d-e', F('a/b:c*d?e'))
+  // Windows drops a trailing dot or space, so the file would not match the name we returned.
+  check('trailing dot is removed', F('Notes.') === 'Notes', F('Notes.'))
+  check('trailing space is removed', F('Notes   ') === 'Notes', F('Notes   '))
+  // A title with nothing usable in it must not produce a bare ".md".
+  check('punctuation-only title falls back', F('???') === 'fallback', F('???'))
+  check('empty title falls back', F('') === 'fallback', F(''))
+  check('dots-only title falls back', F('...') === 'fallback', F('...'))
+  check('whitespace-only title falls back', F('   ') === 'fallback', F('   '))
+  // Reserved device names are rejected by the filesystem no matter the extension.
+  check('reserved name is escaped', F('CON') === 'CON-file', F('CON'))
+  check('reserved name is escaped case-insensitively', F('nul') === 'nul-file', F('nul'))
+  check('a name merely containing a reserved word is left alone', F('console') === 'console', F('console'))
+  // Unicode is legal in Windows filenames; mangling it would be wrong.
+  check('emoji survive', F('rocket ' + String.fromCodePoint(0x1f680)) === 'rocket ' + String.fromCodePoint(0x1f680), F('rocket'))
+  check('CJK survives', F('\u4e2d\u6587') === '\u4e2d\u6587', F('\u4e2d\u6587'))
+  // Control characters would be written verbatim into a path otherwise.
+  check('control characters are stripped', F('a' + String.fromCharCode(7) + 'b') === 'a-b', F('a' + String.fromCharCode(7) + 'b'))
+  check('long titles are truncated', F('x'.repeat(200)).length <= 60, String(F('x'.repeat(200)).length))
+  check('truncation cannot leave a trailing dot', !F('y'.repeat(59) + '.' + 'z'.repeat(20)).endsWith('.'), F('y'.repeat(59) + '.' + 'z'.repeat(20)))
+  check('backslash is treated as forbidden', F('a' + String.fromCharCode(92) + 'b') === 'a-b', F('a' + String.fromCharCode(92) + 'b'))
+
+  // Re-exporting the same conversation must not destroy the earlier export.
+  const taken = new Set([path.join('d', 'chat.md'), path.join('d', 'chat (2).md')])
+  check('first free name is used', uniquePath('d', 'fresh', 'md', (x) => taken.has(x)) === path.join('d', 'fresh.md'))
+  check('collisions get a suffix', uniquePath('d', 'chat', 'md', (x) => taken.has(x)) === path.join('d', 'chat (3).md'),
+    uniquePath('d', 'chat', 'md', (x) => taken.has(x)))
+}
+
+// ---------------------------------------------------------------- schema migrations
+
+/*
+ * Migrations run destructive DDL against a database full of the user's chat history, and they
+ * are forward-only — a mistake here is not recoverable on the next launch. Migration 4 rebuilds
+ * `tasks` to add the foreign key it was originally declared without, so it is exercised against
+ * a database shaped like the one a real upgrade would meet: live rows, and orphans left behind
+ * by the missing cascade.
+ */
+section('Schema migrations')
+
+// storage/paths resolves APPDATA_DIR at import time. Point it at a throwaway directory before
+// db.js loads, so the suite can never read or write the real chat history — the stubbed
+// Electron would refuse anyway, but only after the fact.
+process.env.LLMM_APPDATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-test-'))
+
+{
+  const { DatabaseSync } = await import('node:sqlite')
+  const { MIGRATIONS } = await import('./built/db.js')
+
+  // Mirrors getDb: each migration is applied once, in id order, and only if it has not been.
+  const applyRange = (db, afterId, throughId) => {
+    for (const m of MIGRATIONS) {
+      if (m.id > afterId && m.id <= throughId) db.exec(m.sql)
+    }
+  }
+
+  const db = new DatabaseSync(':memory:')
+  db.exec('PRAGMA foreign_keys = ON;')
+  applyRange(db, 0, 3)
+
+  db.exec("INSERT INTO chats (id, title, kind, created_at, updated_at) VALUES ('live', 'Live', 'agent', 1, 1);")
+  db.exec("INSERT INTO tasks (id, chat_id, text, done, ord) VALUES ('t1', 'live', 'live task', 0, 0);")
+  db.exec("INSERT INTO tasks (id, chat_id, text, done, ord) VALUES ('t2', 'live', 'finished task', 1, 3);")
+  // Rows the missing cascade stranded when their chats were deleted.
+  db.exec("INSERT INTO tasks (id, chat_id, text, done, ord) VALUES ('t3', 'gone', 'orphan', 0, 0);")
+
+  check('pre-migration schema keeps orphaned tasks', db.prepare('SELECT COUNT(*) n FROM tasks').get().n === 3)
+
+  applyRange(db, 3, 4)
+
+  const rows = db.prepare('SELECT id, chat_id, text, done, ord FROM tasks ORDER BY id').all()
+  check('migration drops orphaned tasks', rows.length === 2 && rows.every((r) => r.chat_id === 'live'),
+    JSON.stringify(rows.map((r) => r.id)))
+  check('migration preserves done and ord', rows.find((r) => r.id === 't2')?.done === 1 && rows.find((r) => r.id === 't2')?.ord === 3)
+
+  db.exec("DELETE FROM chats WHERE id = 'live';")
+  check('deleting a chat now cascades to its tasks', db.prepare('SELECT COUNT(*) n FROM tasks').get().n === 0)
+
+  let rejected = false
+  try {
+    db.exec("INSERT INTO tasks (id, chat_id, text, done, ord) VALUES ('bad', 'nonexistent', 'x', 0, 0);")
+  } catch {
+    rejected = true
+  }
+  check('a task cannot be written against a missing chat', rejected)
+
+  db.close()
+}
+
+{
+  // Every migration must be safe to re-run: getDb applies only unapplied ids, but a partially
+  // applied upgrade should not wedge the app on the next launch either.
+  const { DatabaseSync } = await import('node:sqlite')
+  const { MIGRATIONS } = await import('./built/db.js')
+  check('migration ids are unique and ordered',
+    MIGRATIONS.every((m, i) => i === 0 || m.id > MIGRATIONS[i - 1].id))
+
+  const fresh = new DatabaseSync(':memory:')
+  fresh.exec('PRAGMA foreign_keys = ON;')
+  let ok = true
+  try {
+    for (const m of MIGRATIONS) fresh.exec(m.sql)
+  } catch {
+    ok = false
+  }
+  check('a fresh database applies every migration cleanly', ok)
+  fresh.close()
 }
 
 // ---------------------------------------------------------------- markdown

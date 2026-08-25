@@ -264,11 +264,21 @@ export class RemoteWebServer {
     }
 
     // Static renderer assets.
-    const root = rendererRoot()
+    // Resolved here so the containment test below compares two paths in the same normal form.
+    const root = path.resolve(rendererRoot())
     const requested = url.pathname === '/' ? '/index.html' : url.pathname
-    const filePath = path.join(root, path.normalize(requested).replace(/^(\.\.[/\\])+/, ''))
+    const filePath = path.resolve(root, `.${path.posix.normalize(requested)}`)
 
-    if (!filePath.startsWith(root)) {
+    /*
+     * Containment is checked against a resolved path, with the separator included.
+     *
+     * A bare `startsWith(root)` is not a containment test: it also accepts a sibling whose name
+     * merely begins with the root's, so a `dist-private` next to `dist` would serve. Nothing
+     * reaches that today — pathname arrives percent-encoded, so `%2e%2e` never becomes `..` —
+     * but this is the last check standing between the internet and the filesystem, and it
+     * should not depend on that staying true.
+     */
+    if (filePath !== root && !filePath.startsWith(root + path.sep)) {
       res.writeHead(403, baseHeaders)
       res.end('Forbidden')
       return

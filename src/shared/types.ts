@@ -74,6 +74,25 @@ export interface ModelArchInfo {
   unknownTensorTypes: number[]
 }
 
+export type ReasoningKind = 'none' | 'toggle' | 'effort'
+
+/**
+ * What reasoning control a model exposes, read from its own chat template at scan time.
+ *
+ * There is no metadata key for this and the level names are not standardised — Qwen3.8 takes
+ * low/medium/xhigh while gpt-oss takes low/medium/high — so the levels travel with the model
+ * rather than being assumed by the UI.
+ */
+export interface ReasoningSupport {
+  kind: ReasoningKind
+  /** Accepted levels, ordered weakest to strongest. Empty unless kind is 'effort'. */
+  levels: string[]
+  /** What the template falls back to when nothing is sent. */
+  defaultLevel: string | null
+  /** Whether thinking can be switched off entirely. */
+  canDisable: boolean
+}
+
 export interface ModelCapabilities {
   vision: boolean
   audio: boolean
@@ -83,6 +102,7 @@ export interface ModelCapabilities {
   videoPossible: boolean
   tools: boolean
   mmprojPath: string | null
+  reasoning: ReasoningSupport
 }
 
 export interface ModelRecord {
@@ -262,6 +282,8 @@ export interface AgentMessage {
   id: string
   role: 'user' | 'assistant' | 'tool' | 'system'
   content: string
+  /** The model's chain of thought, when it produced one. */
+  reasoning?: string
   toolCalls?: ToolCall[]
   toolResult?: ToolResult
   createdAt: number
@@ -315,4 +337,14 @@ export interface AppSettings {
   ui: {
     closeAction: 'ask' | 'tray' | 'quit'
   }
+}
+
+/** A file staged for sending, as the renderer sees it. */
+export interface AttachmentInfo {
+  path: string
+  name: string
+  kind: 'image' | 'audio' | 'video' | 'doc'
+  bytes: number
+  /** Why this file will not be used as expected, if it will not. */
+  warning: string | null
 }

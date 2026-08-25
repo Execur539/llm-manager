@@ -21,6 +21,47 @@ import type { ModelCapabilities } from '@shared/types'
 import { runtimeBinary } from '../runtime/binaries'
 import { TOOL_OUTPUT_DIR } from '../storage/paths'
 import { classifyAttachment, toDataUrl } from './repo'
+import { extractText } from '../rag/index'
+
+/**
+ * How much of a document to inline.
+ *
+ * Generous enough for a source file or a README, small enough that dropping a 5 MB log does not
+ * silently eat the whole context window and push the conversation out of it. Anything larger is
+ * truncated with a note saying so, because a quietly shortened file is worse than a refusal.
+ */
+const MAX_DOC_CHARS = 60_000
+
+/** Fence language, so inlined code is highlighted rather than rendered as prose. */
+const LANGUAGE_BY_EXT: Record<string, string> = {
+  '.ts': 'typescript',
+  '.tsx': 'tsx',
+  '.js': 'javascript',
+  '.jsx': 'jsx',
+  '.py': 'python',
+  '.rs': 'rust',
+  '.go': 'go',
+  '.java': 'java',
+  '.c': 'c',
+  '.h': 'c',
+  '.cpp': 'cpp',
+  '.cs': 'csharp',
+  '.rb': 'ruby',
+  '.php': 'php',
+  '.swift': 'swift',
+  '.kt': 'kotlin',
+  '.sh': 'bash',
+  '.ps1': 'powershell',
+  '.sql': 'sql',
+  '.json': 'json',
+  '.yaml': 'yaml',
+  '.yml': 'yaml',
+  '.toml': 'toml',
+  '.xml': 'xml',
+  '.html': 'html',
+  '.css': 'css',
+  '.md': 'markdown'
+}
 
 export interface AttachmentPlan {
   parts: ContentPart[]
@@ -166,8 +207,42 @@ export async function buildContent(
       continue
     }
 
-    // Documents are handled by RAG, not by the vision path.
-    notes.push(`${path.basename(file)} is a document — attach it to the chat's documents for retrieval instead.`)
+    /*
+     * Documents are inlined as text.
+     *
+     * This used to refuse them and point at the document collections instead, which is the right
+     * answer for a corpus you will ask about repeatedly and the wrong one for "look at this file"
+     * — the common case, and the one that made attaching a source file feel broken.
+     */
+    const name = path.basename(file)
+    try {
+      const raw = await extractText(file)
+      const trimmed = raw.trim()
+
+      if (!trimmed) {
+        notes.push(`${name} contained no readable text.`)
+        continue
+      }
+
+      const truncated = trimmed.length > MAX_DOC_CHARS
+      const body = truncated ? trimmed.slice(0, MAX_DOC_CHARS) : trimmed
+      const lang = LANGUAGE_BY_EXT[path.extname(file).toLowerCase()] ?? ''
+
+      parts.push({
+        type: 'text',
+        text: `Attached file \`${name}\`:\n\n\`\`\`${lang}\n${body}\n\`\`\``
+      })
+
+      if (truncated) {
+        notes.push(
+          `${name} is ${Math.round(trimmed.length / 1000)}k characters; the first ` +
+            `${Math.round(MAX_DOC_CHARS / 1000)}k were included. Add it to a document collection to ` +
+            `search the whole thing instead.`
+        )
+      }
+    } catch (err) {
+      notes.push(`${name} could not be read: ${err instanceof Error ? err.message : String(err)}`)
+    }
   }
 
   return { parts, notes, extractedFrames }

@@ -12,16 +12,25 @@ await build({
     permissions: path.join(ROOT, 'src/main/agent/permissions.ts'),
     hf: path.join(ROOT, 'src/main/downloads/hf.ts'),
     gguf: path.join(ROOT, 'src/main/models/gguf.ts'),
+    reasoning: path.join(ROOT, 'src/main/models/reasoning.ts'),
     gpu: path.join(ROOT, 'src/main/hardware/gpu.ts'),
+    filenames: path.join(ROOT, 'src/main/storage/filenames.ts'),
+    db: path.join(ROOT, 'src/main/storage/db.ts'),
     markdown: path.join(ROOT, 'src/renderer/src/lib/markdown.ts')
   },
   outdir: path.join(ROOT, 'scripts/built'),
   bundle: true,
   platform: 'node',
   format: 'esm',
-  external: ['electron'],
+  external: ['node:sqlite'],
   logLevel: 'error',
-  alias: { '@shared': path.join(ROOT, 'src/shared') }
+  alias: {
+    '@shared': path.join(ROOT, 'src/shared'),
+    // db.ts pulls in Electron only by way of storage/paths.ts, which resolves everything from
+    // LLMM_APPDATA_DIR under test. Stubbing the import is what lets the schema and its
+    // migrations be exercised against a throwaway database in plain Node.
+    electron: path.join(ROOT, 'scripts/electron-stub.mjs')
+  }
 })
 
 // RAG chunking is worth testing but the module imports Electron-bound code; extract the

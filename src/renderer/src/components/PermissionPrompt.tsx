@@ -66,18 +66,27 @@ export default function PermissionPrompt(): JSX.Element | null {
           <div className="faint tiny-note">{permissionQueue.length - 1} more waiting</div>
         )}
 
+        {!current.hardBlocked && (
+          <div className="actions-remember">
+            <span className="faint">Remember this decision:</span>
+            <button className="link" onClick={() => respond('allow-exact')}>
+              this exact call
+            </button>
+            <span className="faint">·</span>
+            <button className="link" onClick={() => respond('allow-tool')}>
+              every {current.tool}
+            </button>
+          </div>
+        )}
+
         <div className="actions">
           <button className="danger" onClick={() => respond('deny')} data-testid="permission-deny">
             Deny
           </button>
           {!current.hardBlocked && (
-            <>
-              <button onClick={() => respond('allow-exact')}>Always allow this exact call</button>
-              <button onClick={() => respond('allow-tool')}>Always allow {current.tool}</button>
-              <button className="primary" onClick={() => respond('allow-once')} data-testid="permission-allow">
-                Allow once
-              </button>
-            </>
+            <button className="primary" onClick={() => respond('allow-once')} data-testid="permission-allow">
+              Allow once
+            </button>
           )}
         </div>
       </div>

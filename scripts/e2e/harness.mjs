@@ -71,7 +71,48 @@ export async function launchApp(env, extraEnv = {}) {
 
   await page.waitForLoadState('domcontentloaded')
   await page.waitForSelector('.nav-item', { timeout: 20000 })
+
+  // Native dialogs are stubbed the moment the app is up, defaulting to "cancelled".
+  //
+  // An unstubbed picker does not fail a scenario — it opens a real modal window that blocks the
+  // main process until a human clicks it, hanging the suite and taking over the desktop. Every
+  // scenario therefore starts from a state where dialogs answer instantly; the ones that need a
+  // path call stubDialogs() again to override.
+  await stubDialogs(app, {})
+
   return { app, page, consoleErrors }
+}
+
+/**
+ * Replace Electron's native file dialogs for the rest of the run.
+ *
+ * Everything behind a file picker — importing a model, exporting a conversation, ingesting a
+ * document — was untestable without this, which is exactly why those paths carried the most
+ * bugs. The stub runs in the main process, so the handler under test is the real one; only the
+ * user's click on a native dialog is simulated.
+ *
+ * `plan` maps a dialog kind to what the user "chose":
+ *   { open: ['C:/a.gguf'], save: 'C:/out.md' }         -> those paths
+ *   { open: null }                                     -> the user cancelled
+ */
+export async function stubDialogs(app, plan) {
+  await app.evaluate(async ({ dialog }, p) => {
+    dialog.showOpenDialog = async () =>
+      p.open === null || p.open === undefined
+        ? { canceled: true, filePaths: [] }
+        : { canceled: false, filePaths: p.open }
+    dialog.showSaveDialog = async () =>
+      p.save === null || p.save === undefined
+        ? { canceled: true, filePath: undefined }
+        : { canceled: false, filePath: p.save }
+    // Message boxes would block the run forever waiting for a click that never comes.
+    dialog.showMessageBox = async () => ({ response: 0, checkboxChecked: false })
+  }, plan)
+}
+
+/** Read the toasts currently on screen. */
+export async function toastTexts(page) {
+  return page.getByTestId('toast').allTextContents()
 }
 
 export async function closeApp(app) {
@@ -152,15 +193,30 @@ const AUDIT_FN = () => {
     const rect = el.getBoundingClientRect()
     if (rect.width === 0 && rect.height === 0) continue
 
+    // Elements deliberately hidden from users are not judged on layout.
+    if (el.closest('[aria-hidden="true"], [inert]')) continue
+
+    // Does anything between this element and the document scroll horizontally?
+    function scrollableAncestor(node) {
+      for (let p = node.parentElement; p && p !== document.body; p = p.parentElement) {
+        if (/auto|scroll/.test(getComputedStyle(p).overflowX)) return true
+      }
+      return false
+    }
+
     const scrollsX = /auto|scroll/.test(style.overflowX)
     const scrollsY = /auto|scroll/.test(style.overflowY)
     const clipsX = /hidden|clip/.test(style.overflowX)
     const clipsY = /hidden|clip/.test(style.overflowY)
 
-    // 2. Content wider than its box, with no way to reach it.
+// 2. Content wider than its box, with no way to reach it.
+    //
+    // "No way to reach it" has to consider ancestors. A <code> inside a horizontally scrolling
+    // <pre> overflows its own box by design — the content is reachable by scrolling the parent —
+    // so checking only the element itself flags every scroll container's contents.
     if (!scrollsX && el.scrollWidth > el.clientWidth + 2 && el.clientWidth > 0) {
       const truncating = style.textOverflow === 'ellipsis' && /nowrap/.test(style.whiteSpace)
-      if (!truncating) {
+      if (!truncating && !scrollableAncestor(el)) {
         add('h-overflow', `scrollWidth ${el.scrollWidth} > clientWidth ${el.clientWidth}`, el)
       }
     }

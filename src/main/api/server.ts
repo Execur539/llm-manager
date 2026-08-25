@@ -107,6 +107,58 @@ function logRequest(
   }
 }
 
+/**
+ * An OpenAI-shaped usage block.
+ *
+ * All three fields are required by the spec and by every client that tracks cost. Emitting only
+ * completion_tokens made the OpenAI SDK and LangChain report undefined totals.
+ */
+function usageBlock(t: { promptTokens?: number; completionTokens?: number } | null): {
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+} {
+  const prompt = Math.max(0, Math.round(t?.promptTokens ?? 0))
+  const completion = Math.max(0, Math.round(t?.completionTokens ?? 0))
+  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion }
+}
+
+/**
+ * A request that should be answered with a 4xx rather than a 500.
+ *
+ * Malformed JSON and missing fields are the client's mistake; returning 500 tells them the
+ * server broke and makes SDKs retry a request that can never succeed.
+ */
+class BadRequest extends Error {
+  constructor(
+    message: string,
+    readonly status = 400,
+    readonly type = 'invalid_request_error'
+  ) {
+    super(message)
+  }
+}
+
+/** Parse a JSON body, turning any syntax error into a 400. */
+async function parseJson<T>(req: http.IncomingMessage): Promise<T> {
+  const raw = await readBody(req)
+  if (!raw.trim()) throw new BadRequest('Request body is empty')
+  try {
+    return JSON.parse(raw) as T
+  } catch (err) {
+    throw new BadRequest(`Request body is not valid JSON: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+/** The same counts in Anthropic's naming. */
+function anthropicUsage(t: { promptTokens?: number; completionTokens?: number } | null): {
+  input_tokens: number
+  output_tokens: number
+} {
+  const u = usageBlock(t)
+  return { input_tokens: u.prompt_tokens, output_tokens: u.completion_tokens }
+}
+
 function json(res: http.ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body)
   res.writeHead(status, {
@@ -162,7 +214,11 @@ export class ApiServer {
 
     const server = http.createServer((req, res) => {
       void this.handle(req, res).catch((err) => {
-        json(res, 500, { error: { message: err instanceof Error ? err.message : String(err) } })
+        const status = err instanceof BadRequest ? err.status : 500
+        const type = err instanceof BadRequest ? err.type : 'api_error'
+        json(res, status, {
+          error: { message: err instanceof Error ? err.message : String(err), type }
+        })
       })
     })
 
@@ -254,8 +310,12 @@ export class ApiServer {
 
     if (url.pathname === '/v1/embeddings' && req.method === 'POST') {
       const started = Date.now()
-      const body = JSON.parse(await readBody(req)) as { input: string | string[] }
-      const texts = Array.isArray(body.input) ? body.input : [body.input]
+      const body = await parseJson<{ input: string | string[] }>(req)
+      if (body.input === undefined || body.input === null) {
+        throw new BadRequest("'input' is required")
+      }
+      const texts = (Array.isArray(body.input) ? body.input : [body.input]).map(String)
+      if (texts.length === 0) throw new BadRequest("'input' must not be empty")
       const vectors = await requestQueue.enqueue(client === 'local' ? 0 : 1, () => llama.embed(texts))
       logRequest(url.pathname, null, texts.join('').length / 4, 0, Date.now() - started, client, ip, 200)
       json(res, 200, {
@@ -285,7 +345,7 @@ export class ApiServer {
     ip: string
   ): Promise<void> {
     const started = Date.now()
-    const body = JSON.parse(await readBody(req)) as {
+    const body = await parseJson<{
       model?: string
       messages: ChatMessage[]
       stream?: boolean
@@ -294,6 +354,12 @@ export class ApiServer {
       max_tokens?: number
       tools?: { function: { name: string; description: string; parameters: Record<string, unknown> } }[]
       stop?: string[]
+      reasoning_effort?: string
+      chat_template_kwargs?: Record<string, unknown>
+    }>(req)
+
+    if (!Array.isArray(body.messages) || body.messages.length === 0) {
+      throw new BadRequest("'messages' must be a non-empty array")
     }
 
     await this.ensureModel(body.model)
@@ -316,20 +382,30 @@ export class ApiServer {
       topP: body.top_p,
       maxTokens: body.max_tokens,
       stop: body.stop,
-      tools
+      tools,
+      /*
+       * Reasoning controls are forwarded rather than interpreted.
+       *
+       * A client that knows the loaded model — the whole point of an OpenAI-compatible endpoint
+       * is that existing tooling can talk to it — should be able to ask for an effort level and
+       * have it honoured. Dropping these silently would make the endpoint quietly less capable
+       * than the app's own UI.
+       */
+      reasoningEffort: body.reasoning_effort,
+      chatTemplateKwargs: body.chat_template_kwargs
     }
 
     if (!body.stream) {
       const text = await requestQueue.enqueue(priority, () => llama.complete(opts))
       const t = llama.timings
-      logRequest('/v1/chat/completions', llama.loaded.model.filename, 0, t?.completionTokens ?? 0, Date.now() - started, client, ip, 200)
+      logRequest('/v1/chat/completions', llama.loaded.model.filename, t?.promptTokens ?? 0, t?.completionTokens ?? 0, Date.now() - started, client, ip, 200)
       json(res, 200, {
         id: `chatcmpl-${crypto.randomBytes(8).toString('hex')}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: llama.loaded.model.filename,
         choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
-        usage: { completion_tokens: t?.completionTokens ?? 0 }
+        usage: usageBlock(t)
       })
       return
     }
@@ -371,13 +447,19 @@ export class ApiServer {
     ip: string
   ): Promise<void> {
     const started = Date.now()
-    const body = JSON.parse(await readBody(req)) as {
+    const body = await parseJson<{
       model?: string
       system?: string | { type: string; text: string }[]
       messages: { role: 'user' | 'assistant'; content: unknown }[]
       stream?: boolean
       max_tokens?: number
       temperature?: number
+      /** Anthropic's shape for the same control; `type: 'disabled'` turns thinking off. */
+      thinking?: { type?: string; budget_tokens?: number }
+    }>(req)
+
+    if (!Array.isArray(body.messages) || body.messages.length === 0) {
+      throw new BadRequest("'messages' must be a non-empty array")
     }
 
     await this.ensureModel(body.model)
@@ -398,7 +480,14 @@ export class ApiServer {
     }
 
     const priority = client === 'local' ? 0 : 1
-    const opts = { messages, temperature: body.temperature, maxTokens: body.max_tokens }
+    const opts = {
+      messages,
+      temperature: body.temperature,
+      maxTokens: body.max_tokens,
+      // Only the disable case maps cleanly: Anthropic expresses effort as a token budget, which
+      // is not the same thing as a named level, so there is nothing honest to translate it into.
+      ...(body.thinking?.type === 'disabled' ? { reasoningEffort: 'none' } : {})
+    }
     const id = `msg_${crypto.randomBytes(10).toString('hex')}`
 
     if (!body.stream) {
@@ -412,7 +501,7 @@ export class ApiServer {
         model: llama.loaded.model.filename,
         content: [{ type: 'text', text }],
         stop_reason: 'end_turn',
-        usage: { input_tokens: 0, output_tokens: t?.completionTokens ?? 0 }
+        usage: anthropicUsage(t)
       })
       return
     }
@@ -445,12 +534,16 @@ export class ApiServer {
       }
 
       sse('content_block_stop', { type: 'content_block_stop', index: 0 })
-      sse('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: llama.timings?.completionTokens ?? 0 } })
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: anthropicUsage(llama.timings)
+      })
       sse('message_stop', { type: 'message_stop' })
       res.end()
     })
 
-    logRequest('/v1/messages', llama.loaded.model.filename, 0, llama.timings?.completionTokens ?? 0, Date.now() - started, client, ip, 200)
+    logRequest('/v1/messages', llama.loaded.model.filename, llama.timings?.promptTokens ?? 0, llama.timings?.completionTokens ?? 0, Date.now() - started, client, ip, 200)
   }
 }
 

@@ -129,6 +129,20 @@ function truncate(s: string, n: number): string {
 export class PermissionEngine {
   private rules: PermissionRule[] = []
   private sessionAllowedTools = new Set<string>()
+  /**
+   * Calls denied during the current turn.
+   *
+   * A model that has just been refused often asks for exactly the same thing again. Prompting
+   * afresh each time turns one refusal into a barrage of identical dialogs, and the user cannot
+   * make it stop except by aborting. An identical repeat is refused straight away, and the
+   * refusal text tells the model the decision already stands.
+   */
+  private deniedThisTurn = new Set<string>()
+
+  /** Called at the start of each turn: a new turn is a new chance to say yes. */
+  resetTurn(): void {
+    this.deniedThisTurn.clear()
+  }
 
   constructor(
     private opts: {
@@ -187,6 +201,16 @@ export class PermissionEngine {
     if (this.sessionAllowedTools.has(tool)) return { allowed: true }
     if (this.matches(tool, resolved, cwd)) return { allowed: true }
 
+    const signature = `${tool}::${resolved}`
+    if (this.deniedThisTurn.has(signature)) {
+      return {
+        allowed: false,
+        reason:
+          'You already requested this exact action in this turn and the user denied it. That ' +
+          'decision stands — do not ask again. Take a different approach or explain why you cannot.'
+      }
+    }
+
     const decision = await this.opts.ask({
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       tool,
@@ -208,7 +232,11 @@ export class PermissionEngine {
         return { allowed: true }
       case 'deny':
       default:
-        return { allowed: false, reason: 'The user denied this action.' }
+        this.deniedThisTurn.add(signature)
+        return {
+          allowed: false,
+          reason: 'The user denied this action. Do not retry it — choose another approach.'
+        }
     }
   }
 }

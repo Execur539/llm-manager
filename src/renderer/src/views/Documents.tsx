@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react'
 import { fmtBytes, invoke, on } from '../lib/api'
+import ConfirmDialog from '../components/ConfirmDialog'
+import EmptyState from '../components/EmptyState'
+import Icon from '../components/Icon'
 
 interface Collection {
   id: string
@@ -16,6 +19,7 @@ interface DocumentRecord {
 
 export default function Documents(): JSX.Element {
   const [collections, setCollections] = useState<Collection[]>([])
+  const [confirmDeleteCollection, setConfirmDeleteCollection] = useState(false)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [documents, setDocuments] = useState<DocumentRecord[]>([])
   const [newName, setNewName] = useState('')
@@ -107,13 +111,24 @@ export default function Documents(): JSX.Element {
               onKeyDown={(e) => e.key === 'Enter' && void create()}
               style={{ flex: 1 }}
             />
-            <button onClick={() => void create()}>+</button>
+            <button
+              onClick={() => void create()}
+              title="Create collection"
+              aria-label="Create collection"
+              className="icon-button"
+              data-testid="create-collection"
+              disabled={!newName.trim()}
+            >
+              <Icon name="plus" size={15} />
+            </button>
           </div>
           {collections.map((c) => (
             <div
               key={c.id}
               className={`side-item ${activeId === c.id ? 'active' : ''}`}
               onClick={() => void loadDocs(c.id)}
+              data-testid="collection-item"
+              data-id={c.id}
             >
               <div className="truncate">{c.name}</div>
               <div className="faint" style={{ fontSize: 10 }}>{c.documents} documents</div>
@@ -123,22 +138,19 @@ export default function Documents(): JSX.Element {
         </aside>
 
         <div style={{ flex: 1, minWidth: 0 }}>
-          {!activeId && <div className="empty">Select or create a collection.</div>}
+          {!activeId && (
+            <EmptyState
+              icon="documents"
+              title="No collection selected"
+              body="Pick a collection on the left, or create one to start indexing files."
+            />
+          )}
 
           {activeId && (
             <>
               <div className="row" style={{ marginBottom: 12 }}>
                 <button className="primary" onClick={() => void addFiles()}>Add documents…</button>
-                <button
-                  className="danger"
-                  onClick={async () => {
-                    if (!confirm('Delete this collection and its embeddings?')) return
-                    await invoke('rag:delete-collection', activeId)
-                    setActiveId(null)
-                    setDocuments([])
-                    await refresh()
-                  }}
-                >
+                <button className="danger" onClick={() => setConfirmDeleteCollection(true)} data-testid="delete-collection">
                   Delete collection
                 </button>
               </div>
@@ -195,6 +207,30 @@ export default function Documents(): JSX.Element {
           )}
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmDeleteCollection}
+        danger
+        title="Delete this collection?"
+        confirmLabel="Delete collection"
+        body={
+          <p>
+            The collection, its documents and every embedding computed for them will be removed. The original
+            files on disk are left alone — only what was indexed here is deleted.
+          </p>
+        }
+        onCancel={() => setConfirmDeleteCollection(false)}
+        onConfirm={() => {
+          setConfirmDeleteCollection(false)
+          void (async () => {
+            if (!activeId) return
+            await invoke('rag:delete-collection', activeId)
+            setActiveId(null)
+            setDocuments([])
+            await refresh()
+          })()
+        }}
+      />
     </>
   )
 }

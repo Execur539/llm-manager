@@ -29,6 +29,7 @@ import type {
   ToolResult
 } from '@shared/types'
 import { llama, estimateTokens, type ChatMessage } from '../runtime/llama'
+import { reasoningRequestFields, type ReasoningChoice } from '../models/reasoning'
 import { PermissionEngine, type PermissionRule } from './permissions'
 import { ToolRegistry, makeResult, type Tool, type ToolContext } from './tools/base'
 import { filesystemTools } from './tools/filesystem'
@@ -50,6 +51,11 @@ export interface AgentOptions {
   hardBlocksDisabled: boolean
   compaction: CompactionStrategy
   hfToken: string | null
+  /**
+   * Effort level the user selected, as named by the loaded model's template, or 'off'.
+   * null leaves the template's own default alone.
+   */
+  reasoningChoice?: ReasoningChoice
   /** true when the caller is a remote web-UI session */
   remote?: boolean
   remoteToolsEnabled?: boolean
@@ -361,6 +367,8 @@ Platform: Windows (PowerShell)${memoryBlock}`
   async run(session: AgentSessionState, userInput: string): Promise<void> {
     this.abort = new AbortController()
     const signal = this.abort.signal
+    // A fresh turn re-opens decisions the user made in the previous one.
+    this.permissions.resetTurn()
 
     if (!this.history.length) this.hydrate(session)
     else this.history[0] = { role: 'system', content: this.buildSystemPrompt() }
@@ -387,14 +395,20 @@ Platform: Windows (PowerShell)${memoryBlock}`
         await this.compactIfNeeded()
 
         let text = ''
+        let thinking = ''
         const toolCalls: ToolCall[] = []
 
         for await (const ev of llama.streamEvents({
           messages: this.history,
           tools: this.availableTools(),
           signal,
-          temperature: 0.6
+          temperature: 0.6,
+          ...reasoningRequestFields(llama.loaded?.model.caps.reasoning, this.opts.reasoningChoice ?? null)
         })) {
+          if (ev.type === 'reasoning') {
+            thinking += ev.text
+            this.emit('reasoning', ev.text)
+          }
           if (ev.type === 'text') {
             text += ev.text
             this.emit('delta', ev.text)

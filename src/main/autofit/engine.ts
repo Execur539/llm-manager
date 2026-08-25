@@ -501,9 +501,21 @@ export function planFit(
 
 export function fmtBytes(n: number): string {
   if (!Number.isFinite(n)) return '?'
-  if (n >= GB) return `${(n / GB).toFixed(2)} GB`
-  if (n >= MB) return `${(n / MB).toFixed(0)} MB`
-  return `${n} B`
+  // Mirrors the renderer's formatter, including the kilobyte step: without it anything under a
+  // megabyte printed as a raw byte count.
+  const units: [number, string, number][] = [
+    [1024 ** 4, 'TB', 2],
+    [GB, 'GB', 2],
+    [MB, 'MB', 0],
+    [1024, 'KB', 0]
+  ]
+  for (const [size, label, digits] of units) {
+    if (n >= size) {
+      const value = n / size
+      return `${value.toFixed(value >= 10 ? Math.max(0, digits - 1) : digits)} ${label}`
+    }
+  }
+  return `${Math.round(n)} B`
 }
 
 /**

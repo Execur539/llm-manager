@@ -82,28 +82,41 @@ export default function Dashboard({
         </div>
       )}
 
-      <div className="grid-2">
+      <div className="grid-2 grid-top">
         {(hardware?.gpus ?? []).map((g) => {
-          const used = g.freeVram >= 0 ? g.totalVram - g.freeVram : 0
-          const pct = g.totalVram > 0 ? Math.min(100, (used / g.totalVram) * 100) : 0
+          // Free VRAM cannot be measured on some AMD/Intel drivers. Deriving "used" from an
+          // unmeasured figure produced a confident "0 B used" and an empty bar, which asserts
+          // something we do not know — worse than saying nothing.
+          const measured = g.freeVram >= 0
+          const used = measured ? g.totalVram - g.freeVram : 0
+          const pct = measured && g.totalVram > 0 ? Math.min(100, (used / g.totalVram) * 100) : 0
           return (
             <div className="card" key={`${g.index}-${g.name}`}>
               <div className="card-title">
-                <span className="truncate">{g.name}</span>
-                <span className={`badge ${g.freeIsMeasured ? 'good' : 'warn'}`}>
+                <span className="truncate" title={g.name}>{g.name}</span>
+                <span
+                  className={`badge ${g.freeIsMeasured ? 'good' : 'warn'}`}
+                  title={
+                    g.freeIsMeasured
+                      ? 'Free VRAM read from the driver'
+                      : 'This driver does not report free VRAM, so the figure is estimated from the total'
+                  }
+                >
                   {g.freeIsMeasured ? 'measured' : 'estimated'}
                 </span>
               </div>
-              <div className="meter">
-                <span style={{ width: `${pct}%` }} />
+              <div className={`meter${measured ? '' : ' unknown'}`}>
+                {measured && <span style={{ width: `${pct}%` }} />}
               </div>
               <div className="row" style={{ justifyContent: 'space-between', marginTop: 6, fontSize: 11 }}>
-                <span className="faint">{fmtBytes(used)} used</span>
-                <span className="faint">{fmtBytes(g.freeVram)} free of {fmtBytes(g.totalVram)}</span>
+                <span className="faint">{measured ? `${fmtBytes(used)} used` : 'usage unknown'}</span>
+                <span className="faint">
+                  {measured ? `${fmtBytes(g.freeVram)} free of ${fmtBytes(g.totalVram)}` : `${fmtBytes(g.totalVram)} total`}
+                </span>
               </div>
-              {g.utilisation >= 0 && (
-                <div className="faint" style={{ marginTop: 4, fontSize: 11 }}>GPU {g.utilisation}% busy</div>
-              )}
+              <div className="faint gpu-util">
+                {g.utilisation >= 0 ? `GPU ${g.utilisation}% busy` : 'utilisation not reported'}
+              </div>
             </div>
           )
         })}
@@ -121,7 +134,8 @@ export default function Dashboard({
             <dt>Backend</dt>
             <dd>{hardware?.backend.toUpperCase() ?? '—'}</dd>
             <dt>CPU</dt>
-            <dd className="truncate">{hardware?.cpuName ?? '—'}</dd>
+            {/* Wraps rather than truncating: a cut-off CPU name has no way to be read. */}
+            <dd title={hardware?.cpuName ?? undefined}>{hardware?.cpuName ?? '—'}</dd>
             <dt>Threads</dt>
             <dd>{hardware?.cpuThreads ?? '—'}</dd>
             <dt>RAM</dt>

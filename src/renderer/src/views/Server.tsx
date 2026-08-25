@@ -82,6 +82,7 @@ export default function ServerView(): JSX.Element {
           <dd>
             <input
               type="number"
+              className="narrow"
               value={port}
               disabled={status.running}
               onChange={(e) => setPort(Number(e.target.value))}

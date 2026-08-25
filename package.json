@@ -15,9 +15,11 @@
     "fetch-vendor": "node scripts/fetch-vendor.mjs",
     "pack:dir": "electron-vite build && electron-builder --win --dir",
     "pack:installer": "electron-vite build && electron-builder --win nsis",
-    "pack:portable": "npm run pack:dir && node scripts/make-portable.mjs",
+    "pack:portable": "npm run pack:dir && npm run verify:packaged && node scripts/make-portable.mjs",
     "dist": "npm run pack:installer && npm run pack:portable",
-    "test:e2e": "node scripts/e2e/run.mjs"
+    "test:e2e": "node scripts/e2e/run.mjs",
+    "verify:packaged": "node scripts/e2e/verify-packaged.mjs",
+    "verify:portable": "node scripts/e2e/verify-portable.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
@@ -54,8 +56,7 @@
         "filter": [
           "**/*",
           "!.cache/**",
-          "!**/*.zip",
-          "!**/ffplay.exe"
+          "!ffmpeg/ffplay.exe"
         ]
       }
     ],
