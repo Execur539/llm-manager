@@ -85,6 +85,15 @@ export interface CompletionOptions {
   reasoningEffort?: string
   /** Extra Jinja variables — used for `enable_thinking` on models with a plain toggle. */
   chatTemplateKwargs?: Record<string, unknown>
+  /**
+   * Token budget for thinking; 0 ends it immediately.
+   *
+   * This one is llama.cpp's, not the template's — it closes the thought block itself rather than
+   * asking the template to skip it. That makes it the only way to stop a model thinking when its
+   * template offers no switch of its own, which is the common case for effort-only templates
+   * like Qwen3.8's: they enumerate levels and provide no way to say "none".
+   */
+  reasoningBudget?: number
   signal?: AbortSignal
 }
 
@@ -286,6 +295,12 @@ export class LlamaRuntime extends EventEmitter {
     if (opts.reasoningEffort) body.reasoning_effort = opts.reasoningEffort
     if (opts.chatTemplateKwargs && Object.keys(opts.chatTemplateKwargs).length > 0) {
       body.chat_template_kwargs = opts.chatTemplateKwargs
+    }
+    // Sent under both names: the server has accepted `reasoning_budget` and `thinking_budget`
+    // at different points, and an unrecognised field is ignored rather than rejected.
+    if (opts.reasoningBudget !== undefined) {
+      body.reasoning_budget = opts.reasoningBudget
+      body.thinking_budget = opts.reasoningBudget
     }
     if (opts.grammar) body.grammar = opts.grammar
     if (opts.tools?.length) {

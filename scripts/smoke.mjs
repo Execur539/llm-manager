@@ -25,7 +25,7 @@ const { readGguf, extractArchInfo, tensorByteSize, isKnownGgmlType } = await imp
 const { recommendQuant, findMmprojFor } = await import('./built/hf.js')
  const { isVirtualAdapter } = await import('./built/gpu.js')
 const { exportFilename, uniquePath } = await import('./built/filenames.js')
-const { detectReasoning } = await import('./built/reasoning.js')
+const { detectReasoning, reasoningRequestFields } = await import('./built/reasoning.js')
 
 const GB = 1024 ** 3
 let pass = 0
@@ -595,6 +595,63 @@ section('Reasoning detection')
   check('unknown level names are kept', e.levels.includes('turbo'), e.levels.join(','))
   check('known names still order correctly around them', e.levels.indexOf('low') < e.levels.indexOf('max'),
     e.levels.join(','))
+
+  // The off value is only recorded when the template's own accepted set contains one.
+  check('an off level is recorded when the template lists one', d.offValue === 'none', String(d.offValue))
+  check('no off level is invented for a levels-only template', a.offValue === null, String(a.offValue))
+  check('nor for one with only equality branches', b.offValue === null, String(b.offValue))
+}
+
+/*
+ * Turning thinking off.
+ *
+ * Most effort templates enumerate levels and provide no way to say "none" — Qwen3.8 validates
+ * against ('xhigh','medium','low') and raises on anything else. Off therefore cannot be built out
+ * of the effort level alone; it rests on llama.cpp's own reasoning budget, which ends the thought
+ * block without asking the template's permission. What must never happen is sending a level name
+ * the template will reject, which turns "stop thinking" into a failed request.
+ */
+section('Reasoning: off')
+{
+  const levelsOnly = detectReasoning(
+    `{%- set r = reasoning_effort|default('xhigh') %}
+     {%- if r not in ('xhigh', 'medium', 'low') %}{{- raise_exception('nope') }}{%- endif %}`
+  )
+  const withOff = detectReasoning(`{%- if reasoning_effort in ('none', 'low', 'high') %}{%- endif %}`)
+  const toggleOnly = detectReasoning(
+    `{%- if enable_thinking is defined and enable_thinking is false %}<think></think>{%- endif %}`
+  )
+
+  check('a levels-only template cannot disable via its own template', levelsOnly.canDisable === false)
+
+  const offLevels = reasoningRequestFields(levelsOnly, 'off')
+  check('off still works on a levels-only model', offLevels.reasoningBudget === 0, JSON.stringify(offLevels))
+  check(
+    'off never sends a level the template would raise on',
+    offLevels.reasoningEffort === undefined,
+    String(offLevels.reasoningEffort)
+  )
+  check('off asks the template too, in case it listens', offLevels.chatTemplateKwargs?.enable_thinking === false)
+
+  const offNamed = reasoningRequestFields(withOff, 'off')
+  check('off sends the level when the template accepts one', offNamed.reasoningEffort === 'none', String(offNamed.reasoningEffort))
+  check('and still sets the budget', offNamed.reasoningBudget === 0)
+
+  const offToggle = reasoningRequestFields(toggleOnly, 'off')
+  check('off on a toggle model clears enable_thinking', offToggle.chatTemplateKwargs?.enable_thinking === false)
+  check('off on a toggle model sends no level', offToggle.reasoningEffort === undefined, String(offToggle.reasoningEffort))
+
+  // Everything that is not "off" must be untouched by the above.
+  const on = reasoningRequestFields(levelsOnly, 'medium')
+  check('a chosen level is sent as-is', on.reasoningEffort === 'medium', String(on.reasoningEffort))
+  check('a chosen level sets no budget', on.reasoningBudget === undefined, String(on.reasoningBudget))
+  check(
+    'a level the model never advertised is dropped',
+    reasoningRequestFields(levelsOnly, 'ludicrous').reasoningEffort === undefined
+  )
+  check('null means leave the template alone', Object.keys(reasoningRequestFields(levelsOnly, null)).length === 0)
+  check('a non-reasoning model sends nothing at all',
+    Object.keys(reasoningRequestFields(detectReasoning('{{ messages }}'), 'off')).length === 0)
 }
 
 section('Export filenames')

@@ -89,8 +89,17 @@ export interface ReasoningSupport {
   levels: string[]
   /** What the template falls back to when nothing is sent. */
   defaultLevel: string | null
-  /** Whether thinking can be switched off entirely. */
+  /** Whether the template itself can switch thinking off, via enable_thinking or an off level. */
   canDisable: boolean
+  /**
+   * The level name this template accepts for "do not think", if it has one.
+   *
+   * Not the same question as `canDisable`: a template can be disabled through `enable_thinking`
+   * and still validate `reasoning_effort` against a list containing no off value, where sending
+   * one raises instead of disabling. Turning thinking off does not depend on this — llama.cpp
+   * can end the thought block itself — but the level name is only ever sent when it is here.
+   */
+  offValue: string | null
 }
 
 export interface ModelCapabilities {

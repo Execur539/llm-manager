@@ -34,13 +34,23 @@ export interface ReasoningSupport {
   defaultLevel: string | null
   /** Whether thinking can be switched off entirely, via enable_thinking or an explicit 'none'. */
   canDisable: boolean
+  /**
+   * The literal this template accepts as an effort level meaning "do not think", if any.
+   *
+   * Kept separate from `canDisable` because the two are not the same question. A template can be
+   * disabled through `enable_thinking` while still validating `reasoning_effort` against a list
+   * that has no off value in it — sending 'none' to that template does not disable anything, it
+   * raises. Only a name found in the template's own accepted set is ever sent back to it.
+   */
+  offValue: string | null
 }
 
 export const NO_REASONING: ReasoningSupport = {
   kind: 'none',
   levels: [],
   defaultLevel: null,
-  canDisable: false
+  canDisable: false,
+  offValue: null
 }
 
 /**
@@ -99,13 +109,32 @@ export type ReasoningChoice = string | 'off' | null
 export function reasoningRequestFields(
   support: ReasoningSupport | undefined | null,
   choice: ReasoningChoice
-): { reasoningEffort?: string; chatTemplateKwargs?: Record<string, unknown> } {
+): {
+  reasoningEffort?: string
+  chatTemplateKwargs?: Record<string, unknown>
+  reasoningBudget?: number
+} {
   if (!support || support.kind === 'none' || choice === null) return {}
 
+  /*
+   * Turning thinking off works on any reasoning model, whatever its template offers.
+   *
+   * Three mechanisms, sent together because which one bites depends on the model:
+   *   - `reasoning_budget: 0` is llama.cpp's own, and closes the thought block itself. It is the
+   *     only one that works on an effort-only template like Qwen3.8's, which enumerates levels
+   *     and has no way to express "none".
+   *   - `enable_thinking: false` is honoured by templates built around that flag, and is an
+   *     unread variable everywhere else.
+   *   - the effort level is sent only when the template's own accepted set contains an off
+   *     value. Sending 'none' to a template that validates against ('xhigh','medium','low')
+   *     does not disable thinking — it raises mid-request and the turn fails.
+   */
   if (choice === 'off') {
-    if (!support.canDisable) return {}
-    // Both switches exist; sending both covers templates that honour only one of them.
-    return { reasoningEffort: 'none', chatTemplateKwargs: { enable_thinking: false } }
+    return {
+      reasoningBudget: 0,
+      chatTemplateKwargs: { enable_thinking: false },
+      ...(support.offValue ? { reasoningEffort: support.offValue } : {})
+    }
   }
 
   if (support.kind === 'toggle') {
@@ -127,6 +156,7 @@ export function detectReasoning(chatTemplate: string | null | undefined): Reason
 
   let levels: string[] = []
   let canDisable = mentionsToggle
+  let offValue: string | null = null
 
   if (mentionsEffort) {
     /*
@@ -153,7 +183,12 @@ export function detectReasoning(chatTemplate: string | null | undefined): Reason
     }
 
     // 'none' is llama.cpp's way of disabling thinking, not a level of it.
-    if (levels.some((l) => OFF_VALUES.has(l.toLowerCase()))) canDisable = true
+    const off = levels.find((l) => OFF_VALUES.has(l.toLowerCase()))
+    if (off) {
+      canDisable = true
+      // Kept verbatim: the template will compare against its own spelling, not a normalised one.
+      offValue = off
+    }
     levels = levels.filter((l) => !OFF_VALUES.has(l.toLowerCase()) && !PASSTHROUGH_VALUES.has(l.toLowerCase()))
   }
 
@@ -166,10 +201,10 @@ export function detectReasoning(chatTemplate: string | null | undefined): Reason
 
   // One level is not a choice; treat it as a plain toggle if the template offers one.
   if (ordered.length >= 2) {
-    return { kind: 'effort', levels: ordered, defaultLevel, canDisable }
+    return { kind: 'effort', levels: ordered, defaultLevel, canDisable, offValue }
   }
   if (canDisable) {
-    return { kind: 'toggle', levels: [], defaultLevel: null, canDisable: true }
+    return { kind: 'toggle', levels: [], defaultLevel: null, canDisable: true, offValue }
   }
   return NO_REASONING
 }

@@ -15,6 +15,7 @@ import http from 'node:http'
 import crypto from 'node:crypto'
 import type { AddressInfo } from 'node:net'
 import { llama, type ChatMessage } from '../runtime/llama'
+import { reasoningRequestFields } from '../models/reasoning'
 import { run } from '../storage/db'
 
 export interface ApiServerOptions {
@@ -356,6 +357,9 @@ export class ApiServer {
       stop?: string[]
       reasoning_effort?: string
       chat_template_kwargs?: Record<string, unknown>
+      /** Token budget for thinking; 0 ends it immediately. Both spellings are accepted. */
+      reasoning_budget?: number
+      thinking_budget?: number
     }>(req)
 
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
@@ -392,7 +396,10 @@ export class ApiServer {
        * than the app's own UI.
        */
       reasoningEffort: body.reasoning_effort,
-      chatTemplateKwargs: body.chat_template_kwargs
+      chatTemplateKwargs: body.chat_template_kwargs,
+      // Forwarded for the same reason, and the only way an OpenAI-style client can stop a model
+      // thinking when its template enumerates levels without offering a "none".
+      reasoningBudget: body.reasoning_budget ?? body.thinking_budget
     }
 
     if (!body.stream) {
@@ -484,9 +491,19 @@ export class ApiServer {
       messages,
       temperature: body.temperature,
       maxTokens: body.max_tokens,
-      // Only the disable case maps cleanly: Anthropic expresses effort as a token budget, which
-      // is not the same thing as a named level, so there is nothing honest to translate it into.
-      ...(body.thinking?.type === 'disabled' ? { reasoningEffort: 'none' } : {})
+      /*
+       * Anthropic expresses thinking as a token budget, and llama.cpp has one too, so the two
+       * now line up exactly rather than being approximated through a named level.
+       *
+       * `disabled` goes through the same path the UI's Off uses, which matters: sending
+       * reasoning_effort 'none' to a template that validates against its own list of levels does
+       * not disable anything, it raises and fails the request. That is what this used to do.
+       */
+      ...(body.thinking?.type === 'disabled'
+        ? reasoningRequestFields(llama.loaded.model.caps.reasoning, 'off')
+        : body.thinking?.type === 'enabled' && typeof body.thinking.budget_tokens === 'number'
+          ? { reasoningBudget: Math.max(0, body.thinking.budget_tokens) }
+          : {})
     }
     const id = `msg_${crypto.randomBytes(10).toString('hex')}`
 

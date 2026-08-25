@@ -79,9 +79,11 @@ export default function ReasoningControl({
 
   // ---- a model with named effort levels
   //
-  // "Off" occupies position 0 when the template can be told to skip thinking, so the whole range
-  // is one continuous control rather than a slider plus a separate switch.
-  const stops: Choice[] = support.canDisable ? ['off', ...support.levels] : [...support.levels]
+  // "Off" occupies position 0, so the whole range is one continuous control rather than a slider
+  // plus a separate switch. It is offered for every reasoning model, not only those whose
+  // template has a switch of its own: llama.cpp can end the thought block itself, which covers
+  // the effort-only templates that enumerate levels without providing a way to say "none".
+  const stops: Choice[] = ['off', ...support.levels]
   const effective = value ?? support.defaultLevel ?? support.levels.at(-1) ?? null
   const index = Math.max(0, stops.indexOf(effective))
   const max = stops.length - 1
