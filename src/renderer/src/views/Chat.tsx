@@ -216,7 +216,8 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               {m.role === 'assistant' ? (
                 <>
                   {m.reasoning && <ThinkingBlock text={m.reasoning} />}
-                  <Markdown source={m.content} />
+                  {/* Kept in step with Agent: a reasoning-only turn renders no empty body. */}
+                  {m.content && <Markdown source={m.content} />}
                 </>
               ) : (
                 <div className="body">{m.content}</div>

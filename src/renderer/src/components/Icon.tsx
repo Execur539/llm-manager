@@ -117,7 +117,9 @@ const PATHS: Record<IconName, JSX.Element> = {
   close: <path d="M6 6l12 12M18 6 6 18" />,
   folder: <path d="M3 7a2 2 0 0 1 2-2h3.5l2 2.5H19a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" />,
   download: <path d="M12 4v10m0 0 4-4m-4 4-4-4M4 19h16" />,
-  sparkle: <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z" />,
+  // Spans y 5..19 so its centre sits on the grid's centre line at 12, like every other glyph.
+  // Drawn at 3..17 it was a full two units high, which reads as a misaligned avatar.
+  sparkle: <path d="M12 5l1.8 5.2L19 12l-5.2 1.8L12 19l-1.8-5.2L5 12l5.2-1.8L12 5Z" />,
   user: (
     <>
       <circle cx="12" cy="8" r="3.6" />

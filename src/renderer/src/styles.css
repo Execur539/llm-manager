@@ -2349,20 +2349,34 @@ button.danger.subtle:hover {
   position: relative;
   display: flex;
   align-items: center;
-  width: 132px;
-  height: 20px;
+  width: 140px;
+  height: var(--slider-h);
   flex-shrink: 0;
-  /* Must match the thumb width below; the fill and stops are positioned against it. */
-  --thumb: 13px;
+  /*
+   * One source of truth for the geometry.
+   *
+   * --thumb is the thumb's *border box*, which is what the browser keeps inside the track when
+   * it positions it. The fill and the stop marks are laid out against the same number, so the
+   * three agree at every value. They did not before: the thumb was sized content-box (the
+   * universal box-sizing rule does not reach a pseudo-element), so a declared 13px circle with
+   * 2px borders really occupied 17px and sat 2px away from the fill it was supposed to cap.
+   */
+  --thumb: 14px;
+  --track-h: 5px;
+  --slider-h: 20px;
 }
 
 .slider-track {
   position: absolute;
+  top: 50%;
   left: 0;
   right: 0;
-  height: 4px;
+  height: var(--track-h);
+  margin-top: calc(var(--track-h) / -2);
   border-radius: var(--r-pill);
-  background: var(--surface-3);
+  background: var(--bg-inset);
+  box-shadow: inset 0 0 0 1px var(--border);
+  overflow: hidden;
   pointer-events: none;
 }
 
@@ -2371,7 +2385,7 @@ button.danger.subtle:hover {
   border-radius: var(--r-pill);
   background: linear-gradient(90deg, var(--accent-dim), var(--accent));
   width: calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--pct, 0));
-  transition: width 130ms ease;
+  transition: width 130ms cubic-bezier(0.2, 0, 0.2, 1);
 }
 
 /* A mark per selectable value, so the number of stops is visible without dragging. */
@@ -2382,22 +2396,24 @@ button.danger.subtle:hover {
   height: 3px;
   margin-left: -1.5px;
   border-radius: 50%;
-  background: var(--bg);
+  background: var(--border-strong);
   transform: translateY(-50%);
-  opacity: 0.9;
   left: calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--stop, 0));
+  transition: background-color 130ms ease;
 }
 
+/* Behind the fill, the marks need to read against the accent rather than the well. */
 .slider-stop.passed {
-  background: rgba(14, 16, 20, 0.55);
+  background: rgba(10, 12, 16, 0.45);
 }
 
 /* The input itself: invisible apart from its thumb. */
 .slider input[type='range'] {
   position: relative;
   appearance: none;
+  -webkit-appearance: none;
   width: 100%;
-  height: 20px;
+  height: var(--slider-h);
   min-height: 0;
   margin: 0;
   padding: 0;
@@ -2414,35 +2430,62 @@ button.danger.subtle:hover {
 }
 
 .slider input[type='range']::-webkit-slider-runnable-track {
-  height: 20px;
+  height: var(--slider-h);
   background: none;
+  border: none;
 }
 
+/*
+ * The thumb.
+ *
+ * box-sizing is set explicitly: `* { box-sizing: border-box }` does not match pseudo-elements,
+ * so without this the borders are added *outside* the declared width and the geometry drifts.
+ */
 .slider input[type='range']::-webkit-slider-thumb {
   appearance: none;
-  width: 13px;
-  height: 13px;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  width: var(--thumb);
+  height: var(--thumb);
   border-radius: 50%;
-  background: var(--text);
-  border: 2px solid var(--bg);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  background: #fff;
+  border: 1px solid rgba(10, 12, 16, 0.55);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55), 0 0 0 0 var(--accent-wash);
   cursor: grab;
-  transition: transform 90ms ease, background-color 120ms ease;
+  transition: box-shadow 130ms ease, transform 90ms ease;
 }
 
-.slider input[type='range']:hover::-webkit-slider-thumb {
-  transform: scale(1.12);
+.slider input[type='range']::-moz-range-thumb {
+  box-sizing: border-box;
+  width: var(--thumb);
+  height: var(--thumb);
+  border-radius: 50%;
+  background: #fff;
+  border: 1px solid rgba(10, 12, 16, 0.55);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
+  cursor: grab;
+}
+
+.slider input[type='range']::-moz-range-track {
+  height: var(--slider-h);
+  background: none;
+  border: none;
+}
+
+/* A widening ring rather than a size change, so the thumb never drifts off the value it marks. */
+.slider:hover input[type='range']:not(:disabled)::-webkit-slider-thumb {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55), 0 0 0 4px var(--accent-wash);
 }
 
 .slider input[type='range']:active::-webkit-slider-thumb {
   cursor: grabbing;
-  transform: scale(1.05);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55), 0 0 0 6px var(--accent-wash);
 }
 
 /* Keyboard focus has to be visible on the thumb, not on the transparent input box. */
 .slider input[type='range']:focus-visible::-webkit-slider-thumb {
-  box-shadow: 0 0 0 3px var(--accent-wash);
-  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55), 0 0 0 4px var(--accent-wash);
 }
 
 .slider input[type='range']:disabled {
@@ -2451,7 +2494,14 @@ button.danger.subtle:hover {
 
 .slider input[type='range']:disabled::-webkit-slider-thumb {
   background: var(--text-faint);
+  border-color: transparent;
+  box-shadow: none;
   cursor: default;
+}
+
+.reasoning:has(input:disabled) .slider-fill {
+  filter: grayscale(0.7);
+  opacity: 0.6;
 }
 
 /* ---- on/off switch, for models that only have enable_thinking ---- */

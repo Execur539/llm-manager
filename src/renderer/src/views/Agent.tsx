@@ -298,7 +298,9 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                 {m.role === 'assistant' ? (
                 <>
                   {m.reasoning && <ThinkingBlock text={m.reasoning} />}
-                  <Markdown source={m.content} />
+                  {/* A turn can be reasoning only — the model thought, then called a tool
+                      without a word of prose. Rendering an empty body leaves a stray gap. */}
+                  {m.content && <Markdown source={m.content} />}
                 </>
               ) : (
                 <div className="body">{m.content}</div>

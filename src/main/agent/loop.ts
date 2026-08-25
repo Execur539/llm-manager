@@ -428,6 +428,10 @@ Platform: Windows (PowerShell)${memoryBlock}`
             id: crypto.randomBytes(6).toString('hex'),
             role: 'assistant',
             content: text.trim(),
+            // Carried on the message, not just streamed. The UI drops its live reasoning buffer
+            // the moment the message arrives, so thinking that is not stored here disappears
+            // from the transcript as soon as the turn ends — and is gone entirely on reload.
+            reasoning: thinking.trim() || undefined,
             createdAt: Date.now()
           }
           session.messages.push(assistant)
@@ -438,12 +442,15 @@ Platform: Windows (PowerShell)${memoryBlock}`
         }
 
         // Any prose emitted alongside the calls is worth keeping — it is usually the model
-        // explaining its intent, which makes the transcript far more readable.
-        if (text.trim()) {
+        // explaining its intent, which makes the transcript far more readable. Reasoning counts
+        // for the same reason, and on its own: a model that thinks at length and then calls a
+        // tool without a word of prose would otherwise leave no record of why.
+        if (text.trim() || thinking.trim()) {
           const assistant: AgentMessage = {
             id: crypto.randomBytes(6).toString('hex'),
             role: 'assistant',
             content: text.trim(),
+            reasoning: thinking.trim() || undefined,
             createdAt: Date.now()
           }
           session.messages.push(assistant)
