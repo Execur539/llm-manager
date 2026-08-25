@@ -18,9 +18,10 @@ import type {
   HardwareSnapshot,
   ModelRecord,
   PermissionDecision,
-  PermissionRequest
+  PermissionRequest,
+  AttachmentInfo
 } from '@shared/types'
-import { defaultModelsDir, exeDir } from './storage/paths'
+import { defaultModelsDir, exeDir, TOOL_OUTPUT_DIR } from './storage/paths'
 import { loadSettings, patchSettings } from './storage/settings'
 import { detectHardware, refreshFreeVram } from './hardware/gpu'
 import { scanLibrary, libraryDiskUsage } from './models/library'
@@ -53,9 +54,12 @@ import {
 import * as rag from './rag'
 import * as chats from './chat/repo'
 import { buildContent } from './chat/multimodal'
+import { classifyAttachment, recordAttachment, IMAGE_EXT, AUDIO_EXT, VIDEO_EXT, TEXT_EXT } from './chat/repo'
 import { historicalStats, liveStats, requestLog, recordGeneration, clearStats, setContextUsed } from './stats'
 import { buildDiagnostics, logger } from './log'
-import { exportChat, writeExport, all, run } from './storage/db'
+import { exportChat, writeExport, all, run, get } from './storage/db'
+import { exportFilename, uniquePath } from './storage/filenames'
+import { reasoningRequestFields, type ReasoningChoice } from './models/reasoning'
 import { checkForUpdate, applyUpdate } from './update'
 
 // ---------------------------------------------------------------- shared state
@@ -65,6 +69,42 @@ let library: ModelRecord[] = []
 let agent: Agent | null = null
 
 const pendingPermissions = new Map<string, (d: PermissionDecision) => void>()
+
+/**
+ * Settle every outstanding approval prompt as a denial.
+ *
+ * The agent blocks on `ask()` until the renderer answers, and nothing else can unblock it. If
+ * the user hits stop while a prompt is up — or a remote browser closes its tab mid-prompt, or
+ * the window reloads — the promise never settles, the turn hangs for the life of the process,
+ * and the session shows as running forever. Denying is the safe resolution: the tool is skipped
+ * rather than run without an answer.
+ */
+function drainPendingPermissions(): void {
+  for (const [id, resolve] of pendingPermissions) {
+    pendingPermissions.delete(id)
+    resolve('deny')
+  }
+}
+
+/**
+ * Files this process has written and offered to show the user.
+ *
+ * `shell:reveal` only accepts paths from this set. The same handler map serves remote browser
+ * sessions, so an unguarded reveal would let anyone past the remote password pop file-manager
+ * windows anywhere on the machine. Bounded, because the only thing that reads it is a "Show"
+ * button on a toast that has usually expired already.
+ */
+const revealable = new Set<string>()
+
+function offerReveal(file: string): string {
+  const resolved = path.resolve(file)
+  revealable.add(resolved)
+  if (revealable.size > 64) {
+    const oldest = revealable.values().next().value
+    if (oldest) revealable.delete(oldest)
+  }
+  return resolved
+}
 
 /**
  * The session the agent is currently working on.
@@ -111,6 +151,7 @@ function getAgent(): Agent {
 
     const sid = (): string => activeAgentSessionId
     agent.on('delta', (t: string) => emit('agent:delta', { sessionId: sid(), text: t }))
+    agent.on('reasoning', (t: string) => emit('agent:reasoning', { sessionId: sid(), text: t }))
     agent.on('message', (m) => emit('agent:message', { sessionId: sid(), message: m }))
     agent.on('toolCall', (c) => emit('agent:tool-call', { sessionId: sid(), call: c }))
     agent.on('toolResult', (r) => emit('agent:tool-result', { sessionId: sid(), result: r }))
@@ -127,6 +168,26 @@ function getAgent(): Agent {
     )
   }
   return agent
+}
+
+/**
+ * Bring the agent's options in line with current settings.
+ *
+ * Options used to be refreshed only at the start of a run, so anything that asked the agent a
+ * question in between — the tool catalog, most visibly — answered from stale state. With plan
+ * mode on, the UI still listed write and execute tools as available.
+ */
+function syncAgentOptions(): void {
+  const s = loadSettings()
+  agent?.updateOptions({
+    planMode: s.agent.planMode,
+    maxToolCallsPerTurn: s.agent.maxToolCallsPerTurn,
+    commandTimeoutMs: s.agent.commandTimeoutMs,
+    hardBlocksDisabled: s.agent.hardBlocksDisabled,
+    compaction: s.agent.compaction,
+    remoteToolsEnabled: s.agent.remoteToolsEnabled,
+    hfToken: getHfToken()
+  })
 }
 
 function persistPermissionRules(): void {
@@ -203,16 +264,80 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
   run('INSERT OR REPLACE INTO model_meta (model_id, repo, favourite, tags, last_used_at) VALUES (?, ?, COALESCE((SELECT favourite FROM model_meta WHERE model_id = ?), 0), ?, ?)',
     model.id, model.repo, model.id, JSON.stringify(model.tags), Date.now())
 
-  emit('model:status', { model: model.filename, port: loaded.port, plan: chosen })
+  emit('model:status', {
+    model: model.filename,
+    modelId: model.id,
+    port: loaded.port,
+    plan: chosen,
+    startedAt: loaded.startedAt,
+    caps: model.caps
+  })
   return { port: loaded.port, plan: chosen }
 }
 
 // ---------------------------------------------------------------- handlers
 
+/** Staged uploads older than this are removed. */
+const STAGED_UPLOAD_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+/**
+ * Remove old staged uploads.
+ *
+ * A remote session cannot send a path, so its files are written here and referenced by path from
+ * then on. Nothing else ever deletes them, so without this the directory grows for the life of
+ * the install. A week is long enough that the file outlives the conversation it was sent in, and
+ * short enough that a few large videos do not accumulate silently.
+ */
+async function pruneStagedUploads(): Promise<void> {
+  const dir = path.join(TOOL_OUTPUT_DIR, 'attachments')
+  const cutoff = Date.now() - STAGED_UPLOAD_TTL_MS
+
+  for (const name of await fsp.readdir(dir).catch(() => [] as string[])) {
+    const file = path.join(dir, name)
+    try {
+      if ((await fsp.stat(file)).mtimeMs < cutoff) await fsp.rm(file, { force: true })
+    } catch {
+      // Best effort: a file that cannot be examined is left alone.
+    }
+  }
+}
+
+/**
+ * Fold attachments into an agent prompt.
+ *
+ * Text is inlined so the agent can reason about it immediately; binary media is referenced by
+ * path so the agent can decide what to do with it using its own tools.
+ */
+async function attachmentPreamble(input: string, files: string[]): Promise<string> {
+  const caps = llama.loaded?.model.caps
+  if (!caps) return input
+
+  const built = await buildContent('', files, caps)
+  const inlined = built.parts
+    .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+    .map((p) => p.text)
+
+  const referenced = files.filter((f) => classifyAttachment(f) !== 'doc')
+  const sections: string[] = []
+
+  if (inlined.length) sections.push(inlined.join('\n\n'))
+  if (referenced.length) {
+    sections.push(`Attached files on disk:\n${referenced.map((f) => `- ${f}`).join('\n')}`)
+  }
+  if (built.notes.length) sections.push(built.notes.join('\n'))
+
+  return sections.length ? `${sections.join('\n\n')}\n\n${input}` : input
+}
+
 export const handlers: Record<string, (...args: never[]) => unknown> = {
   // ---- settings
   'settings:get': () => ({ ...loadSettings(), hfToken: getHfToken() ? '***set***' : null }),
-  'settings:patch': (patch: Partial<AppSettings>) => patchSettings(patch),
+  'settings:patch': (patch: Partial<AppSettings>) => {
+    const next = patchSettings(patch)
+    // Apply straight away so the agent never operates under superseded settings.
+    syncAgentOptions()
+    return next
+  },
   'settings:set-password': (password: string) => {
     setPassword(password)
     return true
@@ -292,22 +417,62 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     return true
   },
   'library:clean-partials': async () => downloadQueue.cleanPartials(modelsDir()),
+  /**
+   * Import GGUF files the user already has on disk.
+   *
+   * Three things matter here, all of them because these files are enormous:
+   *   - A file already inside the models folder needs no work at all; the old code copied it
+   *     onto itself.
+   *   - On the same volume a hard link is instantaneous and costs no extra disk, where a copy
+   *     of a 20 GB model costs 20 GB and several minutes of an apparently frozen window.
+   *   - A name collision must not overwrite an existing model.
+   *
+   * Failures are collected per file rather than aborting the batch, so one unreadable file does
+   * not silently discard the rest of the selection.
+   */
   'library:import': async () => {
     const result = await dialog.showOpenDialog({
       properties: ['openFile', 'multiSelections'],
       filters: [{ name: 'GGUF models', extensions: ['gguf'] }]
     })
-    if (result.canceled) return []
+    if (result.canceled) return { imported: [], skipped: [], failed: [], linked: 0 }
+
     const dest = modelsDir()
     await fsp.mkdir(dest, { recursive: true })
+
     const imported: string[] = []
+    const skipped: string[] = []
+    const failed: { file: string; error: string }[] = []
+    let linked = 0
+
     for (const src of result.filePaths) {
-      const target = path.join(dest, path.basename(src))
-      await fsp.copyFile(src, target)
-      imported.push(target)
+      const name = path.basename(src)
+      try {
+        // Already in the library folder: nothing to do but rescan.
+        if (path.resolve(path.dirname(src)).toLowerCase() === path.resolve(dest).toLowerCase()) {
+          skipped.push(name)
+          continue
+        }
+
+        const target = uniquePath(dest, path.parse(name).name, 'gguf', (candidate: string) => fs.existsSync(candidate))
+        emit('library:import-progress', { file: name, phase: 'copying' })
+
+        try {
+          // Same volume: instantaneous, and the bytes are not duplicated.
+          await fsp.link(src, target)
+          linked++
+        } catch {
+          await fsp.copyFile(src, target)
+        }
+        imported.push(target)
+      } catch (err) {
+        failed.push({ file: name, error: err instanceof Error ? err.message : String(err) })
+      }
     }
+
     library = await scanLibrary(dest)
-    return imported
+    emit('library:import-progress', { file: '', phase: 'done' })
+    return { imported, skipped, failed, linked }
   },
 
   // ---- auto-fit
@@ -341,7 +506,16 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   },
   'model:status': () => {
     const l = llama.loaded
-    return l ? { model: l.model.filename, modelId: l.model.id, port: l.port, plan: l.plan, startedAt: l.startedAt } : null
+    return l
+      ? {
+          model: l.model.filename,
+          modelId: l.model.id,
+          port: l.port,
+          plan: l.plan,
+          startedAt: l.startedAt,
+          caps: l.model.caps
+        }
+      : null
   },
 
   // ---- relocation
@@ -433,15 +607,37 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     return true
   },
   'chat:search': (query: string) => chats.searchChats(query),
+  /**
+   * Export a conversation to a file the user chooses.
+   *
+   * A save dialog, not a folder picker: the user gets to see and change the filename, and the
+   * shell warns about overwriting. The written path is returned so the UI can say where it went
+   * rather than appearing to do nothing.
+   */
   'chat:export': async (id: string, format: 'md' | 'json') => {
-    const result = await dialog.showOpenDialog({ properties: ['openDirectory'] })
-    if (result.canceled || !result.filePaths[0]) return null
-    return writeExport(id, format, result.filePaths[0])
+    const title = get<{ title: string }>('SELECT title FROM chats WHERE id = ?', id)?.title ?? ''
+    const result = await dialog.showSaveDialog({
+      title: 'Export conversation',
+      defaultPath: `${exportFilename(title, `chat-${id.slice(0, 8)}`)}.${format}`,
+      filters: [
+        format === 'md'
+          ? { name: 'Markdown', extensions: ['md'] }
+          : { name: 'JSON', extensions: ['json'] }
+      ]
+    })
+    if (result.canceled || !result.filePath) return null
+    return offerReveal(writeExport(id, format, result.filePath))
   },
   'chat:export-text': (id: string, format: 'md' | 'json') => exportChat(id, format),
 
   /** Plain chat turn (no tools), streaming deltas to the UI. */
-  'chat:send': async (chatId: string, text: string, attachments?: string[], collectionId?: string) => {
+  'chat:send': async (
+    chatId: string,
+    text: string,
+    attachments?: string[],
+    collectionId?: string,
+    reasoning?: ReasoningChoice
+  ) => {
     const loaded = llama.loaded
     if (!loaded) throw new Error('No model is loaded')
 
@@ -468,25 +664,52 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       if (context) messages.push({ role: 'system', content: context })
     }
 
+    /*
+     * The attachments have to survive in the transcript.
+     *
+     * Only the text was stored, so a conversation reopened later showed the question with no
+     * sign that a file had been sent with it — and the export had the same hole. The names go
+     * into the stored content, and the files themselves are recorded against the message.
+     */
+    const attachmentSummary = attachments?.length
+      ? `\n\n[Attached: ${attachments.map((f) => path.basename(f)).join(', ')}]`
+      : ''
+
     const userMsg = {
       id: `${Date.now().toString(36)}-u`,
       role: 'user' as const,
-      content: text,
+      content: `${text}${attachmentSummary}`,
       createdAt: Date.now()
     }
     chats.appendMessage(chatId, userMsg)
+    for (const file of attachments ?? []) {
+      try {
+        recordAttachment(userMsg.id, { path: file, kind: classifyAttachment(file) })
+      } catch (err) {
+        // A missing attachment row must never cost the user their message — but it should not
+        // vanish without trace either, or the only symptom is an export that quietly lost a file.
+        logger.warn('chat', `could not record attachment ${file}`, err)
+      }
+    }
     chats.autoTitle(chatId)
     emit('chat:message', { chatId, message: userMsg })
     if (notes.length) emit('chat:notes', notes)
 
     const started = Date.now()
     let answer = ''
+    let thinking = ''
     for await (const ev of llama.streamEvents({
-      messages: [...messages, { role: 'user', content: userContent }]
+      messages: [...messages, { role: 'user', content: userContent }],
+      // Dropped silently if the model never advertised the level — see reasoningRequestFields.
+      ...reasoningRequestFields(loaded.model.caps.reasoning, reasoning ?? null)
     })) {
       if (ev.type === 'text') {
         answer += ev.text
         emit('chat:delta', { chatId, text: ev.text })
+      }
+      if (ev.type === 'reasoning') {
+        thinking += ev.text
+        emit('chat:reasoning', { chatId, text: ev.text })
       }
     }
 
@@ -494,6 +717,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       id: `${Date.now().toString(36)}-a`,
       role: 'assistant' as const,
       content: answer,
+      reasoning: thinking || undefined,
       createdAt: Date.now()
     }
     chats.appendMessage(chatId, assistantMsg)
@@ -508,36 +732,58 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   },
 
   // ---- agent
-  'agent:tools': () => getAgent().listTools(),
-  'agent:run': async (sessionId: string, input: string) => {
+  'agent:tools': () => {
+    const a = getAgent()
+    syncAgentOptions()
+    return a.listTools()
+  },
+  'agent:run': async (
+    sessionId: string,
+    input: string,
+    reasoning?: ReasoningChoice,
+    attachments?: string[]
+  ) => {
     const session = chats.loadSession(sessionId)
     if (!session) throw new Error(`No session ${sessionId}`)
 
-    const s = loadSettings()
+    /*
+     * The agent's turn is plain text, not content parts — its loop feeds a growing history back
+     * through the model and interleaves tool results, which the multimodal part format does not
+     * survive cleanly. Text-bearing attachments are inlined into the prompt; anything the agent
+     * cannot read that way is named with its path, which is more useful anyway: the agent has
+     * file tools and can open it itself.
+     */
+    const withFiles = attachments?.length ? await attachmentPreamble(input, attachments) : input
+
     const a = getAgent()
-    a.updateOptions({
-      cwd: session.cwd,
-      planMode: s.agent.planMode,
-      maxToolCallsPerTurn: s.agent.maxToolCallsPerTurn,
-      commandTimeoutMs: s.agent.commandTimeoutMs,
-      hardBlocksDisabled: s.agent.hardBlocksDisabled,
-      compaction: s.agent.compaction,
-      remoteToolsEnabled: s.agent.remoteToolsEnabled,
-      hfToken: getHfToken()
-    })
+    syncAgentOptions()
+    a.updateOptions({ cwd: session.cwd, reasoningChoice: reasoning ?? null })
 
     const before = session.messages.length
     activeAgentSessionId = sessionId
     a.hydrate(session)
-    await a.run(session, input)
+    // A prompt left unanswered by an earlier turn (window reloaded, remote tab closed) would
+    // otherwise sit in the map forever and never be answerable again.
+    drainPendingPermissions()
+    try {
+      await a.run(session, withFiles)
+    } finally {
+      drainPendingPermissions()
+      // Persist on the way out either way. A turn that ends in an error still did real work —
+      // the user's message, and any tool exchanges that already completed — and throwing that
+      // away silently is worse than showing a transcript that stops mid-turn. Approvals the
+      // user granted during the turn are worth keeping for the same reason.
+      for (const m of session.messages.slice(before)) chats.appendMessage(sessionId, m)
+      persistPermissionRules()
+    }
 
-    for (const m of session.messages.slice(before)) chats.appendMessage(sessionId, m)
     chats.autoTitle(sessionId)
-    persistPermissionRules()
     return session
   },
   'agent:stop': () => {
     agent?.stop()
+    // Aborting the run does not settle a prompt the agent is already awaiting.
+    drainPendingPermissions()
     return true
   },
   'agent:compact': async () => {
@@ -595,6 +841,76 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     return true
   },
   'mcp:connect': () => mcpManager.connectAll(),
+
+  // ---- attachments
+
+  /**
+   * Describe files the user is trying to attach.
+   *
+   * Classification and the capability check happen here rather than in the renderer, so the
+   * warning shown next to a chip and the decision `buildContent` makes later cannot disagree.
+   */
+  'attachments:describe': async (paths: string[]) => {
+    const caps = llama.loaded?.model.caps ?? null
+    const out: AttachmentInfo[] = []
+
+    for (const file of paths ?? []) {
+      const kind = classifyAttachment(file)
+      let bytes = -1
+      try {
+        bytes = (await fsp.stat(file)).size
+      } catch {
+        out.push({ path: file, name: path.basename(file), kind, bytes: -1, warning: 'File could not be read.' })
+        continue
+      }
+
+      let warning: string | null = null
+      if (!caps) warning = 'No model is loaded yet.'
+      else if (kind === 'image' && !caps.vision) warning = 'This model has no vision projector, so the image will be skipped.'
+      else if (kind === 'audio' && !caps.audio) warning = 'This model does not accept audio, so it will be skipped.'
+      else if (kind === 'video' && !caps.videoPossible) warning = 'This model cannot read video without a vision projector.'
+
+      out.push({ path: file, name: path.basename(file), kind, bytes, warning })
+    }
+    return out
+  },
+
+  /** Open a picker filtered to what the loaded model can actually take. */
+  'attachments:pick': async () => {
+    const caps = llama.loaded?.model.caps
+    const filters = [
+      { name: 'Everything supported', extensions: [...IMAGE_EXT, ...VIDEO_EXT, ...AUDIO_EXT, ...TEXT_EXT] },
+      { name: 'Images', extensions: IMAGE_EXT },
+      { name: 'Video', extensions: VIDEO_EXT },
+      ...(caps?.audio ? [{ name: 'Audio', extensions: AUDIO_EXT }] : []),
+      { name: 'Text and code', extensions: TEXT_EXT },
+      { name: 'All files', extensions: ['*'] }
+    ]
+    const result = await dialog.showOpenDialog({ properties: ['openFile', 'multiSelections'], filters })
+    if (result.canceled) return []
+    return handlers['attachments:describe'](result.filePaths as never)
+  },
+
+  /**
+   * Accept file bytes and stage them on disk.
+   *
+   * The desktop shell sends a path, which costs nothing. A remote browser has no path to send,
+   * so it posts the contents and gets back a staged file the rest of the pipeline can treat
+   * identically.
+   */
+  'attachments:prune': () => pruneStagedUploads(),
+
+  'attachments:receive': async (name: string, base64: string) => {
+    const safe = exportFilename(String(name ?? 'file'), 'attachment')
+    const ext = path.extname(String(name ?? '')) || ''
+    const dir = path.join(TOOL_OUTPUT_DIR, 'attachments')
+    await fsp.mkdir(dir, { recursive: true })
+
+    const dest = uniquePath(dir, `${Date.now().toString(36)}-${safe.replace(/\.[^.]*$/, '')}`, ext.replace(/^\./, '') || 'bin', (p) => fs.existsSync(p))
+    await fsp.writeFile(dest, Buffer.from(String(base64 ?? ''), 'base64'))
+    const [info] = (await handlers['attachments:describe']([dest] as never)) as AttachmentInfo[]
+    return info
+  },
 
   // ---- RAG
   'rag:collections': () => rag.listCollections(),

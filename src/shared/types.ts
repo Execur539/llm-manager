@@ -74,6 +74,34 @@ export interface ModelArchInfo {
   unknownTensorTypes: number[]
 }
 
+export type ReasoningKind = 'none' | 'toggle' | 'effort'
+
+/**
+ * What reasoning control a model exposes, read from its own chat template at scan time.
+ *
+ * There is no metadata key for this and the level names are not standardised — Qwen3.8 takes
+ * low/medium/xhigh while gpt-oss takes low/medium/high — so the levels travel with the model
+ * rather than being assumed by the UI.
+ */
+export interface ReasoningSupport {
+  kind: ReasoningKind
+  /** Accepted levels, ordered weakest to strongest. Empty unless kind is 'effort'. */
+  levels: string[]
+  /** What the template falls back to when nothing is sent. */
+  defaultLevel: string | null
+  /** Whether the template itself can switch thinking off, via enable_thinking or an off level. */
+  canDisable: boolean
+  /**
+   * The level name this template accepts for "do not think", if it has one.
+   *
+   * Not the same question as `canDisable`: a template can be disabled through `enable_thinking`
+   * and still validate `reasoning_effort` against a list containing no off value, where sending
+   * one raises instead of disabling. Turning thinking off does not depend on this — llama.cpp
+   * can end the thought block itself — but the level name is only ever sent when it is here.
+   */
+  offValue: string | null
+}
+
 export interface ModelCapabilities {
   vision: boolean
   audio: boolean
@@ -83,6 +111,7 @@ export interface ModelCapabilities {
   videoPossible: boolean
   tools: boolean
   mmprojPath: string | null
+  reasoning: ReasoningSupport
 }
 
 export interface ModelRecord {
@@ -262,6 +291,8 @@ export interface AgentMessage {
   id: string
   role: 'user' | 'assistant' | 'tool' | 'system'
   content: string
+  /** The model's chain of thought, when it produced one. */
+  reasoning?: string
   toolCalls?: ToolCall[]
   toolResult?: ToolResult
   createdAt: number
@@ -315,4 +346,14 @@ export interface AppSettings {
   ui: {
     closeAction: 'ask' | 'tray' | 'quit'
   }
+}
+
+/** A file staged for sending, as the renderer sees it. */
+export interface AttachmentInfo {
+  path: string
+  name: string
+  kind: 'image' | 'audio' | 'video' | 'doc'
+  bytes: number
+  /** Why this file will not be used as expected, if it will not. */
+  warning: string | null
 }

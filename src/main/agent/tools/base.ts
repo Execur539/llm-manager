@@ -12,6 +12,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import type { ToolDefinition, ToolResult, ToolTier } from '@shared/types'
 import { TOOL_OUTPUT_DIR } from '../../storage/paths'
+import { log } from '../../log'
 
 export interface ToolContext {
   cwd: string
@@ -46,26 +47,35 @@ export interface Truncated {
 export function truncateForContext(raw: string, label: string): Truncated {
   if (raw.length <= MAX_CHARS) return { content: raw, truncated: false }
 
-  fs.mkdirSync(TOOL_OUTPUT_DIR, { recursive: true })
+  // The overflow file is best-effort: a full disk or a permission error must not fail the tool
+  // call. But we only advertise the path once the bytes are actually on disk — promising a file
+  // that was never written sends the agent off to read_file a path that does not exist, and it
+  // burns a turn discovering that for itself.
   const id = crypto.randomBytes(6).toString('hex')
   const file = path.join(TOOL_OUTPUT_DIR, `${label.replace(/[^a-z0-9]/gi, '_')}-${id}.txt`)
+  let saved = false
   try {
+    fs.mkdirSync(TOOL_OUTPUT_DIR, { recursive: true })
     fs.writeFileSync(file, raw, 'utf8')
-  } catch {
-    /* if we cannot persist it, still return the truncated view */
+    saved = true
+  } catch (err) {
+    log('warn', 'tools', `could not persist full output for ${label}`, err)
   }
 
   const head = raw.slice(0, HEAD_CHARS)
   const tail = raw.slice(-TAIL_CHARS)
   const omitted = raw.length - HEAD_CHARS - TAIL_CHARS
 
+  const note = saved
+    ? `full output saved to ${file}. Use read_file with offset/limit on that path to page through it.`
+    : 'the full output could not be saved to disk, so the omitted middle is unavailable.'
+
   return {
     truncated: true,
-    fullOutputPath: file,
+    fullOutputPath: saved ? file : undefined,
     content:
       `${head}\n\n` +
-      `... [${omitted.toLocaleString()} characters omitted; full output saved to ${file}. ` +
-      `Use read_file with offset/limit on that path to page through it.] ...\n\n` +
+      `... [${omitted.toLocaleString()} characters omitted; ${note}] ...\n\n` +
       tail
   }
 }

@@ -105,25 +105,28 @@ export default function Settings(): JSX.Element {
           <dt>Preferred KV</dt>
           <dd>
             <select
+              className="kv-select"
               value={settings.autoFit.preferredKvType}
               onChange={(e) => void patch({ autoFit: { ...settings.autoFit, preferredKvType: e.target.value as 'f16' | 'q8_0' | 'q4_0' } })}
             >
-              <option value="f16">f16 (best quality)</option>
-              <option value="q8_0">q8_0</option>
-              <option value="q4_0">q4_0</option>
+              <option value="f16">f16 — best quality</option>
+              <option value="q8_0">q8_0 — recommended</option>
+              <option value="q4_0">q4_0 — smallest</option>
             </select>
+            <span className="faint">aim for this first</span>
           </dd>
           <dt>KV floor</dt>
           <dd>
             <select
+              className="kv-select"
               value={settings.autoFit.minKvType}
               onChange={(e) => void patch({ autoFit: { ...settings.autoFit, minKvType: e.target.value as 'f16' | 'q8_0' | 'q4_0' } })}
             >
-              <option value="q4_0">q4_0</option>
-              <option value="q8_0">q8_0</option>
-              <option value="f16">f16</option>
+              <option value="q4_0">q4_0 — smallest</option>
+              <option value="q8_0">q8_0 — recommended</option>
+              <option value="f16">f16 — best quality</option>
             </select>
-            <span className="faint" style={{ marginLeft: 6 }}>never quantise below this</span>
+            <span className="faint">never go below this</span>
           </dd>
           <dt>VRAM headroom</dt>
           <dd>

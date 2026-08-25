@@ -197,6 +197,10 @@ app.whenReady().then(async () => {
   ensureDirs()
   getDb()
 
+  // Old staged uploads are cleared in the background; nothing waits on it. After ensureDirs so
+  // the directory exists, and unawaited so a slow disk never delays the window.
+  void handlers['attachments:prune']?.()
+
   // One emitter feeds both surfaces: the desktop window over IPC, and every connected
   // remote browser over SSE. Neither can silently miss an event the other gets.
   setEmitter((channel, payload) => {
@@ -210,6 +214,15 @@ app.whenReady().then(async () => {
 
   downloadQueue.setToken(getHfToken())
   downloadQueue.recoverOnStart()
+  // Sweep .partial files with no queue entry behind them. recoverOnStart has just marked
+  // everything resumable as paused, so whatever is left is unreachable garbage — a cancelled
+  // or crashed download that nothing can ever resume, sitting on many GB of disk.
+  void downloadQueue.cleanPartials(modelsDir()).then(
+    ({ removed, bytes }) => {
+      if (removed) logger.info('downloads', `removed ${removed} orphaned partial(s), ${bytes} bytes`)
+    },
+    (err) => logger.warn('downloads', 'could not clean orphaned partials', err)
+  )
   downloadQueue.on('update', (list) => mainWindow?.webContents.send('downloads:update', list))
   downloadQueue.on('completed', () => {
     void scanLibrary(modelsDir()).then((models) => {

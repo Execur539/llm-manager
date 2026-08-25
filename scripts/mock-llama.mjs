@@ -15,7 +15,12 @@
  *   [[mock:long]]        stream ~800 words, for scroll/compaction/perf behaviour
  *   [[mock:slow]]        250ms between tokens, for navigating away mid-stream
  *   [[mock:tool]]        emit a tool call instead of prose
+ *   [[mock:calltool:X]]  emit a call to tool X specifically, e.g. write_file or run_command
  *   [[mock:tools:N]]     emit N tool calls in sequence
+ *   [[mock:toolargs:{…}]] arguments for the emitted tool call, as JSON
+ *   [[mock:params]]      reply with the reasoning fields the request actually carried
+ *   [[mock:prompt]]      reply with the last user message exactly as received
+ *   [[mock:think]]       emit reasoning_content before the answer, as a reasoning model does
  *   [[mock:error]]       return HTTP 500 mid-stream
  *   [[mock:stall]]       accept the request and never respond
  *   [[mock:empty]]       stream nothing and finish
@@ -109,10 +114,64 @@ function marker(messages, name) {
   return text.includes(`[[mock:${name}]]`)
 }
 
+/** Extract a named marker value, e.g. [[mock:calltool:write_file]]. */
+function markerName(messages, name) {
+  const text = messages.map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join(' ')
+  const m = text.match(new RegExp(`\\[\\[mock:${name}:([a-z_]+)\\]\\]`))
+  return m ? m[1] : null
+}
+
+/**
+ * Extract a JSON payload marker, e.g. [[mock:toolargs:{"path":"a.txt"}]].
+ *
+ * Braces are counted rather than regex-matched so nested objects survive intact.
+ */
+function markerJson(messages, name) {
+  const text = messages.map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join(' ')
+  const open = text.indexOf(`[[mock:${name}:`)
+  if (open === -1) return null
+  const start = text.indexOf('{', open)
+  if (start === -1) return null
+  let depth = 0
+  for (let i = start; i < text.length; i++) {
+    if (text[i] === '{') depth++
+    else if (text[i] === '}') {
+      depth--
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, i + 1))
+        } catch {
+          return null
+        }
+      }
+    }
+  }
+  return null
+}
+
 function markerValue(messages, name) {
   const text = messages.map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join(' ')
   const m = text.match(new RegExp(`\\[\\[mock:${name}:(\\d+)\\]\\]`))
   return m ? Number(m[1]) : null
+}
+
+/**
+ * Echo back the reasoning-related fields of the request.
+ *
+ * Asserting on the UI alone would pass even if nothing were ever sent; this makes the wire
+ * contents observable from a test.
+ */
+/** The last user turn, verbatim, so a test can see what actually reached the model. */
+function promptReply(messages) {
+  const last = [...messages].reverse().find((m) => m.role === 'user')
+  return typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? null)
+}
+
+function paramsReply(body) {
+  return JSON.stringify({
+    reasoning_effort: body.reasoning_effort ?? null,
+    chat_template_kwargs: body.chat_template_kwargs ?? null
+  })
 }
 
 function pickReply(messages) {
@@ -183,10 +242,17 @@ const server = http.createServer(async (req, res) => {
     if (marker(messages, 'stall')) return // never respond, so cancel/abort can be exercised
     if (marker(messages, 'error')) return json(res, 500, { error: { message: 'mock: simulated server error' } })
 
-    const wantsTool = (marker(messages, 'tool') || markerValue(messages, 'tools') !== null) && body.tools?.length
+    const namedTool = markerName(messages, 'calltool')
+    const forcedArgs = markerJson(messages, 'toolargs')
+    const wantsTool =
+      (marker(messages, 'tool') || markerValue(messages, 'tools') !== null || namedTool) && body.tools?.length
     const toolCount = markerValue(messages, 'tools') ?? 1
     const delay = marker(messages, 'slow') ? 250 : 12
-    const reply = pickReply(messages)
+    const reply = marker(messages, 'params')
+      ? paramsReply(body)
+      : marker(messages, 'prompt')
+        ? promptReply(messages)
+        : pickReply(messages)
     const id = `chatcmpl-mock-${Date.now().toString(36)}`
 
     if (!body.stream) {
@@ -194,7 +260,7 @@ const server = http.createServer(async (req, res) => {
         ? {
             role: 'assistant',
             content: '',
-            tool_calls: buildToolCalls(body.tools, toolCount)
+            tool_calls: buildToolCalls(body.tools, toolCount, namedTool, forcedArgs)
           }
         : { role: 'assistant', content: reply }
       return json(res, 200, {
@@ -228,7 +294,7 @@ const server = http.createServer(async (req, res) => {
     })
 
     if (wantsTool) {
-      const calls = buildToolCalls(body.tools, toolCount)
+      const calls = buildToolCalls(body.tools, toolCount, namedTool, forcedArgs)
       // Emit arguments split across frames, the way llama.cpp does, so the client's fragment
       // accumulation is genuinely exercised rather than receiving one tidy object.
       for (const [index, call] of calls.entries()) {
@@ -246,12 +312,25 @@ const server = http.createServer(async (req, res) => {
     }
 
     send(frame({ role: 'assistant', content: '' }))
+
+    // A reasoning model returns its chain of thought in reasoning_content, separately from the
+    // answer, which is what llama.cpp does with --reasoning-format deepseek.
+    if (marker(messages, 'think')) {
+      for (const token of tokenise(THINKING)) {
+        if (aborted) return
+        send(frame({ reasoning_content: token }))
+        await sleep(delay)
+      }
+    }
     for (const token of tokenise(reply)) {
       if (aborted) return
       send(frame({ content: token }))
       await sleep(delay)
     }
     send(frame({}, 'stop'))
+    // A final usage frame, as llama.cpp sends — without it the client's prompt-token
+    // accounting is never exercised in a streaming test.
+    send({ ...frame({}), usage: { prompt_tokens: 100, completion_tokens: tokenise(reply).length } })
     res.write('data: [DONE]\n\n')
     return res.end()
   }
@@ -259,14 +338,14 @@ const server = http.createServer(async (req, res) => {
   json(res, 404, { error: { message: `mock-llama: no route ${url.pathname}` } })
 })
 
-function buildToolCalls(tools, count) {
-  const preferred = ['list_dir', 'read_file', 'glob', 'web_search']
+function buildToolCalls(tools, count, namedTool, forcedArgs) {
+  const preferred = namedTool ? [namedTool] : ['list_dir', 'read_file', 'glob', 'web_search']
   const chosen = []
   for (let i = 0; i < count; i++) {
     const tool =
       tools.find((t) => t.function?.name === preferred[i % preferred.length]) ?? tools[i % tools.length]
     const name = tool.function?.name ?? 'list_dir'
-    const args = argsFor(name)
+    const args = forcedArgs ?? argsFor(name)
     chosen.push({ id: `call_mock_${i}`, type: 'function', function: { name, arguments: JSON.stringify(args) } })
   }
   return chosen
@@ -285,6 +364,15 @@ function argsFor(name) {
     default: return { path: '.' }
   }
 }
+
+/** Stand-in chain of thought, long enough to exercise scrolling inside the block. */
+const THINKING = [
+  'Let me work through this carefully.',
+  'First, the question is asking about the relationship between the two quantities.',
+  'One approach would be to consider the direct case, but that misses the boundary condition.',
+  'Actually, re-reading it, the constraint changes things: the second term dominates.',
+  'So the answer follows from the second case, not the first.'
+].join(' ')
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 

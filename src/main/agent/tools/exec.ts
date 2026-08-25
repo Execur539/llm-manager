@@ -21,9 +21,33 @@ interface BackgroundJob {
   output: string[]
   exitCode: number | null
   startedAt: number
+  /** set when the process closes; drives reaping */
+  exitedAt: number | null
 }
 
 const jobs = new Map<string, BackgroundJob>()
+
+/**
+ * Finished jobs are kept around so the agent can still read their output, but not forever —
+ * each one pins a ChildProcess and up to 4000 chunks of buffered output, and a long session
+ * that builds in a loop would otherwise grow this map without bound. Running jobs are never
+ * reaped; only completed ones age out.
+ */
+const FINISHED_TTL_MS = 30 * 60 * 1000
+const MAX_FINISHED = 50
+
+function reapJobs(): void {
+  const finished = [...jobs.values()]
+    .filter((j) => j.exitedAt !== null)
+    .sort((a, b) => (a.exitedAt as number) - (b.exitedAt as number))
+
+  const cutoff = Date.now() - FINISHED_TTL_MS
+  const excess = Math.max(0, finished.length - MAX_FINISHED)
+
+  finished.forEach((job, i) => {
+    if (i < excess || (job.exitedAt as number) < cutoff) jobs.delete(job.id)
+  })
+}
 
 function shellFor(command: string): { file: string; args: string[] } {
   // PowerShell is the primary shell on this platform; -Command handles pipelines and
@@ -57,7 +81,10 @@ function runToCompletion(
     const onAbort = (): void => {
       child.kill("SIGKILL")
     }
-    signal.addEventListener('abort', onAbort, { once: true })
+    // A listener attached to an already-aborted signal never fires, so a command dispatched
+    // just after the user hit stop would otherwise run to completion unsupervised.
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
 
     child.stdout?.on('data', (d: Buffer) => {
       if (stdout.length < MAX) stdout += d.toString()
@@ -126,7 +153,8 @@ const runBackground: Tool = {
       child,
       output: [],
       exitCode: null,
-      startedAt: Date.now()
+      startedAt: Date.now(),
+      exitedAt: null
     }
     const push = (d: Buffer): void => {
       job.output.push(d.toString())
@@ -137,8 +165,10 @@ const runBackground: Tool = {
     child.stderr?.on('data', push)
     child.on('close', (code) => {
       job.exitCode = code
+      job.exitedAt = Date.now()
     })
 
+    reapJobs()
     jobs.set(id, job)
     return `Started background job ${id}: ${job.command}`
   }

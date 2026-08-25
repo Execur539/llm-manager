@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { HardwareSnapshot, ModelRecord } from '@shared/types'
+import type { HardwareSnapshot, ModelCapabilities, ModelRecord } from '@shared/types'
 import { invoke, on, isDesktop } from './lib/api'
 import Dashboard from './views/Dashboard'
 import Library from './views/Library'
@@ -10,7 +10,9 @@ import Documents from './views/Documents'
 import ServerView from './views/Server'
 import RemoteView from './views/Remote'
 import Settings from './views/Settings'
+import Icon, { type IconName } from './components/Icon'
 import PermissionPrompt from './components/PermissionPrompt'
+import Toasts from './components/Toasts'
 
 export type View =
   | 'dashboard'
@@ -23,16 +25,16 @@ export type View =
   | 'remote'
   | 'settings'
 
-const NAV: { id: View; label: string; group: string }[] = [
-  { id: 'dashboard', label: 'Dashboard', group: 'Overview' },
-  { id: 'chat', label: 'Chat', group: 'Use' },
-  { id: 'agent', label: 'Agent', group: 'Use' },
-  { id: 'documents', label: 'Documents', group: 'Use' },
-  { id: 'library', label: 'My models', group: 'Models' },
-  { id: 'discover', label: 'Find a model', group: 'Models' },
-  { id: 'server', label: 'API server', group: 'Serve' },
-  { id: 'remote', label: 'Remote access', group: 'Serve' },
-  { id: 'settings', label: 'Settings', group: 'Serve' }
+const NAV: { id: View; label: string; group: string; icon: IconName }[] = [
+  { id: 'dashboard', label: 'Dashboard', group: 'Overview', icon: 'dashboard' },
+  { id: 'chat', label: 'Chat', group: 'Use', icon: 'chat' },
+  { id: 'agent', label: 'Agent', group: 'Use', icon: 'agent' },
+  { id: 'documents', label: 'Documents', group: 'Use', icon: 'documents' },
+  { id: 'library', label: 'My models', group: 'Models', icon: 'models' },
+  { id: 'discover', label: 'Find a model', group: 'Models', icon: 'search' },
+  { id: 'server', label: 'API server', group: 'Serve', icon: 'server' },
+  { id: 'remote', label: 'Remote access', group: 'Serve', icon: 'remote' },
+  { id: 'settings', label: 'Settings', group: 'Serve', icon: 'settings' }
 ]
 
 /** Views whose layout owns the full height and scrolls internally. */
@@ -43,6 +45,8 @@ export interface LoadedModel {
   modelId: string
   port: number
   plan: { contextLength: number; kvType: string; gpuLayers: number; totalLayers: number }
+  /** Optional: a status emitted by an older build may not carry it. */
+  caps?: ModelCapabilities
 }
 
 export default function App(): JSX.Element {
@@ -88,21 +92,27 @@ export default function App(): JSX.Element {
     <div className="app">
       <nav className="sidebar">
         <div className="brand">
-          LLM Manager
-          {!isDesktop && <span className="badge" style={{ marginLeft: 8 }}>remote</span>}
+          <span className="brand-mark" aria-hidden="true">
+            <Icon name="sparkle" size={15} />
+          </span>
+          <span className="brand-name">LLM Manager</span>
+          {!isDesktop && <span className="badge">remote</span>}
         </div>
 
         {groups.map((group) => (
           <div key={group}>
             <div className="nav-group">{group}</div>
             {NAV.filter((n) => n.group === group).map((n) => (
-              <div
+              <button
                 key={n.id}
+                type="button"
                 className={`nav-item ${view === n.id ? 'active' : ''}`}
                 onClick={() => setView(n.id)}
+                aria-current={view === n.id ? 'page' : undefined}
               >
-                {n.label}
-              </div>
+                <Icon name={n.icon} />
+                <span>{n.label}</span>
+              </button>
             ))}
           </div>
         ))}
@@ -110,16 +120,19 @@ export default function App(): JSX.Element {
         <div className="sidebar-footer">
           {loaded ? (
             <>
-              <div className="badge good">loaded</div>
-              <div className="truncate" style={{ marginTop: 6 }} title={loaded.model}>
+              <div className="loaded-head" data-testid="model-loaded">
+                <span className="pulse-dot" aria-hidden="true" />
+                <span className="loaded-label">Loaded</span>
+              </div>
+              <div className="loaded-name truncate" title={loaded.model}>
                 {loaded.model}
               </div>
-              <div className="faint">
+              <div className="loaded-meta">
                 {loaded.plan.contextLength.toLocaleString()} ctx · {loaded.plan.gpuLayers}/
-                {loaded.plan.totalLayers} on GPU
+                {loaded.plan.totalLayers} layers on GPU
               </div>
               <button
-                style={{ marginTop: 8, width: '100%' }}
+                className="full"
                 onClick={async () => {
                   await invoke('model:unload')
                   await refreshLoaded()
@@ -129,7 +142,10 @@ export default function App(): JSX.Element {
               </button>
             </>
           ) : (
-            <div className="faint">No model loaded</div>
+            <div className="loaded-empty">
+              <Icon name="chip" size={14} />
+              <span>No model loaded</span>
+            </div>
           )}
         </div>
       </nav>
@@ -146,6 +162,7 @@ export default function App(): JSX.Element {
           </div>
         )}
 
+        <div className="page">
         {view === 'dashboard' && <Dashboard hardware={hardware} models={models} loaded={loaded} onNavigate={setView} />}
         {view === 'library' && <Library models={models} onRefresh={refreshModels} onLoaded={refreshLoaded} />}
         {view === 'discover' && <Discover onDownloaded={refreshModels} />}
@@ -155,9 +172,11 @@ export default function App(): JSX.Element {
         {view === 'server' && <ServerView />}
         {view === 'remote' && <RemoteView />}
         {view === 'settings' && <Settings />}
+        </div>
       </main>
 
       <PermissionPrompt />
+      <Toasts />
     </div>
   )
 }

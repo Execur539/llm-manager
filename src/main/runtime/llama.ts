@@ -74,6 +74,26 @@ export interface CompletionOptions {
   /** GBNF grammar to constrain sampling — the safety net for weak tool models */
   grammar?: string
   stop?: string[]
+  /**
+   * Reasoning effort, as named by the model's own chat template.
+   *
+   * llama-server does not interpret this: it hands the value to the template, which is why the
+   * level names differ per model (Qwen3.8 wants 'xhigh', gpt-oss wants 'high'). Passing a name
+   * the template does not recognise makes it raise, so this must come from the detected set.
+   * The literal 'none' is llama.cpp's own switch for turning thinking off.
+   */
+  reasoningEffort?: string
+  /** Extra Jinja variables — used for `enable_thinking` on models with a plain toggle. */
+  chatTemplateKwargs?: Record<string, unknown>
+  /**
+   * Token budget for thinking; 0 ends it immediately.
+   *
+   * This one is llama.cpp's, not the template's — it closes the thought block itself rather than
+   * asking the template to skip it. That makes it the only way to stop a model thinking when its
+   * template offers no switch of its own, which is the common case for effort-only templates
+   * like Qwen3.8's: they enumerate levels and provide no way to say "none".
+   */
+  reasoningBudget?: number
   signal?: AbortSignal
 }
 
@@ -85,12 +105,28 @@ export interface StreamedToolCall {
 
 export type StreamEvent =
   | { type: 'text'; text: string }
+  /**
+   * The model's chain of thought.
+   *
+   * llama.cpp defaults to `--reasoning-format deepseek`, which strips <think> blocks out of the
+   * answer and returns them separately as `reasoning_content`. Reading only `content` therefore
+   * discarded the whole of a reasoning model's thinking without leaving any trace that it had
+   * happened — the answers looked clean, and the thought process was simply gone.
+   */
+  | { type: 'reasoning'; text: string }
   | { type: 'tool_call'; call: StreamedToolCall }
   | { type: 'usage'; promptTokens: number; completionTokens: number }
 
 export interface Timings {
   ttftMs: number | null
   totalMs: number
+  /**
+   * Tokens in the prompt, as reported by the server.
+   *
+   * Needed for an OpenAI-shaped `usage` block: clients that track cost read prompt_tokens and
+   * total_tokens, and a response carrying only completion_tokens makes them report undefined.
+   */
+  promptTokens: number
   completionTokens: number
   tokensPerSecond: number
 }
@@ -256,6 +292,16 @@ export class LlamaRuntime extends EventEmitter {
     if (opts.repeatPenalty !== undefined) body.repeat_penalty = opts.repeatPenalty
     if (opts.maxTokens !== undefined && opts.maxTokens > 0) body.max_tokens = opts.maxTokens
     if (opts.stop?.length) body.stop = opts.stop
+    if (opts.reasoningEffort) body.reasoning_effort = opts.reasoningEffort
+    if (opts.chatTemplateKwargs && Object.keys(opts.chatTemplateKwargs).length > 0) {
+      body.chat_template_kwargs = opts.chatTemplateKwargs
+    }
+    // Sent under both names: the server has accepted `reasoning_budget` and `thinking_budget`
+    // at different points, and an unrecognised field is ignored rather than rejected.
+    if (opts.reasoningBudget !== undefined) {
+      body.reasoning_budget = opts.reasoningBudget
+      body.thinking_budget = opts.reasoningBudget
+    }
     if (opts.grammar) body.grammar = opts.grammar
     if (opts.tools?.length) {
       body.tools = opts.tools.map((t) => ({
@@ -281,6 +327,7 @@ export class LlamaRuntime extends EventEmitter {
     const startedAt = Date.now()
     let ttft: number | null = null
     let completionTokens = 0
+    let promptTokens = 0
 
     const res = await fetch(`http://127.0.0.1:${loaded.port}/v1/chat/completions`, {
       method: 'POST',
@@ -329,7 +376,7 @@ export class LlamaRuntime extends EventEmitter {
           const payload = trimmed.slice(5).trim()
           if (payload === '[DONE]') {
             yield* flushCalls()
-            this.lastTimings = finalise(startedAt, ttft, completionTokens)
+            this.lastTimings = finalise(startedAt, ttft, completionTokens, promptTokens)
             return
           }
 
@@ -337,6 +384,7 @@ export class LlamaRuntime extends EventEmitter {
             choices?: {
               delta?: {
                 content?: string
+                reasoning_content?: string
                 tool_calls?: { index?: number; id?: string; function?: { name?: string; arguments?: string } }[]
               }
               finish_reason?: string
@@ -351,6 +399,13 @@ export class LlamaRuntime extends EventEmitter {
 
           const choice = json.choices?.[0]
           const delta = choice?.delta
+
+          if (delta?.reasoning_content) {
+            // Thinking counts towards time-to-first-token: it is the model working, and a
+            // reasoning model can spend a long time here before any answer appears.
+            if (ttft === null) ttft = Date.now() - startedAt
+            yield { type: 'reasoning', text: delta.reasoning_content }
+          }
 
           if (delta?.content) {
             if (ttft === null) ttft = Date.now() - startedAt
@@ -370,9 +425,10 @@ export class LlamaRuntime extends EventEmitter {
           }
 
           if (json.usage) {
+            promptTokens = json.usage.prompt_tokens ?? promptTokens
             yield {
               type: 'usage',
-              promptTokens: json.usage.prompt_tokens ?? 0,
+              promptTokens,
               completionTokens: json.usage.completion_tokens ?? completionTokens
             }
           }
@@ -439,12 +495,13 @@ export class LlamaRuntime extends EventEmitter {
   }
 }
 
-function finalise(startedAt: number, ttft: number | null, completionTokens: number): Timings {
+function finalise(startedAt: number, ttft: number | null, completionTokens: number, promptTokens = 0): Timings {
   const totalMs = Date.now() - startedAt
   const genMs = ttft === null ? totalMs : Math.max(1, totalMs - ttft)
   return {
     ttftMs: ttft,
     totalMs,
+    promptTokens,
     completionTokens,
     tokensPerSecond: completionTokens > 0 ? (completionTokens / genMs) * 1000 : 0
   }

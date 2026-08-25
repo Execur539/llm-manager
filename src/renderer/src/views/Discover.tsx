@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
-import { fmtBytes, invoke, on } from '../lib/api'
+import { fmtBytes, invoke, on, fmtRelative } from '../lib/api'
+import Icon from '../components/Icon'
+import { Skeleton, Spinner } from '../components/Spinner'
 
 interface HfModelSummary {
   id: string
@@ -32,6 +34,19 @@ interface DownloadItem {
   status: string
   error: string | null
   speed: number
+}
+
+/**
+ * Compact counts for HuggingFace figures.
+ *
+ * "6,674,515 downloads" is precise and unreadable; at a glance the only question is the order of
+ * magnitude. The exact number stays available as a tooltip.
+ */
+function fmtCount(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '—'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}k`
+  return String(n)
 }
 
 export default function Discover({ onDownloaded }: { onDownloaded: () => Promise<void> }): JSX.Element {
@@ -112,7 +127,8 @@ export default function Discover({ onDownloaded }: { onDownloaded: () => Promise
           onKeyDown={(e) => e.key === 'Enter' && void search()}
           style={{ flex: 1 }}
         />
-        <button className="primary" onClick={() => void search()} disabled={searching}>
+        <button className="primary" onClick={() => void search()} disabled={searching} data-testid="search-models">
+          {searching ? <Spinner size={13} /> : <Icon name="search" size={14} />}
           {searching ? 'Searching…' : 'Search'}
         </button>
       </div>
@@ -158,18 +174,43 @@ export default function Discover({ onDownloaded }: { onDownloaded: () => Promise
 
       {!selected && (
         <div className="list">
-          {results.map((r) => (
-            <div className="card row-card" key={r.id} onClick={() => void openRepo(r.id)}>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="truncate" style={{ fontWeight: 600 }}>{r.id}</div>
-                <div className="faint" style={{ fontSize: 11 }}>
-                  {r.downloads.toLocaleString()} downloads · {r.likes} likes
-                  {r.updatedAt && ` · updated ${new Date(r.updatedAt).toLocaleDateString()}`}
+          {results.map((r) => {
+            const [owner, ...rest] = r.id.split('/')
+            const name = rest.join('/') || r.id
+            return (
+              <button
+                type="button"
+                className="card row-card repo-card"
+                key={r.id}
+                onClick={() => void openRepo(r.id)}
+                title={`Open ${r.id}`}
+              >
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="truncate repo-name">
+                    {rest.length > 0 && <span className="repo-owner">{owner}/</span>}
+                    {name}
+                  </div>
+                  <div className="repo-meta">
+                    <span title={`${r.downloads.toLocaleString()} downloads`}>
+                      <Icon name="download" size={11} /> {fmtCount(r.downloads)}
+                    </span>
+                    <span title={`${r.likes.toLocaleString()} likes`}>
+                      <Icon name="star" size={11} /> {fmtCount(r.likes)}
+                    </span>
+                    {r.updatedAt && (
+                      <span title={new Date(r.updatedAt).toLocaleString()}>
+                        updated {fmtRelative(new Date(r.updatedAt).getTime())}
+                      </span>
+                    )}
+                  </div>
                 </div>
-              </div>
-              {r.gated && <span className="badge warn">gated</span>}
-            </div>
-          ))}
+                {r.gated && <span className="badge warn">gated</span>}
+                {/* The whole row is clickable; without a mark that is not obvious. */}
+                <Icon name="search" size={14} className="repo-go" />
+              </button>
+            )
+          })}
+          {searching && !results.length && <Skeleton rows={4} height={58} />}
           {!results.length && !searching && (
             <div className="empty">Search for a model to get started.</div>
           )}

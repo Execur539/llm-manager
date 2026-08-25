@@ -1,22 +1,44 @@
 ; Extract-once portable launcher.
 ;
 ; electron-builder's own `portable` target re-extracts the entire payload to TEMP on every
-; launch and deletes it on exit — measured at ~24s per launch with this app's 3 GB payload.
+; launch and deletes it on exit — measured at ~24s per launch with this app's payload.
 ; `portable.unpackDirName` only makes the directory *name* stable; it does not make the
 ; extraction skippable.
 ;
-; This script produces a single exe that unpacks to a versioned directory under LOCALAPPDATA
-; and writes a completion marker. Subsequent launches see the marker and skip straight to
-; running the app, so only the first run pays the extraction cost.
+; This produces a single exe that unpacks to a versioned directory under LOCALAPPDATA and writes
+; a completion marker. Later launches see the marker and start straight away, so only the first
+; run pays the extraction cost.
 ;
-; The marker is written last and includes the version, so a partial extraction (killed midway,
-; out of disk) is never mistaken for a finished one, and a new build never reuses an old payload.
+; The marker is written last and is named after a content fingerprint of the payload, so a
+; partial extraction (killed midway, out of disk) is never mistaken for a finished one, and a
+; rebuild never reuses an old payload — including a rebuild of the same version number.
+;
+; ---------------------------------------------------------------------------------------------
+; Why two archives, both prebuilt
+;
+; NSIS's LZMA is single-threaded: a full pass over this payload took ~900s on one core of
+; twenty-four. 7-Zip's LZMA2 does it across every core, so the archives are built beforehand and
+; stored here uncompressed; NSIS only compresses the ~1 MB extractor beside them.
+;
+; They are split because 82% of the payload is vendored binaries — llama.cpp, Chromium, ffmpeg —
+; that do not change between builds, while the part that does change is a 10 MB asar. Compressing
+; the vendor tree once and caching it takes the incremental rebuild from minutes to seconds.
 
 Unicode true
 ManifestDPIAware true
 RequestExecutionLevel user
-SetCompressor /SOLID lzma
-SetCompressorDictSize 64
+
+; Non-solid, deliberately.
+;
+; `/SOLID` puts NSIS in whole-compression mode, where every file becomes one stream and the
+; per-file `SetCompress off` below is silently ignored — it warns, and carries on. That had NSIS
+; LZMA-compressing the two already-compressed archives on one core: 539 seconds of work to save
+; nothing, on top of the 7-Zip pass that had just done the job properly.
+;
+; Without /SOLID, `SetCompress off` is honoured per file: the extractor is compressed, the
+; archives are stored, and the wrap becomes a copy.
+SetCompressor lzma
+SetCompressorDictSize 8
 
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
@@ -24,11 +46,20 @@ SetCompressorDictSize 64
 !ifndef VERSION
   !define VERSION "0.0.0"
 !endif
-!ifndef PAYLOAD
-  !error "PAYLOAD must be defined: the directory to embed"
+!ifndef APP_ARCHIVE
+  !error "APP_ARCHIVE must be defined: the prebuilt app .7z"
+!endif
+!ifndef VENDOR_ARCHIVE
+  !error "VENDOR_ARCHIVE must be defined: the prebuilt vendor .7z"
+!endif
+!ifndef EXTRACTOR
+  !error "EXTRACTOR must be defined: the 7za.exe used to unpack them"
 !endif
 !ifndef APPEXE
   !define APPEXE "LLM Manager.exe"
+!endif
+!ifndef BUILDID
+  !define BUILDID "dev"
 !endif
 
 Name "LLM Manager ${VERSION}"
@@ -38,17 +69,19 @@ XPStyle on
 
 Var RuntimeDir
 Var Marker
+Var Staging
+Var ExitCode
 
 Section
   StrCpy $RuntimeDir "$LOCALAPPDATA\LLMManager\runtime-${VERSION}"
-  StrCpy $Marker "$RuntimeDir\.unpacked-${VERSION}"
+  StrCpy $Marker "$RuntimeDir\.unpacked-${BUILDID}"
 
   ; The app must know where the *portable exe* lives, not where it was unpacked to. Without
   ; this it treats the extraction cache as its own folder and puts the model library there —
   ; a directory this script deletes on upgrade.
   System::Call 'kernel32::SetEnvironmentVariable(t "LLMM_PORTABLE_DIR", t "$EXEDIR")'
 
-  ; Fast path: a completed extraction of *this* version already exists.
+  ; Fast path: a completed extraction of *this* build already exists.
   ${If} ${FileExists} "$Marker"
     ${AndIf} ${FileExists} "$RuntimeDir\${APPEXE}"
       Exec '"$RuntimeDir\${APPEXE}"'
@@ -59,25 +92,77 @@ Section
   RMDir /r "$RuntimeDir"
   CreateDirectory "$RuntimeDir"
 
-  ; A banner is worth it here: this is a multi-gigabyte unpack and silence looks like a hang.
+  ; The archives and their extractor are staged outside the runtime directory, so a failure part
+  ; way through leaves nothing behind that could be mistaken for an app.
+  StrCpy $Staging "$LOCALAPPDATA\LLMManager\staging-${BUILDID}"
+  RMDir /r "$Staging"
+  CreateDirectory "$Staging"
+
   Banner::show /NOUNLOAD "Setting up LLM Manager — this happens once..."
 
-  SetOutPath "$RuntimeDir"
-  File /r "${PAYLOAD}\*.*"
+  SetOutPath "$Staging"
+  ; The extractor is small and compresses well.
+  SetCompress auto
+  File "${EXTRACTOR}"
+  ; The archives are already LZMA2; compressing them again would cost minutes and save nothing.
+  SetCompress off
+  File "/oname=app.7z" "${APP_ARCHIVE}"
+  File "/oname=vendor.7z" "${VENDOR_ARCHIVE}"
+
+  nsExec::Exec '"$Staging\7za.exe" x "$Staging\app.7z" -o"$RuntimeDir" -y -bso0 -bsp0'
+  Pop $ExitCode
+  ${If} $ExitCode != 0
+    Banner::destroy
+    Call FailedUnpack
+  ${EndIf}
+
+  ; The vendor tree lands where the app looks for it: resources\vendor.
+  nsExec::Exec '"$Staging\7za.exe" x "$Staging\vendor.7z" -o"$RuntimeDir\resources\vendor" -y -bso0 -bsp0'
+  Pop $ExitCode
+  ${If} $ExitCode != 0
+    Banner::destroy
+    Call FailedUnpack
+  ${EndIf}
 
   Banner::destroy
 
+  ${IfNot} ${FileExists} "$RuntimeDir\${APPEXE}"
+    Call FailedUnpack
+  ${EndIf}
+
+  ; The archives are the part worth reclaiming — most of a gigabyte — and nothing holds them
+  ; open, so they go first and unconditionally.
+  Delete "$Staging\app.7z"
+  Delete "$Staging\vendor.7z"
+
+  ; SetOutPath above made $Staging the process working directory, and Windows will not delete the
+  ; directory a process is sitting in. RMDir cleared the files and then failed on the directory
+  ; itself, silently, leaving an empty staging folder behind every first run. Step out first.
+  SetOutPath "$RuntimeDir"
+
+  ; The extractor can also stay locked briefly after its process exits, so give it a moment.
+  ; CleanOldRuntimes sweeps anything that still survives on the next launch.
+  Sleep 400
+  RMDir /r "$Staging"
+
   ; Marker written only after every file has landed.
   FileOpen $0 "$Marker" w
-  FileWrite $0 "${VERSION}"
+  FileWrite $0 "${VERSION} ${BUILDID}"
   FileClose $0
 
-  ; Old versions leave their own runtime-<version> directories behind; remove the previous one
-  ; so upgrades do not silently accumulate several gigabytes each.
   Call CleanOldRuntimes
 
   Exec '"$RuntimeDir\${APPEXE}"'
 SectionEnd
+
+; A failed unpack must leave nothing a later launch could mistake for an app.
+Function FailedUnpack
+  SetOutPath "$LOCALAPPDATA"
+  RMDir /r "$Staging"
+  RMDir /r "$RuntimeDir"
+  MessageBox MB_ICONSTOP "Could not unpack LLM Manager (extractor exit code $ExitCode).$\n$\nCheck free disk space and try again."
+  Abort
+FunctionEnd
 
 ; Remove superseded runtime directories so upgrades do not accumulate gigabytes.
 ;
@@ -98,5 +183,16 @@ Function CleanOldRuntimes
     FindNext $0 $1
     Goto loop
   done:
+  FindClose $0
+
+  ; Abandoned staging directories from a killed run are safe to remove: they only ever hold the
+  ; archives and the extractor.
+  FindFirst $0 $1 "$LOCALAPPDATA\LLMManager\staging-*"
+  sloop:
+    StrCmp $1 "" sdone
+    RMDir /r "$LOCALAPPDATA\LLMManager\$1"
+    FindNext $0 $1
+    Goto sloop
+  sdone:
   FindClose $0
 FunctionEnd

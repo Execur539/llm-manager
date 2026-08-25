@@ -41,6 +41,7 @@ interface MessageRow {
   parent_id: string | null
   role: string
   content: string
+  reasoning: string | null
   tool_calls: string | null
   tool_result: string | null
   created_at: number
@@ -128,11 +129,12 @@ export function searchChats(query: string): { chatId: string; title: string; sni
 export function appendMessage(chatId: string, message: AgentMessage): void {
   transaction(() => {
     run(
-      'INSERT OR REPLACE INTO messages (id, chat_id, parent_id, role, content, tool_calls, tool_result, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?)',
+      'INSERT OR REPLACE INTO messages (id, chat_id, parent_id, role, content, reasoning, tool_calls, tool_result, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)',
       message.id,
       chatId,
       message.role,
       message.content,
+      message.reasoning ?? null,
       message.toolCalls ? JSON.stringify(message.toolCalls) : null,
       message.toolResult ? JSON.stringify(message.toolResult) : null,
       message.createdAt
@@ -146,6 +148,7 @@ export function loadMessages(chatId: string): AgentMessage[] {
     id: r.id,
     role: r.role as AgentMessage['role'],
     content: r.content,
+    reasoning: r.reasoning ?? undefined,
     toolCalls: r.tool_calls ? JSON.parse(r.tool_calls) : undefined,
     toolResult: r.tool_result ? JSON.parse(r.tool_result) : undefined,
     createdAt: r.created_at
@@ -232,11 +235,30 @@ export function attachmentsFor(messageId: string): { id: string; kind: string; p
 }
 
 /** Classify a dropped file so the UI and the model handler agree on what it is. */
+/** Extensions without the dot, so they can be handed straight to a dialog filter. */
+export const IMAGE_EXT = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']
+export const AUDIO_EXT = ['mp3', 'wav', 'flac', 'ogg', 'm4a']
+export const VIDEO_EXT = ['mp4', 'mkv', 'mov', 'webm', 'avi']
+
+/**
+ * Text-ish formats worth offering in a picker.
+ *
+ * Not exhaustive and not a gate: anything unrecognised is still classified as a document and the
+ * extractor decides whether it is readable by looking at the bytes. This list only shapes what
+ * the file dialog suggests.
+ */
+export const TEXT_EXT = [
+  'txt', 'md', 'markdown', 'rst', 'log', 'csv', 'tsv', 'json', 'yaml', 'yml', 'toml', 'ini', 'env',
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'rb', 'go', 'rs', 'java', 'kt', 'swift', 'c', 'h',
+  'cpp', 'hpp', 'cc', 'cs', 'php', 'sh', 'bash', 'zsh', 'ps1', 'bat', 'sql', 'html', 'htm', 'css',
+  'scss', 'xml', 'svg', 'gradle', 'dockerfile', 'makefile', 'pdf'
+]
+
 export function classifyAttachment(file: string): AttachmentInput['kind'] {
-  const ext = path.extname(file).toLowerCase()
-  if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'].includes(ext)) return 'image'
-  if (['.mp3', '.wav', '.flac', '.ogg', '.m4a'].includes(ext)) return 'audio'
-  if (['.mp4', '.mkv', '.mov', '.webm', '.avi'].includes(ext)) return 'video'
+  const ext = path.extname(file).toLowerCase().replace(/^\./, '')
+  if (IMAGE_EXT.includes(ext)) return 'image'
+  if (AUDIO_EXT.includes(ext)) return 'audio'
+  if (VIDEO_EXT.includes(ext)) return 'video'
   return 'doc'
 }
 

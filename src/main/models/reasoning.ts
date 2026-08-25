@@ -1,0 +1,210 @@
+/**
+ * Working out what reasoning control a model actually offers, from its own chat template.
+ *
+ * There is no metadata key for this and no standard set of level names — the template is the
+ * only honest source. Three shapes exist in the wild:
+ *
+ *   effort   the template branches on `reasoning_effort` and enumerates the levels it accepts.
+ *            Qwen3.8-27B takes low / medium / xhigh (default xhigh); gpt-oss takes low / medium
+ *            / high. Hardcoding either list would be wrong for the other, so the levels are read
+ *            out of the template.
+ *   toggle   the template honours `enable_thinking` but has no levels — Qwen3.6, nanbeige4.2.
+ *   none     no reasoning control at all — Hermes-3's template is 209 characters long.
+ *
+ * llama-server passes `reasoning_effort` and `chat_template_kwargs` straight through to the
+ * template, so whatever is found here is exactly what can be sent back.
+ */
+
+/** Ordered weakest to strongest. Names outside this list sort after it, alphabetically. */
+const CANONICAL_ORDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+
+/** Values that mean "no thinking" rather than naming a level of it. */
+const OFF_VALUES = new Set(['none', 'off', 'false', 'disabled'])
+
+/** Values that mean "whatever the template already does". */
+const PASSTHROUGH_VALUES = new Set(['default', 'auto'])
+
+export type ReasoningKind = 'none' | 'toggle' | 'effort'
+
+export interface ReasoningSupport {
+  kind: ReasoningKind
+  /** Accepted effort levels, ordered weakest to strongest. Empty unless kind is 'effort'. */
+  levels: string[]
+  /** What the template falls back to when nothing is passed. */
+  defaultLevel: string | null
+  /** Whether thinking can be switched off entirely, via enable_thinking or an explicit 'none'. */
+  canDisable: boolean
+  /**
+   * The literal this template accepts as an effort level meaning "do not think", if any.
+   *
+   * Kept separate from `canDisable` because the two are not the same question. A template can be
+   * disabled through `enable_thinking` while still validating `reasoning_effort` against a list
+   * that has no off value in it — sending 'none' to that template does not disable anything, it
+   * raises. Only a name found in the template's own accepted set is ever sent back to it.
+   */
+  offValue: string | null
+}
+
+export const NO_REASONING: ReasoningSupport = {
+  kind: 'none',
+  levels: [],
+  defaultLevel: null,
+  canDisable: false,
+  offValue: null
+}
+
+/**
+ * Names the template has assigned `reasoning_effort` to.
+ *
+ * Templates rarely branch on the raw variable: they normalise it first, and the name they
+ * normalise it into is arbitrary. Qwen3.8 happens to pick `resolved_reasoning_effort`, which a
+ * substring match catches by luck; a template using `{%- set r = reasoning_effort|default(...) %}`
+ * would be missed entirely, and the model would silently lose its effort control.
+ */
+function aliasNames(template: string): string[] {
+  const names = new Set<string>()
+  for (const m of template.matchAll(/\bset\s+([A-Za-z_][A-Za-z0-9_]*)\s*=[^%]*?reasoning_effort/g)) {
+    names.add(m[1])
+  }
+  return [...names]
+}
+
+/**
+ * A pattern matching the raw variable or any name the template aliased it to.
+ *
+ * Alias names come from a capture that only accepts identifier characters, so none of them can
+ * carry regex metacharacters and no escaping is needed here.
+ */
+function effortVariablePattern(template: string): string {
+  return `(?:${['[A-Za-z_]*reasoning_effort', ...aliasNames(template)].join('|')})`
+}
+
+/** Pull the quoted strings out of a Jinja tuple/list literal. */
+function quotedStrings(source: string): string[] {
+  return [...source.matchAll(/['"]([A-Za-z0-9_-]+)['"]/g)].map((m) => m[1])
+}
+
+function rank(level: string): number {
+  const i = CANONICAL_ORDER.indexOf(level)
+  return i === -1 ? CANONICAL_ORDER.length : i
+}
+
+function order(levels: Iterable<string>): string[] {
+  return [...new Set(levels)].sort((a, b) => {
+    const d = rank(a) - rank(b)
+    return d !== 0 ? d : a.localeCompare(b)
+  })
+}
+
+/** What the user chose. `null` means "leave the template's own default alone". */
+export type ReasoningChoice = string | 'off' | null
+
+/**
+ * Turn a choice into request fields, given what the model actually supports.
+ *
+ * Deliberately conservative: anything the model did not advertise is dropped rather than sent
+ * hopefully. A level name a template does not know makes it raise an exception mid-request, and
+ * `enable_thinking` on a model that ignores it is silent but misleading in the logs.
+ */
+export function reasoningRequestFields(
+  support: ReasoningSupport | undefined | null,
+  choice: ReasoningChoice
+): {
+  reasoningEffort?: string
+  chatTemplateKwargs?: Record<string, unknown>
+  reasoningBudget?: number
+} {
+  if (!support || support.kind === 'none' || choice === null) return {}
+
+  /*
+   * Turning thinking off works on any reasoning model, whatever its template offers.
+   *
+   * Three mechanisms, sent together because which one bites depends on the model:
+   *   - `reasoning_budget: 0` is llama.cpp's own, and closes the thought block itself. It is the
+   *     only one that works on an effort-only template like Qwen3.8's, which enumerates levels
+   *     and has no way to express "none".
+   *   - `enable_thinking: false` is honoured by templates built around that flag, and is an
+   *     unread variable everywhere else.
+   *   - the effort level is sent only when the template's own accepted set contains an off
+   *     value. Sending 'none' to a template that validates against ('xhigh','medium','low')
+   *     does not disable thinking — it raises mid-request and the turn fails.
+   */
+  if (choice === 'off') {
+    return {
+      reasoningBudget: 0,
+      chatTemplateKwargs: { enable_thinking: false },
+      ...(support.offValue ? { reasoningEffort: support.offValue } : {})
+    }
+  }
+
+  if (support.kind === 'toggle') {
+    // The only meaningful non-off choice for a toggle is "on".
+    return { chatTemplateKwargs: { enable_thinking: true } }
+  }
+
+  if (!support.levels.includes(choice)) return {}
+  return { reasoningEffort: choice }
+}
+
+export function detectReasoning(chatTemplate: string | null | undefined): ReasoningSupport {
+  if (typeof chatTemplate !== 'string' || chatTemplate.length === 0) return NO_REASONING
+
+  const mentionsEffort = /reasoning_effort/.test(chatTemplate)
+  const mentionsToggle = /enable_thinking/.test(chatTemplate)
+
+  if (!mentionsEffort && !mentionsToggle) return NO_REASONING
+
+  let levels: string[] = []
+  let canDisable = mentionsToggle
+  let offValue: string | null = null
+
+  if (mentionsEffort) {
+    /*
+     * A membership test is authoritative when present: it is the template's own validation of
+     * what it will accept, so it excludes aliases. Qwen3.8 remaps 'high' onto 'xhigh' *before*
+     * testing `not in ('xhigh', 'medium', 'low')`, so collecting equality comparisons instead
+     * would offer 'high' as a fourth stop that behaves identically to 'xhigh'.
+     */
+    const variable = effortVariablePattern(chatTemplate)
+    const membership = [
+      ...chatTemplate.matchAll(new RegExp(`\\b${variable}\\s+(?:not\\s+)?in\\s*(\\([^)]*\\)|\\[[^\\]]*\\])`, 'g'))
+    ]
+    for (const m of membership) levels.push(...quotedStrings(m[1]))
+
+    if (levels.length === 0) {
+      // No validation list — fall back to whatever the template compares against. The variable
+      // is often a derived one (`resolved_reasoning_effort`), hence the loose prefix match.
+      for (const m of chatTemplate.matchAll(new RegExp(`\\b${variable}\\s*(?:==|!=)\\s*['"]([A-Za-z0-9_-]+)['"]`, 'g'))) {
+        levels.push(m[1])
+      }
+      for (const m of chatTemplate.matchAll(new RegExp(`['"]([A-Za-z0-9_-]+)['"]\\s*(?:==|!=)\\s*\\b${variable}`, 'g'))) {
+        levels.push(m[1])
+      }
+    }
+
+    // 'none' is llama.cpp's way of disabling thinking, not a level of it.
+    const off = levels.find((l) => OFF_VALUES.has(l.toLowerCase()))
+    if (off) {
+      canDisable = true
+      // Kept verbatim: the template will compare against its own spelling, not a normalised one.
+      offValue = off
+    }
+    levels = levels.filter((l) => !OFF_VALUES.has(l.toLowerCase()) && !PASSTHROUGH_VALUES.has(l.toLowerCase()))
+  }
+
+  const ordered = order(levels)
+
+  // The template's own fallback, e.g. `reasoning_effort|default('xhigh')`.
+  const defaultMatch = chatTemplate.match(/reasoning_effort\s*\|\s*default\s*\(\s*['"]([A-Za-z0-9_-]+)['"]/)
+  const parsedDefault = defaultMatch?.[1] ?? null
+  const defaultLevel = parsedDefault && ordered.includes(parsedDefault) ? parsedDefault : (ordered.at(-1) ?? null)
+
+  // One level is not a choice; treat it as a plain toggle if the template offers one.
+  if (ordered.length >= 2) {
+    return { kind: 'effort', levels: ordered, defaultLevel, canDisable, offValue }
+  }
+  if (canDisable) {
+    return { kind: 'toggle', levels: [], defaultLevel: null, canDisable: true, offValue }
+  }
+  return NO_REASONING
+}

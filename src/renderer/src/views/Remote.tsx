@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { invoke, on } from '../lib/api'
+import ConfirmDialog from '../components/ConfirmDialog'
 
 interface RemoteStatus {
   tunnel: { running: boolean; url: string | null; error: string | null }
@@ -20,6 +21,7 @@ export default function RemoteView(): JSX.Element {
   const [info, setInfo] = useState<string | null>(null)
   const [url, setUrl] = useState<string | null>(null)
   const [remoteTools, setRemoteTools] = useState(false)
+  const [confirmRemoteTools, setConfirmRemoteTools] = useState(false)
 
   const refresh = async (): Promise<void> => {
     const s = await invoke<RemoteStatus>('remote:status')
@@ -80,6 +82,12 @@ export default function RemoteView(): JSX.Element {
   }
 
   const active = status?.settings.enabled && (status.tunnel.running || status.web)
+
+  const applyRemoteTools = async (enabled: boolean): Promise<void> => {
+    setRemoteTools(enabled)
+    const current = await invoke<{ agent: Record<string, unknown> }>('settings:get')
+    await invoke('settings:patch', { agent: { ...current.agent, remoteToolsEnabled: enabled } })
+  }
 
   return (
     <>
@@ -249,6 +257,31 @@ export default function RemoteView(): JSX.Element {
           <div className="faint" style={{ marginTop: 8, fontSize: 11 }}>Set a password first.</div>
         )}
       </div>
+
+      <ConfirmDialog
+        open={confirmRemoteTools}
+        danger
+        title="Allow remote sessions to run code?"
+        confirmLabel="Enable full tool access"
+        requirePhrase="enable full access"
+        body={
+          <>
+            <p>
+              Remote sessions would gain the write and execute tools: creating and deleting files, and running
+              commands, on <strong>this machine</strong>.
+            </p>
+            <p className="subtitle">
+              Anyone who gets past the remote password would have that same reach. Permission prompts still
+              apply, but they would be answered on whichever device is connected.
+            </p>
+          </>
+        }
+        onCancel={() => setConfirmRemoteTools(false)}
+        onConfirm={() => {
+          setConfirmRemoteTools(false)
+          void applyRemoteTools(true)
+        }}
+      />
     </>
   )
 }

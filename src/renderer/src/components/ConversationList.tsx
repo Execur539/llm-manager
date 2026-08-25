@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
+import { closeRail, useStream } from '../lib/store'
+import { DRAWER_QUERY, useMediaQuery } from '../lib/media'
 import { fmtRelative } from '../lib/api'
 
 export interface ChatSummary {
@@ -53,6 +55,12 @@ export default function ConversationList({
     return () => clearTimeout(timer)
   }, [confirmingId])
 
+  const { railOpen } = useStream()
+  // Below this width the rail is an overlay, so when closed it must be neither visible nor
+  // reachable: an off-screen drawer whose buttons still take focus is a keyboard trap.
+  const isDrawer = useMediaQuery(DRAWER_QUERY)
+  const hidden = isDrawer && !railOpen
+
   const commitRename = (id: string): void => {
     const title = draft.trim()
     if (title) onRename(id, title)
@@ -60,8 +68,24 @@ export default function ConversationList({
   }
 
   return (
-    <aside className="side-list" data-testid="conversation-list">
-      <button className="primary new-button" onClick={onNew} data-testid="new-conversation">
+    <>
+      {/* Only rendered as a real backdrop on narrow viewports; CSS hides it otherwise. */}
+      <div
+        className={`rail-backdrop${railOpen ? ' open' : ''}`}
+        onClick={closeRail}
+        aria-hidden="true"
+      />
+      <aside
+        className={`side-list${railOpen ? ' open' : ''}`}
+        data-testid="conversation-list"
+        aria-hidden={hidden || undefined}
+        {...(hidden ? { inert: '' } : {})}
+      >
+      <button className="primary new-button" onClick={() => {
+          onNew()
+          closeRail()
+        }}
+        data-testid="new-conversation">
         {newLabel}
       </button>
 
@@ -73,8 +97,13 @@ export default function ConversationList({
           <div
             key={item.id}
             className={`side-item ${activeId === item.id ? 'active' : ''}`}
-            onClick={() => !isEditing && !isConfirming && onOpen(item.id)}
+            onClick={() => {
+              if (isEditing || isConfirming) return
+              onOpen(item.id)
+              closeRail()
+            }}
             data-testid="conversation-item"
+            data-id={item.id}
             title={item.title}
           >
             {isEditing ? (
@@ -163,6 +192,7 @@ export default function ConversationList({
       })}
 
       {!items.length && <div className="empty small">{emptyLabel}</div>}
-    </aside>
+      </aside>
+    </>
   )
 }

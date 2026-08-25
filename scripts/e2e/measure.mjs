@@ -11,7 +11,7 @@ await page.waitForSelector('.model-card')
 await page.locator('.model-card').first().click()
 await page.waitForSelector('button:has-text("Load with this plan")')
 await page.locator('button:has-text("Load with this plan")').click()
-await page.waitForSelector('.sidebar-footer .badge.good', { timeout: 30000 })
+await page.waitForSelector('[data-testid="model-loaded"]', { timeout: 30000 })
 
 await goTo(page, 'Chat')
 await page.getByTestId('new-conversation').click()

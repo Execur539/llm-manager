@@ -13,6 +13,13 @@ interface DesktopApi {
   send: (channel: string, ...args: unknown[]) => void
   on: (channel: EventChannel, cb: (payload: never) => void) => () => void
   isDesktop: boolean
+  /**
+   * Real on-disk path of a dropped File, from the preload.
+   *
+   * Absent in a remote browser, and empty for anything the browser synthesised — the caller
+   * falls back to sending the bytes.
+   */
+  pathForFile?: (file: File) => string
 }
 
 declare global {
@@ -95,11 +102,23 @@ export function on<T = unknown>(channel: EventChannel, cb: (payload: T) => void)
 export function fmtBytes(n: number | null | undefined): string {
   if (n === null || n === undefined || !Number.isFinite(n)) return '—'
   if (n < 0) return 'unknown'
-  const gb = n / 1024 ** 3
-  if (gb >= 1) return `${gb.toFixed(gb >= 10 ? 1 : 2)} GB`
-  const mb = n / 1024 ** 2
-  if (mb >= 1) return `${mb.toFixed(0)} MB`
-  return `${n} B`
+
+  // Every step down to bytes. Without a kilobyte step, anything under a megabyte printed as a
+  // raw byte count — "438009 B" where "428 KB" was meant.
+  const units: [number, string, number][] = [
+    [1024 ** 4, 'TB', 2],
+    [1024 ** 3, 'GB', 2],
+    [1024 ** 2, 'MB', 0],
+    [1024, 'KB', 0]
+  ]
+  for (const [size, label, digits] of units) {
+    if (n >= size) {
+      const value = n / size
+      // Keep large numbers from carrying meaningless precision: 12.34 GB, but 1.23 GB.
+      return `${value.toFixed(value >= 10 ? Math.max(0, digits - 1) : digits)} ${label}`
+    }
+  }
+  return `${Math.round(n)} B`
 }
 
 export function fmtTokens(n: number): string {

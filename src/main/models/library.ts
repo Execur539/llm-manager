@@ -7,17 +7,33 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import type { ModelCapabilities, ModelRecord } from '@shared/types'
+import type { ModelCapabilities, ModelRecord, ReasoningSupport } from '@shared/types'
 import { extractArchInfo, readGguf, templateSupportsTools } from './gguf'
+import { detectReasoning, NO_REASONING } from './reasoning'
 import { APPDATA_DIR } from '../storage/paths'
 
 const INDEX_FILE = path.join(APPDATA_DIR, 'model-index.json')
+
+/**
+ * Bump when the shape of a cached record changes.
+ *
+ * The index exists so a library of 40 GB files is not re-parsed on every launch, and it keys on
+ * path/size/mtime — none of which change when *this code* starts recording something new. Without
+ * a schema version, adding a capability leaves every already-scanned model with that field
+ * missing, and the gap only shows up wherever the UI happens to read it.
+ */
+const INDEX_SCHEMA = 2
 
 interface IndexEntry {
   path: string
   size: number
   mtimeMs: number
   record: ModelRecord
+}
+
+interface IndexFile {
+  schema: number
+  entries: IndexEntry[]
 }
 
 /**
@@ -48,8 +64,13 @@ function idFor(filePath: string): string {
 
 async function loadIndex(): Promise<Map<string, IndexEntry>> {
   try {
-    const raw = JSON.parse(await fsp.readFile(INDEX_FILE, 'utf8')) as IndexEntry[]
-    return new Map(raw.map((e) => [e.path, e]))
+    const raw = JSON.parse(await fsp.readFile(INDEX_FILE, 'utf8')) as IndexFile | IndexEntry[]
+
+    // A bare array is the pre-versioned format: discard it and re-parse rather than serve
+    // records that predate whatever the current code expects to find on them.
+    if (Array.isArray(raw) || raw.schema !== INDEX_SCHEMA) return new Map()
+
+    return new Map(raw.entries.map((e) => [e.path, e]))
   } catch {
     return new Map()
   }
@@ -57,7 +78,7 @@ async function loadIndex(): Promise<Map<string, IndexEntry>> {
 
 async function saveIndex(entries: IndexEntry[]): Promise<void> {
   await fsp.mkdir(APPDATA_DIR, { recursive: true })
-  await fsp.writeFile(INDEX_FILE, JSON.stringify(entries, null, 2))
+  await fsp.writeFile(INDEX_FILE, JSON.stringify({ schema: INDEX_SCHEMA, entries }, null, 2))
 }
 
 /** Walk the models dir for .gguf files, skipping the partial-download staging area. */
@@ -106,7 +127,8 @@ async function detectCapabilities(
   archName: string,
   modelName: string | null,
   mmproj: string | null,
-  toolsFromTemplate: boolean
+  toolsFromTemplate: boolean,
+  reasoning: ReasoningSupport = NO_REASONING
 ): Promise<ModelCapabilities> {
   let vision = false
   let audio = false
@@ -137,7 +159,8 @@ async function detectCapabilities(
     // llama.cpp expands video into frames for any vision model, so vision implies video is reachable.
     videoPossible: vision,
     tools: toolsFromTemplate,
-    mmprojPath: mmproj
+    mmprojPath: mmproj,
+    reasoning
   }
 }
 
@@ -172,7 +195,14 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
     try {
       const meta = await readGguf(file)
       const arch = extractArchInfo(meta, st.size)
-      const caps = await detectCapabilities(file, arch.architecture, arch.name, mmproj, templateSupportsTools(meta))
+      const caps = await detectCapabilities(
+        file,
+        arch.architecture,
+        arch.name,
+        mmproj,
+        templateSupportsTools(meta),
+        detectReasoning(meta.kv['tokenizer.chat_template'] as string | undefined)
+      )
       const quantLabel = quantFromFilename(path.basename(file))
       record = {
         id: idFor(file),
@@ -199,7 +229,15 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
         path: file,
         bytes: st.size,
         arch: null,
-        caps: { vision: false, audio: false, nativeVideo: false, videoPossible: false, tools: false, mmprojPath: mmproj },
+        caps: {
+          vision: false,
+          audio: false,
+          nativeVideo: false,
+          videoPossible: false,
+          tools: false,
+          mmprojPath: mmproj,
+          reasoning: NO_REASONING
+        },
         addedAt: Date.now(),
         lastUsedAt: null,
         favourite: false,
