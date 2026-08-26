@@ -99,7 +99,23 @@ await fsp.writeFile(
 const env = { ...process.env, LLMM_APPDATA_DIR: appData }
 
 killApp()
-await fsp.rm(RUNTIME, { recursive: true, force: true }).catch(() => undefined)
+
+/*
+ * The cache must actually be gone before the run starts.
+ *
+ * This removal used to swallow its own failure. A process still holding the directory — the
+ * packaged verification launches the app moments earlier — left the previous build's payload in
+ * place, the launcher found a marker it was happy with, skipped extraction, and every assertion
+ * below passed against the old payload. Retried, then asserted.
+ */
+for (let attempt = 0; attempt < 10 && fs.existsSync(RUNTIME); attempt++) {
+  await fsp.rm(RUNTIME, { recursive: true, force: true }).catch(() => undefined)
+  if (fs.existsSync(RUNTIME)) await sleep(1000)
+}
+if (fs.existsSync(RUNTIME)) {
+  console.error(`Could not clear ${RUNTIME} — something is still holding it. Aborting.`)
+  process.exit(1)
+}
 
 try {
   // ---- first launch: unpacks
@@ -126,6 +142,21 @@ try {
   const markerName = markers[0] ?? ''
   check('the marker is keyed to a build fingerprint, not the version',
     markerName !== `.unpacked-${VERSION}` && /^\.unpacked-[0-9a-f]{12}$/.test(markerName), markerName)
+
+  /*
+   * And it must name *this* build.
+   *
+   * Checking only the shape was not enough to catch the bug this file exists for: the previous
+   * build's marker is also twelve hex characters, so a payload that was never replaced passed
+   * every assertion above. The id is written beside the exe at build time, so the expected
+   * value is knowable rather than inferred.
+   */
+  const expectedId = (await fsp.readFile(`${EXE}.buildid`, 'utf8').catch(() => '')).trim().split(/\s+/)[0]
+  check('the build id was recorded beside the exe', !!expectedId, expectedId || '(missing)')
+  if (expectedId) {
+    check('the unpacked payload is this build, not a previous one',
+      markerName === `.unpacked-${expectedId}`, `${markerName} vs expected .unpacked-${expectedId}`)
+  }
 
   const started = await waitFor('app', async () => appRunning(), 120000)
   check('the app starts after unpacking', started !== null,
