@@ -852,6 +852,21 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     syncAgentOptions()
     a.updateOptions({ cwd: session.cwd, reasoningChoice: reasoning ?? null })
 
+    /*
+     * Show the user's message before doing anything slow with it.
+     *
+     * The loop is what normally announces the turn, and under Ultra the loop does not start
+     * until several planning samples and a synthesis pass have finished — minutes during which
+     * the transcript held no user message at all, so the empty state rendered and the sample box
+     * sat alone at the bottom of an empty pane. The id is minted here and handed to the loop, so
+     * what it stores is this message rather than a second one.
+     */
+    const userMessageId = `${Date.now().toString(36)}-u`
+    emit('agent:message', {
+      sessionId,
+      message: { id: userMessageId, role: 'user', content: displayText, createdAt: Date.now() }
+    })
+
     const before = session.messages.length
     activeAgentSessionId = sessionId
     a.hydrate(session)
@@ -869,6 +884,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
        * against results which never happened.
        */
       let prompt = turn.text
+      let chosenPlan: string | undefined
       if (isUltra(reasoning ?? null)) {
         const cfg = loadSettings().ultra
         const count = Math.max(1, Math.min(8, Math.round(cfg.samples)))
@@ -902,10 +918,13 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         prompt = chosen.trim() ? `${turn.text}\n\n${planPreamble(chosen)}` : turn.text
         // Shown in a box of its own. It shapes everything that follows, so it should be
         // readable — just not by being pasted into the user's message.
-        if (chosen.trim()) emit('agent:ultra-plan', { sessionId, plan: chosen.trim() })
+        if (chosen.trim()) {
+          chosenPlan = chosen.trim()
+          emit('agent:ultra-plan', { sessionId, plan: chosenPlan })
+        }
       }
 
-      await a.run(session, prompt, turn.media, displayText)
+      await a.run(session, prompt, turn.media, displayText, { userMessageId, plan: chosenPlan })
     } finally {
       drainPendingPermissions()
       // Persist on the way out either way. A turn that ends in an error still did real work —

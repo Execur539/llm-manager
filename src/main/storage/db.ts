@@ -238,6 +238,15 @@ export const MIGRATIONS: { id: number; sql: string }[] = [
     ALTER TABLE tasks_new RENAME TO tasks;
     CREATE INDEX IF NOT EXISTS idx_tasks_chat ON tasks(chat_id, ord);
     `
+  },
+  {
+    id: 5,
+    sql: `
+    -- Ultra chooses a plan before an agent turn acts on it. It used to reach the transcript by
+    -- being appended to the prompt, which put it inside the user's own message; stored properly,
+    -- it belongs to the turn without pretending to be something the user typed.
+    ALTER TABLE messages ADD COLUMN plan TEXT;
+    `
   }
 ]
 

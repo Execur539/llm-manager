@@ -42,6 +42,7 @@ interface MessageRow {
   role: string
   content: string
   reasoning: string | null
+  plan: string | null
   tool_calls: string | null
   tool_result: string | null
   created_at: number
@@ -129,12 +130,13 @@ export function searchChats(query: string): { chatId: string; title: string; sni
 export function appendMessage(chatId: string, message: AgentMessage): void {
   transaction(() => {
     run(
-      'INSERT OR REPLACE INTO messages (id, chat_id, parent_id, role, content, reasoning, tool_calls, tool_result, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)',
+      'INSERT OR REPLACE INTO messages (id, chat_id, parent_id, role, content, reasoning, plan, tool_calls, tool_result, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)',
       message.id,
       chatId,
       message.role,
       message.content,
       message.reasoning ?? null,
+      message.plan ?? null,
       message.toolCalls ? JSON.stringify(message.toolCalls) : null,
       message.toolResult ? JSON.stringify(message.toolResult) : null,
       message.createdAt
@@ -149,6 +151,7 @@ export function loadMessages(chatId: string): AgentMessage[] {
     role: r.role as AgentMessage['role'],
     content: r.content,
     reasoning: r.reasoning ?? undefined,
+    plan: r.plan ?? undefined,
     toolCalls: r.tool_calls ? JSON.parse(r.tool_calls) : undefined,
     toolResult: r.tool_result ? JSON.parse(r.tool_result) : undefined,
     createdAt: r.created_at

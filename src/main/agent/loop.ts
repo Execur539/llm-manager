@@ -482,7 +482,16 @@ Platform: Windows (PowerShell)${memoryBlock}`
      * inside the user's own message bubble, so a conversation opened with "Hello" appeared to
      * have been sent with a numbered plan attached to it.
      */
-    displayText: string = userInput
+    displayText: string = userInput,
+    /**
+     * Identity and plan for the turn's user message, when the caller has already shown it.
+     *
+     * Ultra's planning runs before the loop does — several samples and a synthesis pass, which
+     * is minutes of work — and the message that started it must be on screen for all of that.
+     * The caller emits it up front and passes the id here so the stored message is the same one
+     * rather than a second copy appearing when the loop finally begins.
+     */
+    turnMeta: { userMessageId?: string; plan?: string } = {}
   ): Promise<void> {
     this.abort = new AbortController()
     const signal = this.abort.signal
@@ -499,9 +508,10 @@ Platform: Windows (PowerShell)${memoryBlock}`
     )
 
     const userMsg: AgentMessage = {
-      id: crypto.randomBytes(6).toString('hex'),
+      id: turnMeta.userMessageId ?? crypto.randomBytes(6).toString('hex'),
       role: 'user',
       content: displayText,
+      plan: turnMeta.plan,
       createdAt: Date.now()
     }
     session.messages.push(userMsg)

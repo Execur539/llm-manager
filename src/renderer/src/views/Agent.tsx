@@ -337,7 +337,22 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                   {m.content && <Markdown source={m.content} />}
                 </>
               ) : (
-                <div className="body">{m.content}</div>
+                <>
+                  <div className="body">{m.content}</div>
+                  {/* Kept with the turn it directed, so reading the transcript back explains
+                      why the agent did what it did. */}
+                  {m.plan && (
+                    <div className="ultra-block turn-plan">
+                      <div className="ultra-head">
+                        <Icon name="sparkle" size={12} />
+                        <span>Ultra — plan for this turn</span>
+                      </div>
+                      <div className="ultra-plan">
+                        <div className="ultra-pre">{m.plan}</div>
+                      </div>
+                    </div>
+                  )}
+                </>
               )}
               </MessageRow>
             )

@@ -745,6 +745,12 @@ process.env.LLMM_APPDATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-tes
   }
   check('a task cannot be written against a missing chat', rejected)
 
+  // Migration 5: the turn's plan is stored beside its message rather than pasted into it.
+  applyRange(db, 4, 5)
+  const cols = db.prepare('PRAGMA table_info(messages)').all().map((c) => c.name)
+  check('messages can hold a plan', cols.includes('plan'), cols.join(','))
+  check('and still hold reasoning', cols.includes('reasoning'), cols.join(','))
+
   db.close()
 }
 

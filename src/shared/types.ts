@@ -293,6 +293,13 @@ export interface AgentMessage {
   content: string
   /** The model's chain of thought, when it produced one. */
   reasoning?: string
+  /**
+   * The course of action Ultra settled on for this turn, on the message that opened it.
+   *
+   * Kept because it directs everything the turn then does — a transcript showing the work but
+   * not the plan behind it is hard to read back later.
+   */
+  plan?: string
   toolCalls?: ToolCall[]
   toolResult?: ToolResult
   createdAt: number

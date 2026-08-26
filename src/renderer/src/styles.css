@@ -3165,3 +3165,12 @@ button.danger.subtle:hover {
   border-top: 1px solid var(--border);
   background: var(--accent-wash);
 }
+
+/* The stored plan sits under the message that prompted it, not inside it. */
+.turn-plan {
+  margin-top: 8px;
+}
+
+.turn-plan .ultra-plan {
+  border-top: none;
+}

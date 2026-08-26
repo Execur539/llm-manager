@@ -488,7 +488,15 @@ function wire(): void {
     const id = wrapped.sessionId || activeId
     state.partial[id] = ''
     state.reasoningPartial[id] = ''
-    state.pending[id] = [...(state.pending[id] ?? []), message]
+    /*
+     * Replace, rather than append, when the id is already queued.
+     *
+     * The user's turn is announced before Ultra starts planning and stored again when the loop
+     * finally runs, so the same message arrives twice by design. The later copy is the complete
+     * one — it carries the chosen plan — and the view only dedupes against what it has already
+     * drained, so two undrained copies would both be shown.
+     */
+    state.pending[id] = [...(state.pending[id] ?? []).filter((m) => m.id !== message.id), message]
     emitChange()
   })
 
