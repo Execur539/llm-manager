@@ -30,6 +30,19 @@ const EVENT_CHANNELS = [
   'agent:compacted',
   'agent:done',
   'agent:error',
+  // Ultra's attempts, for both surfaces. The renderer subscribes to every channel in this list
+  // at import time and throws on one it does not recognise, so a new event has to be added here
+  // before it can be listened for — the whole renderer fails to mount otherwise.
+  'chat:ultra-sample-start',
+  'chat:ultra-sample-delta',
+  'chat:ultra-sample-reasoning',
+  'chat:ultra-sample',
+  'chat:ultra-synthesis',
+  'agent:ultra-sample-start',
+  'agent:ultra-sample-delta',
+  'agent:ultra-sample-reasoning',
+  'agent:ultra-sample',
+  'agent:ultra-synthesis',
   'mcp:update',
   'rag:progress',
   'server:status',

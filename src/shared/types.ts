@@ -332,6 +332,27 @@ export interface AppSettings {
     hardBlocksDisabled: boolean
     remoteToolsEnabled: boolean
   }
+  /**
+   * The effort level above the model's own maximum.
+   *
+   * Everything here is spent per answer and sequentially — the runtime holds a single slot, so
+   * samples cannot overlap — which makes these the settings most able to turn a fast model into
+   * a slow one. They are surfaced next to the control that switches Ultra on, rather than buried
+   * in Settings, so the cost is visible at the moment it is chosen.
+   */
+  ultra: {
+    /** Independent attempts before the synthesis pass. */
+    samples: number
+    /**
+     * Thinking floor, as a multiple of what the model produced unprompted.
+     *
+     * A model that stops after 400 tokens of reasoning at 2.5x is pushed to roughly 1000 before
+     * it is allowed to answer.
+     */
+    thinkingFactor: number
+    /** Give up forcing after this many continuations, however short the thinking still is. */
+    maxContinuations: number
+  }
   server: {
     enabled: boolean
     port: number

@@ -1742,13 +1742,26 @@ const scenarios = {
         const kind = await page.getByTestId('reasoning-control').getAttribute('data-kind')
         report.check('reasoning', 'it is a slider, not a switch', kind === 'effort', String(kind))
 
-        // Stops are read from the template: low, medium, xhigh — plus an off position, because
-        // the same template honours enable_thinking.
+        /*
+         * The scale lives in a popover now; the row itself carries only the chosen level. Read
+         * the level off the trigger, which is always mounted, and open the panel to move it.
+         */
+        const level = async () => (await page.getByTestId('reasoning-trigger').textContent())?.trim()
+        const openEffort = async () => {
+          if ((await page.getByTestId('reasoning-pop').count()) === 0) {
+            await page.getByTestId('reasoning-trigger').click()
+            await page.waitForTimeout(140)
+          }
+        }
+
+        // Stops are read from the template: low, medium, xhigh — plus an off position, which is
+        // offered for every reasoning model whether or not the template has a switch of its own.
+        await openEffort()
         const range = page.getByTestId('reasoning-slider')
         const max = Number(await range.getAttribute('max'))
         report.check('reasoning', 'a stop per level, plus off', max === 3, `max=${max}`)
 
-        const initial = (await page.getByTestId('reasoning-value').textContent())?.trim()
+        const initial = await level()
         report.check('reasoning', "it starts on the template's own default", initial === 'Extra high', String(initial))
 
         // The level names must come from the model, not a built-in list.
@@ -1756,7 +1769,7 @@ const scenarios = {
         for (let i = 0; i <= max; i++) {
           await range.fill(String(i))
           await page.waitForTimeout(120)
-          names.push((await page.getByTestId('reasoning-value').textContent())?.trim())
+          names.push(await level())
         }
         report.check('reasoning', 'stops are ordered off -> weakest -> strongest',
           names.join(',') === 'Off,Low,Medium,Extra high', names.join(','))
@@ -1797,24 +1810,35 @@ const scenarios = {
           { timeout: 30000 }
         )
         body = (await page.getByTestId('chat-messages').textContent()) ?? ''
-        report.check('reasoning', 'off disables thinking on the wire',
-          /"reasoning_effort"\s*:\s*"none"/.test(body) && /enable_thinking[^,}]*false/.test(body),
-          body.slice(-260))
+        /*
+         * This fixture's template validates against ('xhigh','medium','low') and raises on
+         * anything else, while also honouring enable_thinking. Sending reasoning_effort 'none'
+         * to it does not turn thinking off — it fails the request. This assertion used to
+         * require exactly that, pinning the bug in place. Off is carried by llama.cpp's own
+         * budget instead, which needs no cooperation from the template.
+         */
+        report.check('reasoning', 'off ends thinking via the reasoning budget',
+          /"reasoning_budget"\s*:\s*0/.test(body), body.slice(-260))
+        report.check('reasoning', 'off also asks the template, for the ones that listen',
+          /enable_thinking[^,}]*false/.test(body), body.slice(-260))
+        report.check('reasoning', 'off sends no level this template would raise on',
+          !/"reasoning_effort"\s*:\s*"none"/.test(body), body.slice(-260))
 
         // The choice belongs to the conversation, not the app.
         await page.getByTestId('new-conversation').click()
         await page.waitForTimeout(500)
-        const fresh = (await page.getByTestId('reasoning-value').textContent())?.trim()
+        const fresh = await level()
         report.check('reasoning', 'a new conversation starts from the default again',
           fresh === 'Extra high', String(fresh))
 
         // And it survives leaving the view mid-session.
+        await openEffort()
         await page.getByTestId('reasoning-slider').fill('1')
         await page.waitForTimeout(150)
         await goTo(page, 'Dashboard')
         await goTo(page, 'Chat')
         await page.waitForTimeout(500)
-        const kept = (await page.getByTestId('reasoning-value').textContent())?.trim()
+        const kept = await level()
         report.check('reasoning', 'the choice survives navigating away', kept === 'Low', String(kept))
 
         await auditLayout(page, 'Chat (reasoning slider)', report)
@@ -2180,6 +2204,10 @@ const scenarios = {
         await page.getByTestId('new-conversation').click()
         await page.waitForTimeout(400)
 
+        // The scale is behind its trigger; open it before measuring anything.
+        await page.getByTestId('reasoning-trigger').click()
+        await page.waitForTimeout(160)
+
         const range = page.getByTestId('reasoning-slider')
         const max = Number(await range.getAttribute('max'))
 
@@ -2189,29 +2217,39 @@ const scenarios = {
 
           const m = await page.evaluate(() => {
             const input = document.querySelector('[data-testid="reasoning-slider"]')
-            const fill = document.querySelector('.slider-fill')
+            const slider = input.closest('.slider')
             const stops = [...document.querySelectorAll('.slider-stop')]
             const box = input.getBoundingClientRect()
 
-            // Where the browser actually puts the thumb centre.
+            /*
+             * The thumb size is read from the stylesheet rather than written down here.
+             *
+             * This assertion used to hardcode 13 — the value the CSS *declared* — while the
+             * thumb was sized content-box and really occupied 17. Both the test and the layout
+             * were wrong in the same direction, so a systematic 2px error passed a 2px
+             * tolerance for as long as it existed. Deriving it from --thumb means the check
+             * cannot quietly agree with a mistake in the CSS again.
+             */
+            const thumb = parseFloat(getComputedStyle(slider).getPropertyValue('--thumb'))
             const value = Number(input.value)
             const maxV = Number(input.max)
-            const thumb = 13
             const thumbCentre = box.left + thumb / 2 + ((box.width - thumb) * value) / (maxV || 1)
 
             return {
+              thumb,
               thumbCentre: Math.round(thumbCentre),
-              fillRight: Math.round(fill.getBoundingClientRect().right),
               stopCentres: stops.map((s) => Math.round(s.getBoundingClientRect().left + s.getBoundingClientRect().width / 2))
             }
           })
 
-          report.check('slider-geometry', `the fill ends at the thumb at position ${index}`,
-            Math.abs(m.fillRight - m.thumbCentre) <= 2, `fill ${m.fillRight}, thumb ${m.thumbCentre}`)
+          report.check('slider-geometry', `the thumb size is declared in the stylesheet at position ${index}`,
+            Number.isFinite(m.thumb) && m.thumb > 0, `--thumb resolved to ${m.thumb}`)
 
+          // One mark must sit exactly under the handle. Tolerance is a pixel of rounding, not
+          // the two that let the old drift through.
           const nearest = m.stopCentres.reduce((a, b) => (Math.abs(b - m.thumbCentre) < Math.abs(a - m.thumbCentre) ? b : a))
           report.check('slider-geometry', `a stop mark sits under the thumb at position ${index}`,
-            Math.abs(nearest - m.thumbCentre) <= 2, `stop ${nearest}, thumb ${m.thumbCentre}`)
+            Math.abs(nearest - m.thumbCentre) <= 1, `stop ${nearest}, thumb ${m.thumbCentre}`)
         }
       },
       { models: ['Reasoner-8B-Q4_K_M.gguf'], modelOpts: { reasoning: 'effort' } }

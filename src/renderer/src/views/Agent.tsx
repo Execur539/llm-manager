@@ -9,7 +9,9 @@ import {
   useStream,
   clearFor,
   clearNotice,
-  setReasoning
+  setReasoning,
+  adoptReasoning,
+  DRAFT_AGENT
 } from '../lib/store'
 import type { LoadedModel } from '../App'
 import ConversationList, { type ChatSummary } from '../components/ConversationList'
@@ -17,6 +19,7 @@ import Icon from '../components/Icon'
 import Markdown from '../components/Markdown'
 import MessageRow from '../components/MessageRow'
 import ThinkingBlock from '../components/ThinkingBlock'
+import UltraSamples from '../components/UltraSamples'
 import RailToggle from '../components/RailToggle'
 import ReasoningControl from '../components/ReasoningControl'
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
@@ -80,6 +83,31 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   const error = activeId ? stream.errors[activeId] : null
   const notice = activeId ? stream.notices[activeId] : null
   const liveToolCalls = activeId ? (stream.toolCalls[activeId] ?? []) : []
+  // The agent view restores no session on mount, so this is null far more often than in chat —
+  // which is what made the control look broken here first.
+  const effortId = activeId ?? DRAFT_AGENT
+  const ultra = activeId ? (stream.ultra[activeId] ?? []) : []
+  const synthesising = activeId ? !!stream.ultraSynthesising[activeId] : false
+
+  /*
+   * Ultra's attempt count, mirrored from settings.
+   *
+   * It is a setting rather than per-conversation state because it is a statement about this
+   * machine's patience, not about one question. Written back on change so the choice survives a
+   * restart, and read once on mount.
+   */
+  const [ultraSamples, setUltraSamplesState] = useState(3)
+
+  useEffect(() => {
+    void invoke<{ ultra?: { samples?: number } }>('settings:get')
+      .then((s) => setUltraSamplesState(s.ultra?.samples ?? 3))
+      .catch(() => undefined)
+  }, [])
+
+  const setUltraSamples = (next: number): void => {
+    setUltraSamplesState(next)
+    void invoke('settings:patch', { ultra: { samples: next } }).catch(() => undefined)
+  }
 
   const refreshSessions = async (): Promise<void> => {
     setSessions(await invoke<ChatSummary[]>('chat:list', 'agent'))
@@ -144,6 +172,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
     })
     await refreshSessions()
     setMessages([])
+    adoptReasoning(DRAFT_AGENT, s.id)
     select('agent', s.id)
   }
 
@@ -164,8 +193,12 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
       })
       sessionId = s.id
       setMessages([])
+      adoptReasoning(DRAFT_AGENT, sessionId)
       select('agent', sessionId)
     }
+
+    // As in chat: `stream` predates the adopt, so the draft key is where the choice still is.
+    const effort = stream.reasoning[effortId] ?? null
 
     const text = input
     setInput('')
@@ -174,7 +207,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
     try {
       const files = attachments.items.map((a) => a.path)
       attachments.clear()
-      await invoke('agent:run', sessionId, text, stream.reasoning[sessionId] ?? null, files)
+      await invoke('agent:run', sessionId, text, effort, files)
     } finally {
       setRunning(sessionId, false)
       await refreshSessions()
@@ -313,15 +346,17 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             <ToolCard key={entry.call.id} call={entry.call} result={entry.result} />
           ))}
 
-          {(partial || reasoning) && (
+          {(partial || reasoning || ultra.length > 0) && (
             <MessageRow role="assistant" testId="streaming-message">
+              {/* Plans, while they are being weighed — above whatever the run then does. */}
+              <UltraSamples samples={ultra} synthesising={synthesising} />
               {reasoning && <ThinkingBlock text={reasoning} streaming answerStarted={!!partial} />}
               <div className="body streaming">
                 <Markdown source={partial} caret />
               </div>
             </MessageRow>
           )}
-          {running && !partial && !reasoning && !unsavedCalls.length && (
+          {running && !partial && !reasoning && !unsavedCalls.length && !ultra.length && (
             <MessageRow role="assistant">
               <div className="thinking">
                 <span className="dot" />
@@ -360,25 +395,28 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
               rows={1}
               data-testid="agent-input"
             />
+            {/* Same treatment as chat: the button stops the turn it started. */}
             <button
-              className="send-button"
-              onClick={() => void send()}
-              disabled={!loaded || running || (!input.trim() && !attachments.items.length)}
-              title={running ? 'The agent is working' : 'Send  (Enter)'}
-              aria-label="Send"
+              className={`send-button${running ? ' stopping' : ''}`}
+              onClick={() => (running ? void invoke('agent:stop') : void send())}
+              disabled={!loaded || (!running && !input.trim() && !attachments.items.length)}
+              title={running ? 'Stop the agent' : 'Send  (Enter)'}
+              aria-label={running ? 'Stop' : 'Send'}
               data-testid="agent-send"
             >
-              <Icon name="send" size={15} />
+              <Icon name={running ? 'stop' : 'send'} size={15} />
             </button>
           </div>
           <div className="composer-meta">
+            <div className="composer-hint">Enter to send · Shift+Enter for a newline</div>
             <ReasoningControl
               support={loaded?.caps?.reasoning}
-              value={activeId ? (stream.reasoning[activeId] ?? null) : null}
-              onChange={(next) => activeId && setReasoning(activeId, next)}
+              value={stream.reasoning[effortId] ?? null}
+              onChange={(next) => setReasoning(effortId, next)}
               disabled={running}
+              samples={ultraSamples}
+              onSamplesChange={setUltraSamples}
             />
-            <div className="composer-hint">Enter to send · Shift+Enter for a newline</div>
           </div>
         </div>
       </div>

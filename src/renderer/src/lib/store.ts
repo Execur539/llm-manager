@@ -14,6 +14,19 @@ import { useSyncExternalStore } from 'react'
 import type { AgentMessage, PermissionRequest, ToolCall, ToolResult } from '@shared/types'
 import { on } from './api'
 
+/** One of Ultra's independent attempts, as it appears in the transcript. */
+export interface UltraSampleView {
+  index: number
+  /** Grows while this sample is the one running. */
+  answer: string
+  reasoning: string
+  /** Set once the sample is final; a sample still streaming has no summary yet. */
+  done: boolean
+  continuations?: number
+  temperature?: number
+  ms?: number
+}
+
 export interface StreamState {
   /** partial assistant text, keyed by chat/session id */
   partial: Record<string, string>
@@ -36,6 +49,16 @@ export interface StreamState {
   permissionQueue: PermissionRequest[]
   /** tool calls seen this turn, so a remount can still render them in order */
   toolCalls: Record<string, { call: ToolCall; result?: ToolResult }[]>
+  /**
+   * Ultra's independent attempts for the turn in flight, keyed by conversation.
+   *
+   * Held apart from `partial` on purpose: these are drafts, and the place the real answer will
+   * appear must not fill up with text that is about to be replaced. They render as their own
+   * collapsed boxes above the answer, and clear when the turn ends.
+   */
+  ultra: Record<string, UltraSampleView[]>
+  /** true once sampling is done and the synthesised answer is being written */
+  ultraSynthesising: Record<string, boolean>
   /**
    * Which conversation each view has open.
    *
@@ -114,6 +137,8 @@ const state: StreamState = {
   notices: {},
   permissionQueue: [],
   toolCalls: {},
+  ultra: {},
+  ultraSynthesising: {},
   selection: loadSelection(),
   toasts: [],
   railOpen: false,
@@ -138,6 +163,8 @@ function emitChange(): void {
     notices: { ...state.notices },
     permissionQueue: [...state.permissionQueue],
     toolCalls: { ...state.toolCalls },
+    ultra: { ...state.ultra },
+    ultraSynthesising: { ...state.ultraSynthesising },
     selection: { ...state.selection },
     toasts: [...state.toasts],
     railOpen: state.railOpen,
@@ -163,6 +190,12 @@ export function setRunning(id: string, running: boolean): void {
     state.errors[id] = null
     state.partial[id] = ''
     state.toolCalls[id] = []
+    state.ultra[id] = []
+    state.ultraSynthesising[id] = false
+  } else {
+    // The samples were scaffolding for an answer that now exists on its own.
+    delete state.ultra[id]
+    delete state.ultraSynthesising[id]
   }
   emitChange()
 }
@@ -188,6 +221,8 @@ export function clearFor(id: string): void {
   delete state.errors[id]
   delete state.notices[id]
   delete state.toolCalls[id]
+  delete state.ultra[id]
+  delete state.ultraSynthesising[id]
   delete state.reasoning[id]
   emitChange()
 }
@@ -200,6 +235,26 @@ export function dismissPermission(requestId: string): void {
 export function setReasoning(id: string, choice: string | null): void {
   if (choice === null) delete state.reasoning[id]
   else state.reasoning[id] = choice
+  emitChange()
+}
+
+/**
+ * Where the effort choice lives before there is a conversation to attach it to.
+ *
+ * The control sits in the composer, which is usable from the moment the view opens — but the
+ * choice is keyed by conversation, and a conversation does not exist until the first message is
+ * sent. Without somewhere to put it, the setting was written against `null` and dropped: in the
+ * agent view, which never restores a session on mount, that made the slider appear broken, and
+ * in chat it silently discarded whatever was chosen before the opening message.
+ */
+export const DRAFT_CHAT = 'draft:chat'
+export const DRAFT_AGENT = 'draft:agent'
+
+/** Carry the draft choice onto the conversation that has just been created for it. */
+export function adoptReasoning(fromId: string, toId: string): void {
+  const choice = state.reasoning[fromId]
+  if (choice === undefined) return
+  state.reasoning[toId] = choice
   emitChange()
 }
 
@@ -298,6 +353,106 @@ function wire(): void {
     // The finished message carries its own reasoning; the streamed copy has served its purpose.
     state.reasoningPartial[id] = ''
     state.pending[id] = [...(state.pending[id] ?? []), d.message]
+    emitChange()
+  })
+
+  // ---- Ultra
+  //
+  // Samples accumulate against the conversation and are wiped when the turn's real answer
+  // arrives: they are working, not transcript, and persisting them would mean every reopened
+  // conversation carried three discarded drafts above each answer.
+
+  const sampleAt = (id: string, index: number): UltraSampleView => {
+    const list = (state.ultra[id] ??= [])
+    let sample = list.find((s) => s.index === index)
+    if (!sample) {
+      sample = { index, answer: '', reasoning: '', done: false }
+      list.push(sample)
+      list.sort((a, b) => a.index - b.index)
+    }
+    return sample
+  }
+
+  on<{ chatId: string; index: number; total: number }>('chat:ultra-sample-start', (d) => {
+    const id = d.chatId || activeId
+    // A fresh run starts from nothing, so a retry does not stack onto the previous attempt.
+    if (d.index === 0) state.ultra[id] = []
+    state.ultraSynthesising[id] = false
+    sampleAt(id, d.index)
+    emitChange()
+  })
+
+  on<{ chatId: string; index: number; text: string }>('chat:ultra-sample-delta', (d) => {
+    sampleAt(d.chatId || activeId, d.index).answer += d.text
+    emitChange()
+  })
+
+  on<{ chatId: string; index: number; text: string }>('chat:ultra-sample-reasoning', (d) => {
+    sampleAt(d.chatId || activeId, d.index).reasoning += d.text
+    emitChange()
+  })
+
+  on<{
+    chatId: string
+    sample: { index: number; answer: string; reasoning: string; continuations: number; temperature: number; ms: number }
+  }>('chat:ultra-sample', (d) => {
+    const id = d.chatId || activeId
+    const sample = sampleAt(id, d.sample.index)
+    // Take the finished text over the accumulated stream: a forced continuation can replace the
+    // answer wholesale, and the deltas alone would show both attempts run together.
+    sample.answer = d.sample.answer
+    sample.reasoning = d.sample.reasoning
+    sample.continuations = d.sample.continuations
+    sample.temperature = d.sample.temperature
+    sample.ms = d.sample.ms
+    sample.done = true
+    emitChange()
+  })
+
+  on<{ chatId: string }>('chat:ultra-synthesis', (d) => {
+    state.ultraSynthesising[d.chatId || activeId] = true
+    emitChange()
+  })
+
+  /*
+   * The agent emits the same shapes under its own channels, keyed by session instead of chat.
+   * Same state, same rendering — an Ultra attempt looks the same whether it was an answer or a
+   * plan, and the store has no reason to tell them apart.
+   */
+  on<{ sessionId: string; index: number; total: number }>('agent:ultra-sample-start', (d) => {
+    const id = d.sessionId || activeId
+    if (d.index === 0) state.ultra[id] = []
+    state.ultraSynthesising[id] = false
+    sampleAt(id, d.index)
+    emitChange()
+  })
+
+  on<{ sessionId: string; index: number; text: string }>('agent:ultra-sample-delta', (d) => {
+    sampleAt(d.sessionId || activeId, d.index).answer += d.text
+    emitChange()
+  })
+
+  on<{ sessionId: string; index: number; text: string }>('agent:ultra-sample-reasoning', (d) => {
+    sampleAt(d.sessionId || activeId, d.index).reasoning += d.text
+    emitChange()
+  })
+
+  on<{
+    sessionId: string
+    sample: { index: number; answer: string; reasoning: string; continuations: number; temperature: number; ms: number }
+  }>('agent:ultra-sample', (d) => {
+    const sample = sampleAt(d.sessionId || activeId, d.sample.index)
+    sample.answer = d.sample.answer
+    sample.reasoning = d.sample.reasoning || sample.reasoning
+    sample.continuations = d.sample.continuations
+    sample.temperature = d.sample.temperature
+    sample.ms = d.sample.ms
+    sample.done = true
+    emitChange()
+  })
+
+  on<{ sessionId: string }>('agent:ultra-synthesis', (d) => {
+    state.ultraSynthesising[d.sessionId || activeId] = true
     emitChange()
   })
 

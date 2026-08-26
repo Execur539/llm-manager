@@ -768,6 +768,122 @@ process.env.LLMM_APPDATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-tes
   fresh.close()
 }
 
+// ---------------------------------------------------------------- ultra
+
+/*
+ * Ultra is mostly orchestration, but two pure pieces decide whether it is worth its cost: the
+ * spread of temperatures that makes the samples differ, and the synthesis prompt that has to
+ * turn several answers into one without averaging a right answer with a wrong one.
+ */
+section('Ultra')
+{
+  const { sampleTemperatures, synthesisMessages, looksDegenerate } = await import('./built/ultra.js')
+
+  const three = sampleTemperatures(3)
+  check('a sample per attempt', three.length === 3, three.join(','))
+  check('temperatures rise across the run', three[0] < three[1] && three[1] < three[2], three.join(','))
+  check('the first attempt is the least adventurous', three[0] <= 0.5, String(three[0]))
+  check('none of them are incoherent', three.every((t) => t <= 1), three.join(','))
+  check('a single sample still gets a usable temperature', sampleTemperatures(1).length === 1)
+  // Identical samples would make best-of-N an expensive way to ask the same thing N times.
+  check('two samples still differ from each other', new Set(sampleTemperatures(2)).size === 2)
+  check('eight samples are all distinct', new Set(sampleTemperatures(8)).size === 8)
+
+  const original = [{ role: 'user', content: 'what is 2+2?' }]
+  const samples = [
+    { index: 0, answer: 'four', reasoning: 'x'.repeat(9000), continuations: 2, temperature: 0.45, ms: 10 },
+    { index: 1, answer: 'five', reasoning: 'y'.repeat(9000), continuations: 1, temperature: 0.95, ms: 12 }
+  ]
+  const msgs = synthesisMessages(original, samples)
+
+  check('the original turn is preserved', msgs[0].content === 'what is 2+2?')
+  check('one instruction is appended', msgs.length === original.length + 1)
+
+  const prompt = msgs.at(-1).content
+  check('every candidate is offered', prompt.includes('four') && prompt.includes('five'))
+  /*
+   * The reasoning must not come along. A forced sample thinks for thousands of tokens, and
+   * passing that back for each candidate would exhaust the window before the pass that has to
+   * read them could start.
+   */
+  check('reasoning is left out of the prompt', !prompt.includes('x'.repeat(50)) && !prompt.includes('y'.repeat(50)),
+    `${prompt.length} chars`)
+  check('it is told to choose rather than blend', /decide which is correct|blend/i.test(prompt))
+  check('it is told not to narrate the process', /do not mention/i.test(prompt))
+
+  /*
+   * Degeneration detection, against the real thing.
+   *
+   * Forced to keep thinking about "Idk", the model produced this: sentence after sentence
+   * announcing a check, on a question containing no algebra at all. Every line differs, so
+   * comparing lines finds nothing — what gives it away is that they all open the same way.
+   */
+  const vamping = [
+    'Let me verify the coset',
+    'Let me reconsider the homomorphism',
+    'Let me check the kernel',
+    'Let me verify the image',
+    'Let me reconsider the exact sequence',
+    'Let me check the extension',
+    'Let me verify the splitting',
+    'Let me reconsider the quotient',
+    'Let me check the injection'
+  ].join('. ')
+  check('a forced loop is recognised', looksDegenerate(vamping))
+
+  // Real reasoning must survive the same test, or forcing is disabled by its own safety net.
+  const genuine = [
+    'The user is asking about the config key rename',
+    'There are three call sites in the loader',
+    'The second one reads from an env var, so it needs care',
+    'I should grep before editing anything',
+    'Renaming without checking the tests would break the suite',
+    'Let me look at how the default is applied',
+    'The migration also references the old name',
+    'That means two changes, not one',
+    'I will start with the grep'
+  ].join('. ')
+  check('methodical reasoning is not mistaken for a loop', !looksDegenerate(genuine))
+
+  check('a short passage is never judged', !looksDegenerate('Let me check. Let me verify. Let me see.'))
+  check('empty text is not degenerate', !looksDegenerate(''))
+
+  const empty = synthesisMessages(original, [{ index: 0, answer: '   ', reasoning: '', continuations: 0, temperature: 0.6, ms: 1 }])
+  check('an empty answer is labelled, not dropped silently',
+    empty.at(-1).content.includes('no answer produced'))
+}
+
+/*
+ * The agent's variant answers a different question: these candidates are courses of action, and
+ * the output has to be one coherent sequence rather than a merge. A plan assembled from parts of
+ * several is one nobody checked end to end.
+ */
+section('Ultra: agent plans')
+{
+  const { planSynthesisMessages, planPreamble } = await import('./built/ultra.js')
+
+  const msgs = planSynthesisMessages('rename the config key', ['1. grep for it, 2. edit', '1. edit blindly'])
+  check('the plan prompt is a single turn', msgs.length === 1 && msgs[0].role === 'user')
+
+  const p = msgs[0].content
+  check('the task is restated', p.includes('rename the config key'))
+  check('every plan is offered', p.includes('grep for it') && p.includes('edit blindly'))
+  check('it is told to pick a base rather than interleave', /interleaving|soundest/i.test(p))
+  check('it is told to answer with the plan alone', /no preamble/i.test(p))
+
+  const blank = planSynthesisMessages('task', ['', '   '])
+  check('an empty plan is labelled', blank[0].content.includes('no plan produced'))
+
+  /*
+   * The preamble has to say the plan is provisional. It was written before any of the work was
+   * done, so an agent that follows it past a contradicting tool result is following a guess.
+   */
+  const pre = planPreamble('  1. do the thing  ')
+  check('the plan survives into the preamble', pre.includes('1. do the thing'))
+  check('the preamble is trimmed', !pre.endsWith(' '))
+  check('the run is told the tool result wins', /trust the tool result/i.test(pre))
+}
+
 // ---------------------------------------------------------------- markdown
 
 // Lives in its own module: the grammar has enough cases to be worth grouping.

@@ -28,7 +28,7 @@ import type {
   ToolDefinition,
   ToolResult
 } from '@shared/types'
-import { llama, estimateTokens, type ChatMessage } from '../runtime/llama'
+import { llama, estimateTokens, type ChatMessage, type ContentPart } from '../runtime/llama'
 import { reasoningRequestFields, type ReasoningChoice } from '../models/reasoning'
 import { PermissionEngine, type PermissionRule } from './permissions'
 import { ToolRegistry, makeResult, type Tool, type ToolContext } from './tools/base'
@@ -83,6 +83,13 @@ PLAN MODE IS ACTIVE. You may only use read-class tools (reading, listing, search
 Investigate first, then present a concise written plan for the user to approve. Do not attempt
 to write files or run commands until plan mode is turned off.`
 
+/** Where a planning sample's output goes while it is standing in for the real run. */
+export interface PlanHooks {
+  onDelta?: (text: string) => void
+  onReasoning?: (text: string) => void
+  onToolCall?: (call: ToolCall) => void
+}
+
 export class Agent extends EventEmitter {
   private registry = new ToolRegistry()
   private permissions: PermissionEngine
@@ -90,6 +97,34 @@ export class Agent extends EventEmitter {
   /** Rolling conversation sent to the model, distinct from the persisted session history. */
   private history: ChatMessage[] = []
   private depth: number
+  /**
+   * Set while a planning sample is running.
+   *
+   * A sample is not the turn — it is one of several guesses at how the turn should go, and the
+   * transcript must not fill with all of them. While this is set, events are diverted to the
+   * caller's hooks instead of reaching the listeners the bridge attached.
+   */
+  private sampling: PlanHooks | null = null
+  /** Per-sample temperature; null uses the loop's own. */
+  private samplingTemperature: number | null = null
+
+  /**
+   * Events go to the caller's hooks while a planning sample runs, and nowhere else.
+   *
+   * Overriding emit rather than threading a flag through every call site is deliberate: there
+   * are a dozen emit points in the loop, and one of them forgetting to check would put a
+   * discarded draft into the user's transcript.
+   */
+  override emit(event: string | symbol, ...args: unknown[]): boolean {
+    if (this.sampling) {
+      if (event === 'delta') this.sampling.onDelta?.(String(args[0]))
+      else if (event === 'reasoning') this.sampling.onReasoning?.(String(args[0]))
+      else if (event === 'toolCall') this.sampling.onToolCall?.(args[0] as ToolCall)
+      // Everything else — message, done, compacted — belongs to a real turn, not a guess at one.
+      return true
+    }
+    return super.emit(event, ...args)
+  }
 
   constructor(
     private opts: AgentOptions,
@@ -263,8 +298,22 @@ Platform: Windows (PowerShell)${memoryBlock}`
     if (!loaded) return
 
     const budget = Math.floor(loaded.plan.contextLength * 0.75)
-    const cost = (m: ChatMessage): number =>
-      estimateTokens(typeof m.content === 'string' ? m.content : JSON.stringify(m.content))
+    /*
+     * Media is charged a flat rate, not measured as text.
+     *
+     * An image arrives as a base64 data URL, so serialising the parts and counting characters
+     * values a single photo at hundreds of thousands of tokens — enough to blow the budget on
+     * the spot and compact a conversation that had barely started. What the model actually
+     * spends is the projector's patch count, which is on the order of a thousand.
+     */
+    const MEDIA_TOKENS = 1200
+    const cost = (m: ChatMessage): number => {
+      if (typeof m.content === 'string') return estimateTokens(m.content)
+      return m.content.reduce(
+        (a, part) => a + (part.type === 'text' ? estimateTokens(part.text ?? '') : MEDIA_TOKENS),
+        0
+      )
+    }
     let total = this.history.reduce((a, m) => a + cost(m), 0)
     if (total <= budget) return
 
@@ -348,6 +397,55 @@ Platform: Windows (PowerShell)${memoryBlock}`
     this.opts.compaction = saved
   }
 
+  /**
+   * Run the turn as planning only, and return the plan.
+   *
+   * Ultra's samples in the agent are not attempts at the work — they are attempts at deciding
+   * how to do the work. Read tools run for real, because a plan made without looking at the
+   * files is worthless; nothing that writes or executes is even offered, which is what makes it
+   * safe to run several times. The winning plan is then handed to one ordinary run that does
+   * the work once, with live tool results.
+   *
+   * The alternative — letting a sample write, stubbing the result, and replaying the calls
+   * afterwards — was rejected deliberately: every step after a stubbed write is planned against
+   * a result that never happened, so the replay acts on assumptions that were never true.
+   *
+   * The session is not touched. A scratch copy absorbs the sample's messages, the rolling
+   * history is rebuilt afterwards, and events are diverted to the hooks.
+   */
+  async planOnce(
+    session: AgentSessionState,
+    input: string,
+    media: ContentPart[],
+    temperature: number,
+    hooks: PlanHooks = {}
+  ): Promise<string> {
+    const wasPlanMode = this.opts.planMode
+    const savedHistory = this.history
+
+    this.opts = { ...this.opts, planMode: true }
+    this.sampling = hooks
+    this.samplingTemperature = temperature
+    // Force a rebuild: this sample starts from the session as it stands, not from whatever the
+    // previous sample left in the rolling window.
+    this.history = []
+
+    const scratch: AgentSessionState = { ...session, messages: [...session.messages] }
+
+    try {
+      await this.run(scratch, input, media)
+      const answered = [...scratch.messages]
+        .reverse()
+        .find((m) => m.role === 'assistant' && m.content.trim())
+      return answered?.content.trim() ?? ''
+    } finally {
+      this.opts = { ...this.opts, planMode: wasPlanMode }
+      this.sampling = null
+      this.samplingTemperature = null
+      this.history = savedHistory
+    }
+  }
+
   /** Seed the rolling history from a persisted session (used on resume). */
   hydrate(session: AgentSessionState): void {
     this.history = [
@@ -363,8 +461,16 @@ Platform: Windows (PowerShell)${memoryBlock}`
     ]
   }
 
-  /** Run one user turn to completion. */
-  async run(session: AgentSessionState, userInput: string): Promise<void> {
+  /**
+   * Run one user turn to completion.
+   *
+   * `media` carries image and audio parts for a turn that has attachments on a model that can
+   * take them. They go to the model but not into the transcript: the parts hold base64 payloads
+   * megabytes wide, and the persisted message keeps the readable text instead. The consequence
+   * is that media lives for the life of the running session — resuming a session after a restart
+   * rebuilds the history from stored text, so the file is named but no longer shown.
+   */
+  async run(session: AgentSessionState, userInput: string, media: ContentPart[] = []): Promise<void> {
     this.abort = new AbortController()
     const signal = this.abort.signal
     // A fresh turn re-opens decisions the user made in the previous one.
@@ -373,7 +479,11 @@ Platform: Windows (PowerShell)${memoryBlock}`
     if (!this.history.length) this.hydrate(session)
     else this.history[0] = { role: 'system', content: this.buildSystemPrompt() }
 
-    this.history.push({ role: 'user', content: userInput })
+    this.history.push(
+      media.length
+        ? { role: 'user', content: [...media, { type: 'text', text: userInput }] }
+        : { role: 'user', content: userInput }
+    )
 
     const userMsg: AgentMessage = {
       id: crypto.randomBytes(6).toString('hex'),
@@ -402,7 +512,7 @@ Platform: Windows (PowerShell)${memoryBlock}`
           messages: this.history,
           tools: this.availableTools(),
           signal,
-          temperature: 0.6,
+          temperature: this.samplingTemperature ?? 0.6,
           ...reasoningRequestFields(llama.loaded?.model.caps.reasoning, this.opts.reasoningChoice ?? null)
         })) {
           if (ev.type === 'reasoning') {

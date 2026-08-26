@@ -28,6 +28,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
     hardBlocksDisabled: false,
     remoteToolsEnabled: false
   },
+  ultra: {
+    // Three is the smallest count where a majority can form and the synthesis pass has
+    // something to compare rather than merely arbitrate.
+    samples: 3,
+    thinkingFactor: 2.5,
+    maxContinuations: 4
+  },
   server: {
     enabled: false,
     port: 1234,

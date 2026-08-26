@@ -97,7 +97,32 @@ function order(levels: Iterable<string>): string[] {
 }
 
 /** What the user chose. `null` means "leave the template's own default alone". */
-export type ReasoningChoice = string | 'off' | null
+export type ReasoningChoice = string | 'off' | typeof ULTRA | null
+
+/**
+ * The level above the model's own maximum.
+ *
+ * Not a level the template knows — no template has one — so it never reaches the model as an
+ * effort value. It is a runtime mode, implemented in main/ultra: the request itself goes out at
+ * the model's strongest native level, and the extra effort comes from what surrounds it.
+ */
+export const ULTRA = 'ultra' as const
+
+/** Is this choice the synthetic level rather than one the model named? */
+export function isUltra(choice: ReasoningChoice): boolean {
+  return choice === ULTRA
+}
+
+/**
+ * The strongest level the template actually accepts.
+ *
+ * Ultra runs on top of this: forcing a model to think longer is worth more when it is already
+ * thinking as hard as it knows how.
+ */
+export function strongestLevel(support: ReasoningSupport | undefined | null): string | null {
+  if (!support || support.kind !== 'effort') return null
+  return support.levels.at(-1) ?? null
+}
 
 /**
  * Turn a choice into request fields, given what the model actually supports.
@@ -135,6 +160,18 @@ export function reasoningRequestFields(
       chatTemplateKwargs: { enable_thinking: false },
       ...(support.offValue ? { reasoningEffort: support.offValue } : {})
     }
+  }
+
+  /*
+   * Ultra is not a value any template accepts, so it is never sent as one. The request goes out
+   * at the model's strongest native level and the extra effort is applied around it — see
+   * main/ultra. Sending the literal 'ultra' would raise on any template that validates its
+   * levels, which is the same trap that 'none' used to fall into.
+   */
+  if (choice === ULTRA) {
+    if (support.kind === 'toggle') return { chatTemplateKwargs: { enable_thinking: true } }
+    const strongest = strongestLevel(support)
+    return strongest ? { reasoningEffort: strongest } : {}
   }
 
   if (support.kind === 'toggle') {

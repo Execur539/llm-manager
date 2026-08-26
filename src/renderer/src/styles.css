@@ -1,37 +1,59 @@
-/* LM Studio-like: dark, dense, developer-focused. */
+/* Dark, dense, developer-focused — on a warm neutral ground rather than a blue one. */
 
 :root {
   /* ---- surfaces ------------------------------------------------------------
    * Four levels, each a real step in luminance so stacked panels read as depth
    * rather than as one flat field with hairlines drawn on it.
+   *
+   * Neutral-warm, not blue. The greys here used to carry a blue cast (#0e1014,
+   * #14171e), which reads as cold and slightly clinical and fights anything warm
+   * placed on it. These are near-neutral with a trace of warmth, so the accent is
+   * the only real colour on screen.
    */
-  --bg: #0e1014;
-  --surface-1: #14171e; /* cards, raised panels */
-  --surface-2: #1a1e26; /* hover, controls */
-  --surface-3: #222732; /* active/pressed */
+  --bg: #1f1e1d;
+  --surface-1: #262624; /* cards, raised panels */
+  --surface-2: #302f2c; /* hover, controls */
+  --surface-3: #3a3835; /* active/pressed */
   --bg-raised: var(--surface-1);
-  --bg-inset: #0a0c10; /* wells: inputs, code, meters */
+  --bg-inset: #191817; /* wells: inputs, code, meters */
 
   /* ---- lines ---------------------------------------------------------------
    * A subtle line for structure and a stronger one for emphasis. The subtle one
    * is deliberately low-contrast: at this density, crisp borders everywhere make
    * the UI look like a wireframe.
    */
-  --border: #232833;
-  --border-strong: #323945;
+  --border: #35332f;
+  --border-strong: #494640;
 
-  --text: #e7eaf0;
-  --text-dim: #9aa3b5;
-  --text-faint: #6d7689;
+  --text: #f0eee7;
+  --text-dim: #a8a49a;
+  --text-faint: #7e7a72;
 
-  --accent: #6aa5ff;
-  --accent-hover: #82b4ff;
-  --accent-dim: #2f4d80;
-  --accent-wash: rgba(106, 165, 255, 0.12);
+  /* ---- accent --------------------------------------------------------------
+   * Coral, and the only saturated colour in the interface.
+   *
+   * It sits near --warn on the hue wheel, which is a real hazard: an accent that
+   * looks like a warning makes every selected item read as a caution. --warn is
+   * pushed yellow and --bad red to keep all three tellable apart at a glance.
+   */
+  --accent: #d97757;
+  --accent-hover: #e68e6f;
+  --accent-dim: #8a4a34;
+  --accent-wash: rgba(217, 119, 87, 0.14);
 
-  --good: #4ade80;
-  --warn: #fbbf24;
-  --bad: #f87171;
+  /*
+   * Ink for anything sitting *on* a filled accent surface — button labels, the
+   * switch knob, a spinner inside a primary button. Was written as the page
+   * background's own hex in four places, which quietly meant "dark blue" and
+   * would now mean the wrong dark entirely.
+   */
+  --on-accent: #221a15;
+  /* Dimming layer for drop targets and modal grounds. */
+  --scrim: rgba(20, 19, 18, 0.72);
+
+  --good: #7dc98f;
+  --warn: #e8b84b;
+  --bad: #e5766c;
 
   /* ---- shape ---------------------------------------------------------------
    * One radius scale. Controls and cards previously mixed 5px, 6px, 8px and 10px
@@ -129,7 +151,7 @@ body {
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #3d4552;
+  background: var(--border-strong);
   background-clip: content-box;
 }
 
@@ -181,10 +203,10 @@ body {
   height: 24px;
   flex-shrink: 0;
   border-radius: var(--r-sm);
-  color: #0e1014;
+  color: var(--on-accent);
   /* The one saturated element in the chrome: it anchors the eye at the top-left. */
-  background: linear-gradient(150deg, #8ab8ff, var(--accent));
-  box-shadow: 0 1px 6px rgba(106, 165, 255, 0.35);
+  background: linear-gradient(150deg, var(--accent-hover), var(--accent));
+  box-shadow: 0 1px 6px rgba(217, 119, 87, 0.35);
 }
 
 .brand-name {
@@ -284,17 +306,17 @@ body {
   height: 6px;
   border-radius: 50%;
   background: var(--good);
-  box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.5);
+  box-shadow: 0 0 0 0 rgba(125, 201, 143, 0.5);
   animation: pulse 2.4s ease-out infinite;
 }
 
 @keyframes pulse {
   0% {
-    box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.45);
+    box-shadow: 0 0 0 0 rgba(125, 201, 143, 0.45);
   }
   70%,
   100% {
-    box-shadow: 0 0 0 6px rgba(74, 222, 128, 0);
+    box-shadow: 0 0 0 6px rgba(125, 201, 143, 0);
   }
 }
 
@@ -568,7 +590,7 @@ button:disabled {
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #0e1014;
+  color: var(--on-accent);
   font-weight: 600;
 }
 
@@ -584,7 +606,7 @@ button.danger {
 
 button.danger:hover:not(:disabled) {
   border-color: var(--bad);
-  background: rgba(248, 113, 113, 0.12);
+  background: rgba(229, 118, 108, 0.12);
   color: #ffd4d4;
 }
 
@@ -611,17 +633,17 @@ button:disabled {
 .badge.good {
   color: var(--good);
   border-color: #1f4a33;
-  background: rgba(74, 222, 128, 0.08);
+  background: rgba(125, 201, 143, 0.08);
 }
 .badge.warn {
   color: var(--warn);
   border-color: #5a4515;
-  background: rgba(251, 191, 36, 0.08);
+  background: rgba(232, 184, 75, 0.08);
 }
 .badge.bad {
   color: var(--bad);
   border-color: #5c2626;
-  background: rgba(248, 113, 113, 0.08);
+  background: rgba(229, 118, 108, 0.08);
 }
 
 .meter {
@@ -916,13 +938,30 @@ pre {
   border: none;
   border-radius: var(--r-md);
   background: var(--accent);
-  color: #0e1014;
+  color: var(--on-accent);
   cursor: pointer;
   transition: background-color 120ms ease, opacity 120ms ease, transform 90ms ease;
 }
 
 .send-button:hover:not(:disabled) {
   background: var(--accent-hover);
+}
+
+/*
+ * Stopping is not the accent action.
+ *
+ * Keeping it in accent would leave the button looking identical while its meaning inverted —
+ * the same colour in the same place doing the opposite thing. Neutral until hovered, where it
+ * turns the colour of the thing it is about to do.
+ */
+.send-button.stopping {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.send-button.stopping:hover:not(:disabled) {
+  background: var(--bad);
+  color: var(--on-accent);
 }
 
 .send-button:active:not(:disabled) {
@@ -1031,7 +1070,7 @@ select:disabled {
   position: fixed;
   inset: 0;
   /* A blur behind the dialog separates it from the page without hiding the context. */
-  background: rgba(6, 8, 11, 0.62);
+  background: rgba(20, 19, 18, 0.62);
   backdrop-filter: blur(2px);
   display: flex;
   align-items: center;
@@ -1156,7 +1195,7 @@ button.link:active:not(:disabled) {
 }
 
 .side-item.active {
-  background: rgba(91, 157, 255, 0.1);
+  background: var(--accent-wash);
   border-color: var(--accent-dim);
 }
 
@@ -1182,7 +1221,7 @@ button.link:active:not(:disabled) {
 
 .model-card.selected {
   border-color: var(--accent-dim);
-  background: #171b24;
+  background: var(--surface-2);
 }
 
 .truncate {
@@ -1317,7 +1356,7 @@ th {
 
 td {
   padding: 5px 10px 5px 0;
-  border-bottom: 1px solid rgba(38, 43, 54, 0.5);
+  border-bottom: 1px solid var(--border);
 }
 
 .cursor {
@@ -1866,7 +1905,7 @@ button.danger.subtle {
 
 button.danger.subtle:hover {
   border-color: #5c2626;
-  background: rgba(248, 113, 113, 0.08);
+  background: rgba(229, 118, 108, 0.08);
   color: var(--bad);
 }
 
@@ -2123,7 +2162,7 @@ button.danger.subtle:hover {
   position: fixed;
   inset: 0;
   z-index: 30;
-  background: rgba(6, 8, 11, 0.55);
+  background: rgba(20, 19, 18, 0.55);
   opacity: 0;
   pointer-events: none;
   transition: opacity 180ms ease;
@@ -2317,14 +2356,94 @@ button.danger.subtle:hover {
 
 /* ---------------------------------------------------------------- reasoning control */
 
+/*
+ * In the composer row the control is just the level's name. The scale itself lives in a panel
+ * that opens above it: stacked, with what the two ends of the axis buy you named directly.
+ * "Effort [====O] Extra high" says which setting is on but not what moving it does; "Faster"
+ * and "Smarter" answer that without a tooltip.
+ */
 .reasoning {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 10px;
   flex-shrink: 0;
-  font-size: 11.5px;
+  font-size: 11px;
   color: var(--text-faint);
   user-select: none;
+}
+
+.reasoning[data-kind='toggle'] {
+  gap: 10px;
+}
+
+/* The collapsed state: the chosen level, sitting in the row like a piece of its small print. */
+.reasoning-trigger {
+  min-height: 0;
+  padding: 2px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.reasoning-trigger:hover:not(:disabled),
+.reasoning-trigger.open {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.reasoning-trigger:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/*
+ * Anchored to the right edge and opening upward: the control lives at the bottom of the window,
+ * so downward has nowhere to go, and it is the rightmost thing in its row.
+ */
+.reasoning-pop {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 232px;
+  padding: 11px 13px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface-1);
+  box-shadow: var(--shadow-md);
+  cursor: default;
+}
+
+/*
+ * Two lines are always reserved, whether or not this level's description needs both.
+ *
+ * The descriptions are one or two lines depending on the level, so sizing to the text made the
+ * panel change height as the slider moved — and since it is anchored to its bottom edge, the
+ * whole thing jumped under the cursor mid-drag. Holding the taller of the two costs one line of
+ * empty space on the short ones and keeps the panel still.
+ */
+.reasoning-hint {
+  margin: 6px 0 0;
+  min-height: calc(2 * 1.45em);
+  color: var(--text-faint);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.reasoning-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .reasoning-label {
@@ -2333,9 +2452,22 @@ button.danger.subtle:hover {
 
 /* The chosen level, in a fixed-width slot so the row does not jitter as it changes. */
 .reasoning-value {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.reasoning[data-kind='toggle'] .reasoning-value {
   min-width: 8ch;
   color: var(--text-dim);
   font-weight: 500;
+}
+
+.reasoning-anchors {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-faint);
+  opacity: 0.75;
 }
 
 /*
@@ -2345,25 +2477,32 @@ button.danger.subtle:hover {
  * semantics — and is made transparent so the track, fill and stop marks beneath it can be drawn
  * to match the rest of the app. Its thumb stays visible, since that is the part being dragged.
  */
+/*
+ * A stepped scale drawn as marks, not as a bar.
+ *
+ * There is no filled portion. A progress bar reads as "how much of something", which is the
+ * wrong idea for a setting that picks one of five named values — and at the top of the range it
+ * turned into a solid block of accent colour dominating the composer. The stops are the scale,
+ * and the handle says which one is chosen.
+ */
 .slider {
   position: relative;
   display: flex;
   align-items: center;
-  width: 140px;
+  width: 100%;
   height: var(--slider-h);
   flex-shrink: 0;
   /*
    * One source of truth for the geometry.
    *
    * --thumb is the thumb's *border box*, which is what the browser keeps inside the track when
-   * it positions it. The fill and the stop marks are laid out against the same number, so the
-   * three agree at every value. They did not before: the thumb was sized content-box (the
-   * universal box-sizing rule does not reach a pseudo-element), so a declared 13px circle with
-   * 2px borders really occupied 17px and sat 2px away from the fill it was supposed to cap.
+   * positioning it, and the stop marks are laid out against the same number so the two agree at
+   * every value. They did not before: the thumb was sized content-box (the universal box-sizing
+   * rule does not reach a pseudo-element), so a declared 13px circle with 2px borders really
+   * occupied 17px and sat 2px away from the mark it was supposed to be resting on.
    */
-  --thumb: 14px;
-  --track-h: 5px;
-  --slider-h: 20px;
+  --thumb: 15px;
+  --slider-h: 18px;
 }
 
 .slider-track {
@@ -2371,27 +2510,14 @@ button.danger.subtle:hover {
   top: 50%;
   left: 0;
   right: 0;
-  height: var(--track-h);
-  margin-top: calc(var(--track-h) / -2);
-  border-radius: var(--r-pill);
-  background: var(--bg-inset);
-  box-shadow: inset 0 0 0 1px var(--border);
-  overflow: hidden;
+  height: 0;
   pointer-events: none;
-}
-
-.slider-fill {
-  height: 100%;
-  border-radius: var(--r-pill);
-  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
-  width: calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--pct, 0));
-  transition: width 130ms cubic-bezier(0.2, 0, 0.2, 1);
 }
 
 /* A mark per selectable value, so the number of stops is visible without dragging. */
 .slider-stop {
   position: absolute;
-  top: 50%;
+  top: 0;
   width: 3px;
   height: 3px;
   margin-left: -1.5px;
@@ -2402,9 +2528,14 @@ button.danger.subtle:hover {
   transition: background-color 130ms ease;
 }
 
-/* Behind the fill, the marks need to read against the accent rather than the well. */
-.slider-stop.passed {
-  background: rgba(10, 12, 16, 0.45);
+/* The model's own fallback, so the scale has a reference point that is not the current value. */
+.slider-stop.is-default {
+  background: var(--accent-dim);
+}
+
+/* The chosen one sits under the handle, which covers it — hidden so no rim shows around it. */
+.slider-stop.current {
+  opacity: 0;
 }
 
 /* The input itself: invisible apart from its thumb. */
@@ -2448,11 +2579,12 @@ button.danger.subtle:hover {
   width: var(--thumb);
   height: var(--thumb);
   border-radius: 50%;
-  background: #fff;
-  border: 1px solid rgba(10, 12, 16, 0.55);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55), 0 0 0 0 var(--accent-wash);
+  /* Off-white, not pure white: at this size #fff is a hole punched in a dark composer. */
+  background: var(--text);
+  border: none;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 0 0 0 var(--accent-wash);
   cursor: grab;
-  transition: box-shadow 130ms ease, transform 90ms ease;
+  transition: box-shadow 130ms ease, background-color 120ms ease;
 }
 
 .slider input[type='range']::-moz-range-thumb {
@@ -2460,9 +2592,9 @@ button.danger.subtle:hover {
   width: var(--thumb);
   height: var(--thumb);
   border-radius: 50%;
-  background: #fff;
-  border: 1px solid rgba(10, 12, 16, 0.55);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
+  background: var(--text);
+  border: none;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
   cursor: grab;
 }
 
@@ -2474,18 +2606,18 @@ button.danger.subtle:hover {
 
 /* A widening ring rather than a size change, so the thumb never drifts off the value it marks. */
 .slider:hover input[type='range']:not(:disabled)::-webkit-slider-thumb {
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55), 0 0 0 4px var(--accent-wash);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 0 0 4px var(--accent-wash);
 }
 
 .slider input[type='range']:active::-webkit-slider-thumb {
   cursor: grabbing;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55), 0 0 0 6px var(--accent-wash);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 0 0 6px var(--accent-wash);
 }
 
 /* Keyboard focus has to be visible on the thumb, not on the transparent input box. */
 .slider input[type='range']:focus-visible::-webkit-slider-thumb {
-  border-color: var(--accent);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55), 0 0 0 4px var(--accent-wash);
+  background: var(--accent);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 0 0 4px var(--accent-wash);
 }
 
 .slider input[type='range']:disabled {
@@ -2494,14 +2626,12 @@ button.danger.subtle:hover {
 
 .slider input[type='range']:disabled::-webkit-slider-thumb {
   background: var(--text-faint);
-  border-color: transparent;
   box-shadow: none;
   cursor: default;
 }
 
-.reasoning:has(input:disabled) .slider-fill {
-  filter: grayscale(0.7);
-  opacity: 0.6;
+.reasoning:has(input:disabled) {
+  opacity: 0.55;
 }
 
 /* ---- on/off switch, for models that only have enable_thinking ---- */
@@ -2537,7 +2667,7 @@ button.danger.subtle:hover {
 }
 
 .switch.on .switch-knob {
-  background: #0e1014;
+  background: var(--on-accent);
   transform: translateX(13px);
 }
 
@@ -2562,6 +2692,16 @@ button.danger.subtle:hover {
 
 .composer-meta .composer-hint {
   margin: 0;
+}
+
+/*
+ * The setting sits at the right end of the row, opposite the typing hint.
+ *
+ * Which reads correctly: the hint describes the box above it and belongs beside it, while the
+ * effort control is a property of the model answering, and the eye finds it where the other
+ * per-request controls are.
+ */
+.composer-meta .reasoning {
   margin-left: auto;
 }
 
@@ -2675,7 +2815,7 @@ button.danger.subtle:hover {
 /* A file the model cannot use is staged but flagged, rather than silently dropped later. */
 .attachment.warned {
   border-color: #5a4515;
-  background: rgba(251, 191, 36, 0.07);
+  background: rgba(232, 184, 75, 0.07);
 }
 
 .attachment.warned .icon {
@@ -2763,7 +2903,7 @@ button.danger.subtle:hover {
   display: grid;
   place-items: center;
   border-radius: var(--r-lg);
-  background: rgba(14, 16, 20, 0.72);
+  background: var(--scrim);
   backdrop-filter: blur(1px);
   /* The overlay must not eat the drop event it is announcing. */
   pointer-events: none;
@@ -2817,8 +2957,8 @@ button.danger.subtle:hover {
 /* Inside a filled button the ring has to read against the accent, not on it. */
 .primary .spinner,
 .send-button .spinner {
-  border-color: rgba(14, 16, 20, 0.3);
-  border-top-color: #0e1014;
+  border-color: rgba(34, 26, 21, 0.3);
+  border-top-color: var(--on-accent);
 }
 
 @keyframes spin {
@@ -2860,4 +3000,161 @@ button.danger.subtle:hover {
     animation: none;
     background: var(--surface-1);
   }
+}
+
+/* ---------------------------------------------------------------- ultra */
+
+/*
+ * Ultra's attempts, above the answer they produced.
+ *
+ * Styled as scaffolding rather than transcript: inset, quieter than a message, and collapsed by
+ * default. They have to be visibly *not* the answer — a turn that shows three drafts and a reply
+ * in the same treatment is a turn where the reader cannot tell which one to believe.
+ */
+.ultra-block {
+  margin: 0 0 10px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent-dim);
+  border-radius: var(--r-md);
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+
+.ultra-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  color: var(--text-faint);
+  font-size: 11px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ultra-status {
+  margin-left: auto;
+  color: var(--accent);
+}
+
+.ultra-sample + .ultra-sample {
+  border-top: 1px solid var(--border);
+}
+
+.ultra-sample-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 0;
+  padding: 6px 10px;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ultra-sample-head:hover {
+  background: var(--surface-1);
+}
+
+/* A numeral rather than a bullet: which attempt this is matters when comparing them. */
+.ultra-index {
+  display: grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--surface-2);
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.ultra-sample-label {
+  flex-shrink: 0;
+}
+
+.ultra-sample-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  font-size: 10.5px;
+}
+
+.ultra-tag {
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  background: var(--accent-wash);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.ultra-chevron {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  transition: transform 130ms ease;
+}
+
+.ultra-sample.open .ultra-chevron {
+  transform: rotate(180deg);
+}
+
+.ultra-sample-body {
+  padding: 2px 12px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.ultra-sub {
+  margin: 8px 0 3px;
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.ultra-pre {
+  max-height: 240px;
+  overflow-y: auto;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.55;
+  /* The model's own line breaks carry structure worth keeping. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The stop past the model's own maximum, marked so it never passes for a native level. */
+.slider-stop.is-ultra {
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-wash);
+}
+
+.ultra-config {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.ultra-config input {
+  width: 56px;
+  min-height: 0;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg-inset);
+  color: var(--text);
+  font: inherit;
+  text-align: center;
 }

@@ -12,6 +12,7 @@
  * control whose whole purpose is picking one of a few ordered values.
  */
 
+import { useEffect, useRef, useState } from 'react'
 import type { ReasoningSupport } from '@shared/types'
 
 /** Human wording for the level names models actually use. */
@@ -38,19 +39,27 @@ export function levelLabel(level: string): string {
   return LEVEL_LABELS[level] ?? level.replace(/^\w/, (c) => c.toUpperCase())
 }
 
-export type Choice = string | 'off' | null
+/** Kept in step with main/models/reasoning.ts, which defines the same constant. */
+export const ULTRA = 'ultra'
+
+export type Choice = string | 'off' | typeof ULTRA | null
 
 export default function ReasoningControl({
   support,
   value,
   onChange,
-  disabled = false
+  disabled = false,
+  samples = 3,
+  onSamplesChange
 }: {
   support: ReasoningSupport | undefined | null
   /** null means "whatever the model does by default". */
   value: Choice
   onChange: (next: Choice) => void
   disabled?: boolean
+  /** Ultra's attempt count, surfaced here because this is where Ultra is chosen. */
+  samples?: number
+  onSamplesChange?: (next: number) => void
 }): JSX.Element | null {
   if (!support || support.kind === 'none') return null
 
@@ -83,53 +92,175 @@ export default function ReasoningControl({
   // plus a separate switch. It is offered for every reasoning model, not only those whose
   // template has a switch of its own: llama.cpp can end the thought block itself, which covers
   // the effort-only templates that enumerate levels without providing a way to say "none".
-  const stops: Choice[] = ['off', ...support.levels]
+  //
+  // "Ultra" occupies the last position, past everything the template offers. It is not a level
+  // the model knows — no template has one — but a runtime mode built on top of its strongest
+  // native setting, so it belongs at the end of the same scale rather than in a control of its
+  // own. It is marked so it never passes for something the model advertised.
+  const stops: Choice[] = ['off', ...support.levels, ULTRA]
   const effective = value ?? support.defaultLevel ?? support.levels.at(-1) ?? null
   const index = Math.max(0, stops.indexOf(effective))
   const max = stops.length - 1
-  // 0..1 in the thumb centre's coordinate space; the CSS converts it. See .slider-fill.
-  const pct = max > 0 ? index / max : 0
 
   const current = stops[index]
-  const name = current === 'off' ? 'Off' : levelLabel(String(current))
-  const hint =
-    current === 'off'
+  const isUltra = current === ULTRA
+  const name = current === 'off' ? 'Off' : isUltra ? 'Ultra' : levelLabel(String(current))
+  const hint = isUltra
+    ? `Beyond the model's own maximum: ${samples} independent attempts, each pushed to keep thinking past where it would have stopped, then compared into one answer. Several times slower.`
+    : current === 'off'
       ? 'No thinking. Answers immediately.'
       : (LEVEL_HINTS[String(current)] ?? 'Effort level defined by this model.')
 
+  // The level the model falls back to on its own, marked so the scale has a reference point.
+  const defaultIndex = support.defaultLevel ? stops.indexOf(support.defaultLevel) : -1
+
   return (
-    <div className="reasoning" data-testid="reasoning-control" data-kind="effort">
-      <span className="reasoning-label">Effort</span>
+    <EffortPopover
+      name={name}
+      hint={hint}
+      disabled={disabled}
+      panel={
+        <>
+          <div className="reasoning-head">
+            <span className="reasoning-label">Effort</span>
+            <span className="reasoning-value" data-testid="reasoning-value">
+              {name}
+            </span>
+          </div>
 
-      <div className="slider" title={hint}>
-        {/* The filled portion and the stop marks are painted behind the input. */}
-        <div className="slider-track">
-          <div className="slider-fill" style={{ '--pct': pct } as React.CSSProperties} />
-          {stops.map((stop, i) => (
-            <span
-              key={String(stop)}
-              className={`slider-stop${i <= index ? ' passed' : ''}`}
-              style={{ '--stop': max > 0 ? i / max : 0 } as React.CSSProperties}
+          {/* Naming both ends says what the axis costs, which the level names alone do not. */}
+          <div className="reasoning-anchors" aria-hidden="true">
+            <span>Faster</span>
+            <span>Smarter</span>
+          </div>
+
+          <div className="slider">
+            {/* One mark per value. No filled bar: the stops are the scale. */}
+            <div className="slider-track">
+              {stops.map((stop, i) => (
+                <span
+                  key={String(stop)}
+                  className={
+                    'slider-stop' +
+                    (i === index ? ' current' : '') +
+                    (i === defaultIndex ? ' is-default' : '') +
+                    (stop === ULTRA ? ' is-ultra' : '')
+                  }
+                  style={{ '--stop': max > 0 ? i / max : 0 } as React.CSSProperties}
+                />
+              ))}
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={max}
+              step={1}
+              value={index}
+              disabled={disabled}
+              onChange={(e) => onChange(stops[Number(e.target.value)] ?? null)}
+              aria-label="Reasoning effort"
+              aria-valuetext={name}
+              data-testid="reasoning-slider"
             />
-          ))}
-        </div>
-        <input
-          type="range"
-          min={0}
-          max={max}
-          step={1}
-          value={index}
-          disabled={disabled}
-          onChange={(e) => onChange(stops[Number(e.target.value)] ?? null)}
-          aria-label="Reasoning effort"
-          aria-valuetext={name}
-          data-testid="reasoning-slider"
-        />
-      </div>
+          </div>
 
-      <span className="reasoning-value" data-testid="reasoning-value">
+          {/* Only Ultra spends this, so the cost only appears when it is about to be spent. */}
+          {isUltra && (
+            <label className="ultra-config" data-testid="ultra-samples-config">
+              <span>Attempts</span>
+              <input
+                type="number"
+                min={1}
+                max={8}
+                value={samples}
+                disabled={disabled}
+                onChange={(e) => onSamplesChange?.(clampSamples(Number(e.target.value)))}
+                data-testid="ultra-samples-input"
+              />
+            </label>
+          )}
+        </>
+      }
+    />
+  )
+}
+
+/** Bounded where the engine bounds it, so the field cannot ask for something it will not get. */
+export function clampSamples(n: number): number {
+  return Number.isFinite(n) ? Math.max(1, Math.min(8, Math.round(n))) : 3
+}
+
+/**
+ * The effort scale, folded away behind the level it has chosen.
+ *
+ * The composer's meta row is a strip of small print, and a three-row control with its own axis
+ * labels does not belong there permanently — the setting is glanced at far more often than it is
+ * changed. So the row carries only the current level, and the scale opens over it on demand.
+ *
+ * Deliberately not a <details>: it has to escape the composer's bounds, and it needs to close on
+ * Escape and on a click elsewhere, neither of which that element does.
+ */
+function EffortPopover({
+  name,
+  hint,
+  disabled,
+  panel
+}: {
+  name: string
+  hint: string
+  disabled: boolean
+  panel: React.ReactNode
+}): JSX.Element {
+  const [open, setOpen] = useState(false)
+  const root = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+
+    const onDown = (e: PointerEvent): void => {
+      if (!root.current?.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        setOpen(false)
+      }
+    }
+    // Captured, so dragging the slider inside the panel never counts as a click outside it.
+    document.addEventListener('pointerdown', onDown, true)
+    document.addEventListener('keydown', onKey, true)
+    return () => {
+      document.removeEventListener('pointerdown', onDown, true)
+      document.removeEventListener('keydown', onKey, true)
+    }
+  }, [open])
+
+  // A setting that cannot be changed should not offer to open.
+  useEffect(() => {
+    if (disabled) setOpen(false)
+  }, [disabled])
+
+  return (
+    <div className="reasoning" data-testid="reasoning-control" data-kind="effort" ref={root}>
+      <button
+        type="button"
+        className={`reasoning-trigger${open ? ' open' : ''}`}
+        onClick={() => setOpen((v) => !v)}
+        disabled={disabled}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        title={`Reasoning effort — ${hint}`}
+        data-testid="reasoning-trigger"
+      >
         {name}
-      </span>
+      </button>
+
+      {open && (
+        <div className="reasoning-pop" role="dialog" aria-label="Reasoning effort" data-testid="reasoning-pop">
+          {panel}
+          <p className="reasoning-hint">{hint}</p>
+        </div>
+      )}
     </div>
   )
 }

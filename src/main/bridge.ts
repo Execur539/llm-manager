@@ -27,7 +27,7 @@ import { detectHardware, refreshFreeVram } from './hardware/gpu'
 import { scanLibrary, libraryDiskUsage } from './models/library'
 import { checkRelocation, keepInPlace, performMove } from './models/relocation'
 import { DEFAULT_CONSTRAINTS, planFit, verifyPrediction } from './autofit/engine'
-import { llama } from './runtime/llama'
+import { llama, type ContentPart, type CompletionOptions } from './runtime/llama'
 import { missingBinaries, embeddingModelPath, vendorDiagnostics } from './runtime/binaries'
 import { Agent } from './agent/loop'
 import { killAllJobs } from './agent/tools/exec'
@@ -59,7 +59,8 @@ import { historicalStats, liveStats, requestLog, recordGeneration, clearStats, s
 import { buildDiagnostics, logger } from './log'
 import { exportChat, writeExport, all, run, get } from './storage/db'
 import { exportFilename, uniquePath } from './storage/filenames'
-import { reasoningRequestFields, type ReasoningChoice } from './models/reasoning'
+import { reasoningRequestFields, isUltra, type ReasoningChoice } from './models/reasoning'
+import { ultraSamples, sampleTemperatures, planSynthesisMessages, planPreamble } from './ultra'
 import { checkForUpdate, applyUpdate } from './update'
 
 // ---------------------------------------------------------------- shared state
@@ -69,6 +70,15 @@ let library: ModelRecord[] = []
 let agent: Agent | null = null
 
 const pendingPermissions = new Map<string, (d: PermissionDecision) => void>()
+
+/**
+ * Chat turns currently streaming, so they can be stopped.
+ *
+ * Keyed by conversation rather than held as a single controller: the API server and a remote
+ * browser can each have a turn in flight alongside the desktop window, and stopping one must not
+ * cut off another.
+ */
+const inFlightChats = new Map<string, AbortController>()
 
 /**
  * Settle every outstanding approval prompt as a denial.
@@ -303,30 +313,46 @@ async function pruneStagedUploads(): Promise<void> {
 }
 
 /**
- * Fold attachments into an agent prompt.
+ * Fold attachments into an agent turn.
  *
- * Text is inlined so the agent can reason about it immediately; binary media is referenced by
- * path so the agent can decide what to do with it using its own tools.
+ * Text-bearing files are inlined into the prompt so the agent can reason about them straight
+ * away. Images and audio are handed over as content parts, exactly as the chat path does.
+ *
+ * They used to be reduced to a list of paths, on the reasoning that the agent has file tools and
+ * could open them itself. It cannot: nothing in the tool set decodes an image, so a vision model
+ * that was perfectly able to see the picture was instead handed a filename and left to guess —
+ * reaching for Python, EXIF and the shape of the file name to answer "what is this?".
+ *
+ * Paths are still named alongside, because they remain genuinely useful: the agent can copy,
+ * move or convert a file it can also see.
  */
-async function attachmentPreamble(input: string, files: string[]): Promise<string> {
+async function attachmentTurn(
+  input: string,
+  files: string[]
+): Promise<{ text: string; media: ContentPart[] }> {
   const caps = llama.loaded?.model.caps
-  if (!caps) return input
+  if (!caps) return { text: input, media: [] }
 
   const built = await buildContent('', files, caps)
-  const inlined = built.parts
-    .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
-    .map((p) => p.text)
-
-  const referenced = files.filter((f) => classifyAttachment(f) !== 'doc')
   const sections: string[] = []
+  const media: ContentPart[] = []
 
-  if (inlined.length) sections.push(inlined.join('\n\n'))
-  if (referenced.length) {
-    sections.push(`Attached files on disk:\n${referenced.map((f) => `- ${f}`).join('\n')}`)
+  for (const part of built.parts) {
+    if (part.type === 'text') sections.push(part.text ?? '')
+    else media.push(part)
+  }
+
+  // Named whether or not they were also sent as media, so the agent can act on the file itself.
+  const onDisk = files.filter((f) => classifyAttachment(f) !== 'doc')
+  if (onDisk.length) {
+    sections.push(`Attached files on disk:\n${onDisk.map((f) => `- ${f}`).join('\n')}`)
   }
   if (built.notes.length) sections.push(built.notes.join('\n'))
 
-  return sections.length ? `${sections.join('\n\n')}\n\n${input}` : input
+  return {
+    text: sections.length ? `${sections.join('\n\n')}\n\n${input}` : input,
+    media
+  }
 }
 
 export const handlers: Record<string, (...args: never[]) => unknown> = {
@@ -698,25 +724,78 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const started = Date.now()
     let answer = ''
     let thinking = ''
-    for await (const ev of llama.streamEvents({
+
+    /*
+     * A chat turn is interruptible.
+     *
+     * Only the agent could be stopped before, which is backwards for the surface where a wrong
+     * turn is cheapest to abandon — a model that has misread the question and is settling in for
+     * two thousand tokens about it should not have to be waited out. The controller is held
+     * against the conversation so `chat:stop` can find it, and cleared in the finally below
+     * whether the turn ended, failed or was cut short.
+     */
+    inFlightChats.get(chatId)?.abort()
+    const abort = new AbortController()
+    inFlightChats.set(chatId, abort)
+
+    const request: CompletionOptions = {
       messages: [...messages, { role: 'user', content: userContent }],
+      signal: abort.signal,
       // Dropped silently if the model never advertised the level — see reasoningRequestFields.
       ...reasoningRequestFields(loaded.model.caps.reasoning, reasoning ?? null)
-    })) {
-      if (ev.type === 'text') {
-        answer += ev.text
-        emit('chat:delta', { chatId, text: ev.text })
+    }
+
+    /*
+     * Ultra replaces the single request with several, then a pass that reads them together.
+     *
+     * The samples stream into their own boxes rather than the answer, so the transcript never
+     * shows a draft in the place the real reply will appear. Only the synthesis pass writes to
+     * chat:delta, which means everything downstream — the store, the caret, the markdown
+     * renderer — sees exactly what it sees for an ordinary turn.
+     */
+    if (isUltra(reasoning ?? null)) {
+      const cfg = loadSettings().ultra
+      const { synthesis } = await ultraSamples(request, cfg, {
+        onSampleStart: (index, total) => emit('chat:ultra-sample-start', { chatId, index, total }),
+        onSampleDelta: (index, t) => emit('chat:ultra-sample-delta', { chatId, index, text: t }),
+        onSampleReasoning: (index, t) =>
+          emit('chat:ultra-sample-reasoning', { chatId, index, text: t }),
+        onSample: (sample) => emit('chat:ultra-sample', { chatId, sample }),
+        onSynthesisStart: () => emit('chat:ultra-synthesis', { chatId })
+      })
+      request.messages = synthesis
+    }
+
+    let stopped = false
+    try {
+      for await (const ev of llama.streamEvents(request)) {
+        if (ev.type === 'text') {
+          answer += ev.text
+          emit('chat:delta', { chatId, text: ev.text })
+        }
+        if (ev.type === 'reasoning') {
+          thinking += ev.text
+          emit('chat:reasoning', { chatId, text: ev.text })
+        }
       }
-      if (ev.type === 'reasoning') {
-        thinking += ev.text
-        emit('chat:reasoning', { chatId, text: ev.text })
-      }
+    } catch (err) {
+      /*
+       * A stopped turn keeps what it wrote.
+       *
+       * The user asked for it to stop, not for it to be undone — half an answer is usually still
+       * worth reading, and discarding it would also lose the question that prompted it from the
+       * visible transcript. Anything that is not the abort is a real failure and still throws.
+       */
+      if (!abort.signal.aborted) throw err
+      stopped = true
+    } finally {
+      inFlightChats.delete(chatId)
     }
 
     const assistantMsg = {
       id: `${Date.now().toString(36)}-a`,
       role: 'assistant' as const,
-      content: answer,
+      content: stopped ? `${answer}${answer.trim() ? '\n\n' : ''}_[stopped]_` : answer,
       reasoning: thinking || undefined,
       createdAt: Date.now()
     }
@@ -747,13 +826,15 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     if (!session) throw new Error(`No session ${sessionId}`)
 
     /*
-     * The agent's turn is plain text, not content parts — its loop feeds a growing history back
-     * through the model and interleaves tool results, which the multimodal part format does not
-     * survive cleanly. Text-bearing attachments are inlined into the prompt; anything the agent
-     * cannot read that way is named with its path, which is more useful anyway: the agent has
-     * file tools and can open it itself.
+     * Text goes into the prompt, media goes to the model as content parts.
+     *
+     * Only the first user message of the turn carries parts; everything the loop appends after
+     * it — assistant turns, tool results — stays plain text, which is the arrangement llama.cpp
+     * expects and the reason the loop can feed its history back unchanged each iteration.
      */
-    const withFiles = attachments?.length ? await attachmentPreamble(input, attachments) : input
+    const turn = attachments?.length
+      ? await attachmentTurn(input, attachments)
+      : { text: input, media: [] as ContentPart[] }
 
     const a = getAgent()
     syncAgentOptions()
@@ -766,7 +847,50 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     // otherwise sit in the map forever and never be answerable again.
     drainPendingPermissions()
     try {
-      await a.run(session, withFiles)
+      /*
+       * Ultra plans before it acts.
+       *
+       * Several passes investigate the task with only read tools available, so they can be run
+       * over and over without touching anything. The winner is then handed to one ordinary run
+       * that does the work once, with real tool results and the usual approval prompts — so the
+       * thing that executes has seen the truth, rather than replaying calls that were planned
+       * against results which never happened.
+       */
+      let prompt = turn.text
+      if (isUltra(reasoning ?? null)) {
+        const cfg = loadSettings().ultra
+        const count = Math.max(1, Math.min(8, Math.round(cfg.samples)))
+        const temps = sampleTemperatures(count)
+        const plans: string[] = []
+
+        for (let i = 0; i < count; i++) {
+          emit('agent:ultra-sample-start', { sessionId, index: i, total: count })
+          const startedAt = Date.now()
+          const plan = await a.planOnce(session, turn.text, turn.media, temps[i], {
+            onDelta: (t) => emit('agent:ultra-sample-delta', { sessionId, index: i, text: t }),
+            onReasoning: (t) => emit('agent:ultra-sample-reasoning', { sessionId, index: i, text: t })
+          })
+          plans.push(plan)
+          emit('agent:ultra-sample', {
+            sessionId,
+            sample: {
+              index: i,
+              answer: plan,
+              reasoning: '',
+              continuations: 0,
+              temperature: temps[i],
+              ms: Date.now() - startedAt
+            }
+          })
+        }
+
+        emit('agent:ultra-synthesis', { sessionId })
+        const chosen = await llama.complete({ messages: planSynthesisMessages(turn.text, plans) })
+        // A synthesis that comes back empty must not silently strip the user's own request.
+        prompt = chosen.trim() ? `${turn.text}\n\n${planPreamble(chosen)}` : turn.text
+      }
+
+      await a.run(session, prompt, turn.media)
     } finally {
       drainPendingPermissions()
       // Persist on the way out either way. A turn that ends in an error still did real work —
@@ -779,6 +903,11 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
 
     chats.autoTitle(sessionId)
     return session
+  },
+  /** Cut a chat turn short. Whatever has been generated so far is kept. */
+  'chat:stop': (chatId: string) => {
+    inFlightChats.get(chatId)?.abort()
+    return true
   },
   'agent:stop': () => {
     agent?.stop()

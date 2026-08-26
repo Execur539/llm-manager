@@ -1,13 +1,25 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AgentMessage } from '@shared/types'
 import { invoke, fmtRelative } from '../lib/api'
-import { select, setRunning, takePending, dropPending, useStream, clearFor, toast, setReasoning } from '../lib/store'
+import {
+  select,
+  setRunning,
+  takePending,
+  dropPending,
+  useStream,
+  clearFor,
+  toast,
+  setReasoning,
+  adoptReasoning,
+  DRAFT_CHAT
+} from '../lib/store'
 import type { LoadedModel } from '../App'
 import ConversationList, { type ChatSummary } from '../components/ConversationList'
 import Icon from '../components/Icon'
 import Markdown from '../components/Markdown'
 import MessageRow from '../components/MessageRow'
 import ThinkingBlock from '../components/ThinkingBlock'
+import UltraSamples from '../components/UltraSamples'
 import RailToggle from '../components/RailToggle'
 import ReasoningControl from '../components/ReasoningControl'
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
@@ -37,6 +49,31 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   const partial = activeId ? (stream.partial[activeId] ?? '') : ''
   const reasoning = activeId ? (stream.reasoningPartial[activeId] ?? '') : ''
   const busy = activeId ? !!stream.running[activeId] : false
+  // Usable before the first message: the choice is held against a draft key and adopted by
+  // whatever conversation the message goes on to create.
+  const effortId = activeId ?? DRAFT_CHAT
+  const ultra = activeId ? (stream.ultra[activeId] ?? []) : []
+  const synthesising = activeId ? !!stream.ultraSynthesising[activeId] : false
+
+  /*
+   * Ultra's attempt count, mirrored from settings.
+   *
+   * It is a setting rather than per-conversation state because it is a statement about this
+   * machine's patience, not about one question. Written back on change so the choice survives a
+   * restart, and read once on mount.
+   */
+  const [ultraSamples, setUltraSamplesState] = useState(3)
+
+  useEffect(() => {
+    void invoke<{ ultra?: { samples?: number } }>('settings:get')
+      .then((s) => setUltraSamplesState(s.ultra?.samples ?? 3))
+      .catch(() => undefined)
+  }, [])
+
+  const setUltraSamples = (next: number): void => {
+    setUltraSamplesState(next)
+    void invoke('settings:patch', { ultra: { samples: next } }).catch(() => undefined)
+  }
 
   const refreshChats = async (): Promise<void> => {
     setChats(await invoke<ChatSummary[]>('chat:list', 'chat'))
@@ -93,6 +130,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
     const chat = await invoke<ChatSummary>('chat:create', { kind: 'chat', modelId: loaded?.modelId ?? null })
     await refreshChats()
     setMessages([])
+    adoptReasoning(DRAFT_CHAT, chat.id)
     select('chat', chat.id)
   }
 
@@ -115,8 +153,13 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
       const chat = await invoke<ChatSummary>('chat:create', { kind: 'chat', modelId: loaded.modelId })
       chatId = chat.id
       setMessages([])
+      adoptReasoning(DRAFT_CHAT, chatId)
       select('chat', chatId)
     }
+
+    // Read from the render-time snapshot, which is the only place the draft choice exists —
+    // adoptReasoning has mutated the store, but `stream` here was captured before it did.
+    const effort = stream.reasoning[effortId] ?? null
 
     const text = input
     setInput('')
@@ -126,7 +169,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
     try {
       const files = attachments.items.map((a) => a.path)
       attachments.clear()
-      await invoke('chat:send', chatId, text, files, collectionId || undefined, stream.reasoning[chatId] ?? null)
+      await invoke('chat:send', chatId, text, files, collectionId || undefined, effort)
       await refreshChats()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -225,15 +268,16 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
             </MessageRow>
           ))}
 
-          {(partial || reasoning) && (
+          {(partial || reasoning || ultra.length > 0) && (
             <MessageRow role="assistant" testId="streaming-message">
+              <UltraSamples samples={ultra} synthesising={synthesising} />
               {reasoning && <ThinkingBlock text={reasoning} streaming answerStarted={!!partial} />}
               <div className="body streaming">
                 <Markdown source={partial} caret />
               </div>
             </MessageRow>
           )}
-          {busy && !partial && !reasoning && (
+          {busy && !partial && !reasoning && !ultra.length && (
             <MessageRow role="assistant">
               <div className="thinking">
                 <span className="dot" />
@@ -272,25 +316,32 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               rows={1}
               data-testid="chat-input"
             />
+            {/*
+              * One button, two jobs. While a turn is in flight the only thing worth doing here
+              * is stopping it — a disabled send button says "wait", which is exactly the thing
+              * the user is trying not to do.
+              */}
             <button
-              className="send-button"
-              onClick={() => void send()}
-              disabled={!loaded || busy || (!input.trim() && !attachments.items.length)}
-              title={busy ? 'Waiting for the model' : 'Send  (Enter)'}
-              aria-label="Send"
+              className={`send-button${busy ? ' stopping' : ''}`}
+              onClick={() => (busy ? void invoke('chat:stop', activeId) : void send())}
+              disabled={!loaded || (!busy && !input.trim() && !attachments.items.length)}
+              title={busy ? 'Stop generating' : 'Send  (Enter)'}
+              aria-label={busy ? 'Stop' : 'Send'}
               data-testid="chat-send"
             >
-              <Icon name="send" size={15} />
+              <Icon name={busy ? 'stop' : 'send'} size={15} />
             </button>
           </div>
           <div className="composer-meta">
+            <div className="composer-hint">Enter to send · Shift+Enter for a newline</div>
             <ReasoningControl
               support={loaded?.caps?.reasoning}
-              value={activeId ? (stream.reasoning[activeId] ?? null) : null}
-              onChange={(next) => activeId && setReasoning(activeId, next)}
+              value={stream.reasoning[effortId] ?? null}
+              onChange={(next) => setReasoning(effortId, next)}
               disabled={busy}
+              samples={ultraSamples}
+              onSamplesChange={setUltraSamples}
             />
-            <div className="composer-hint">Enter to send · Shift+Enter for a newline</div>
           </div>
         </div>
       </div>
