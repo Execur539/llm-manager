@@ -54,10 +54,13 @@ function Sample({ sample, running }: { sample: UltraSampleView; running: boolean
 
 export default function UltraSamples({
   samples,
-  synthesising
+  synthesising,
+  plan
 }: {
   samples: UltraSampleView[]
   synthesising: boolean
+  /** The course of action chosen from the attempts, on agent turns. */
+  plan?: string
 }): JSX.Element | null {
   if (!samples.length) return null
 
@@ -74,6 +77,17 @@ export default function UltraSamples({
       {samples.map((s) => (
         <Sample key={s.index} sample={s} running={!s.done} />
       ))}
+
+      {/*
+        * Shown, because it directs everything the agent then does — and it used to be shown by
+        * being pasted into the user's own message, which read as though they had typed it.
+        */}
+      {plan && (
+        <div className="ultra-plan" data-testid="ultra-plan">
+          <div className="ultra-sub">Plan chosen</div>
+          <div className="ultra-pre">{plan}</div>
+        </div>
+      )}
     </div>
   )
 }

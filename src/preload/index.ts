@@ -43,6 +43,7 @@ const EVENT_CHANNELS = [
   'agent:ultra-sample-reasoning',
   'agent:ultra-sample',
   'agent:ultra-synthesis',
+  'agent:ultra-plan',
   'mcp:update',
   'rag:progress',
   'server:status',

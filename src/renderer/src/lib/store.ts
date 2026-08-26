@@ -59,6 +59,8 @@ export interface StreamState {
   ultra: Record<string, UltraSampleView[]>
   /** true once sampling is done and the synthesised answer is being written */
   ultraSynthesising: Record<string, boolean>
+  /** The plan Ultra settled on for an agent turn, shown above the work it directs. */
+  ultraPlan: Record<string, string>
   /**
    * Which conversation each view has open.
    *
@@ -139,6 +141,7 @@ const state: StreamState = {
   toolCalls: {},
   ultra: {},
   ultraSynthesising: {},
+  ultraPlan: {},
   selection: loadSelection(),
   toasts: [],
   railOpen: false,
@@ -165,6 +168,7 @@ function emitChange(): void {
     toolCalls: { ...state.toolCalls },
     ultra: { ...state.ultra },
     ultraSynthesising: { ...state.ultraSynthesising },
+    ultraPlan: { ...state.ultraPlan },
     selection: { ...state.selection },
     toasts: [...state.toasts],
     railOpen: state.railOpen,
@@ -192,10 +196,12 @@ export function setRunning(id: string, running: boolean): void {
     state.toolCalls[id] = []
     state.ultra[id] = []
     state.ultraSynthesising[id] = false
+    delete state.ultraPlan[id]
   } else {
     // The samples were scaffolding for an answer that now exists on its own.
     delete state.ultra[id]
     delete state.ultraSynthesising[id]
+    delete state.ultraPlan[id]
   }
   emitChange()
 }
@@ -223,6 +229,7 @@ export function clearFor(id: string): void {
   delete state.toolCalls[id]
   delete state.ultra[id]
   delete state.ultraSynthesising[id]
+  delete state.ultraPlan[id]
   delete state.reasoning[id]
   emitChange()
 }
@@ -453,6 +460,11 @@ function wire(): void {
 
   on<{ sessionId: string }>('agent:ultra-synthesis', (d) => {
     state.ultraSynthesising[d.sessionId || activeId] = true
+    emitChange()
+  })
+
+  on<{ sessionId: string; plan: string }>('agent:ultra-plan', (d) => {
+    state.ultraPlan[d.sessionId || activeId] = d.plan
     emitChange()
   })
 

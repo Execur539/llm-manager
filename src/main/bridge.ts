@@ -836,6 +836,18 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       ? await attachmentTurn(input, attachments)
       : { text: input, media: [] as ContentPart[] }
 
+    /*
+     * What the transcript shows, as distinct from what the model is sent.
+     *
+     * The prompt carries inlined attachment text and, under Ultra, a chosen plan — none of which
+     * the user typed. Recording it verbatim put the whole preamble inside their own message, so
+     * a conversation opened with "Hello" appeared to have been sent with a numbered plan
+     * attached. Attachments are named the way chat names them.
+     */
+    const displayText = attachments?.length
+      ? `${input}\n\n[Attached: ${attachments.map((f) => path.basename(f)).join(', ')}]`
+      : input
+
     const a = getAgent()
     syncAgentOptions()
     a.updateOptions({ cwd: session.cwd, reasoningChoice: reasoning ?? null })
@@ -888,9 +900,12 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         const chosen = await llama.complete({ messages: planSynthesisMessages(turn.text, plans) })
         // A synthesis that comes back empty must not silently strip the user's own request.
         prompt = chosen.trim() ? `${turn.text}\n\n${planPreamble(chosen)}` : turn.text
+        // Shown in a box of its own. It shapes everything that follows, so it should be
+        // readable — just not by being pasted into the user's message.
+        if (chosen.trim()) emit('agent:ultra-plan', { sessionId, plan: chosen.trim() })
       }
 
-      await a.run(session, prompt, turn.media)
+      await a.run(session, prompt, turn.media, displayText)
     } finally {
       drainPendingPermissions()
       // Persist on the way out either way. A turn that ends in an error still did real work —

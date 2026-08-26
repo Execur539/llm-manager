@@ -3158,3 +3158,10 @@ button.danger.subtle:hover {
   font: inherit;
   text-align: center;
 }
+
+/* The course of action Ultra settled on, above the work it directs. */
+.ultra-plan {
+  padding: 2px 12px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--accent-wash);
+}

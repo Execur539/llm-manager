@@ -88,6 +88,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   const effortId = activeId ?? DRAFT_AGENT
   const ultra = activeId ? (stream.ultra[activeId] ?? []) : []
   const synthesising = activeId ? !!stream.ultraSynthesising[activeId] : false
+  const ultraPlan = activeId ? stream.ultraPlan[activeId] : undefined
 
   /*
    * Ultra's attempt count, mirrored from settings.
@@ -349,7 +350,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
           {(partial || reasoning || ultra.length > 0) && (
             <MessageRow role="assistant" testId="streaming-message">
               {/* Plans, while they are being weighed — above whatever the run then does. */}
-              <UltraSamples samples={ultra} synthesising={synthesising} />
+              <UltraSamples samples={ultra} synthesising={synthesising} plan={ultraPlan} />
               {reasoning && <ThinkingBlock text={reasoning} streaming answerStarted={!!partial} />}
               <div className="body streaming">
                 <Markdown source={partial} caret />

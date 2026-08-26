@@ -470,7 +470,20 @@ Platform: Windows (PowerShell)${memoryBlock}`
    * is that media lives for the life of the running session — resuming a session after a restart
    * rebuilds the history from stored text, so the file is named but no longer shown.
    */
-  async run(session: AgentSessionState, userInput: string, media: ContentPart[] = []): Promise<void> {
+  async run(
+    session: AgentSessionState,
+    userInput: string,
+    media: ContentPart[] = [],
+    /**
+     * What the transcript records, when that differs from what the model is sent.
+     *
+     * The prompt accumulates machinery the user never typed — inlined attachment text, and under
+     * Ultra a chosen plan running to a dozen lines. Recording the prompt verbatim put all of it
+     * inside the user's own message bubble, so a conversation opened with "Hello" appeared to
+     * have been sent with a numbered plan attached to it.
+     */
+    displayText: string = userInput
+  ): Promise<void> {
     this.abort = new AbortController()
     const signal = this.abort.signal
     // A fresh turn re-opens decisions the user made in the previous one.
@@ -488,7 +501,7 @@ Platform: Windows (PowerShell)${memoryBlock}`
     const userMsg: AgentMessage = {
       id: crypto.randomBytes(6).toString('hex'),
       role: 'user',
-      content: userInput,
+      content: displayText,
       createdAt: Date.now()
     }
     session.messages.push(userMsg)
