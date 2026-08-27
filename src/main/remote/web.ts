@@ -14,6 +14,7 @@ import https from 'node:https'
 import fs from 'node:fs'
 import path from 'node:path'
 import { app } from 'electron'
+import { loadSettings } from '../storage/settings'
 import {
   isLockedOut,
   issueSession,
@@ -26,16 +27,65 @@ import {
 
 /** Actions that require physical access to the desktop app. */
 const DESKTOP_ONLY = new Set([
-  'model:delete',
   'library:delete-model',
   'settings:set-password',
-  'settings:disable-hard-blocks',
   'remote:disable',
   'remote:enable',
-  'agent:set-hard-blocks',
   'mcp:add',
-  'mcp:remove'
+  'mcp:remove',
+  // Quitting the host from a remote tab is not a feature.
+  'app:quit',
+  /*
+   * These open a native dialog on the desktop and await it.
+   *
+   * A remote caller cannot see or dismiss one, so the request hangs until somebody walks over to
+   * the machine — and the dialog appears unbidden on someone else's screen either way.
+   */
+  'library:import',
+  'chat:export',
+  'agent:set-cwd'
 ])
+
+/*
+ * Settings a remote session may not change, whatever route it takes.
+ *
+ * The deny-list above names channels, which was not enough. `settings:disable-hard-blocks` and
+ * `agent:set-hard-blocks` were listed but have never existed as handlers, while the path the UI
+ * actually uses — `settings:patch`, taking an arbitrary Partial<AppSettings> — was not listed at
+ * all. A remote session could therefore turn off the hard-block list and grant itself write and
+ * execute tools with two ordinary settings calls, which is precisely what both of those gates
+ * were written to prevent.
+ *
+ * Checked by content rather than by channel, so gating stays here in the web server and the
+ * handler map stays transport-agnostic.
+ */
+const PRIVILEGED_SETTINGS: Record<string, string[]> = {
+  agent: ['hardBlocksDisabled', 'remoteToolsEnabled']
+}
+
+/*
+ * Blocks a privileged *change*, not the mere presence of a privileged key.
+ *
+ * The settings UI patches by spreading a whole section — `{ agent: { ...agent, planMode } }` —
+ * so every one of these keys travels with every agent patch, carrying its current value.
+ * Rejecting on presence would have blocked a remote session from touching any agent setting at
+ * all. Only a value that differs from what is already stored is an attempt to change it.
+ */
+function privilegedSettingsIn(patch: unknown): string | null {
+  if (!patch || typeof patch !== 'object') return null
+  const current = loadSettings() as unknown as Record<string, Record<string, unknown>>
+
+  for (const [section, keys] of Object.entries(PRIVILEGED_SETTINGS)) {
+    const value = (patch as Record<string, unknown>)[section]
+    if (!value || typeof value !== 'object') continue
+    for (const key of keys) {
+      const incoming = (value as Record<string, unknown>)[key]
+      if (!(key in (value as Record<string, unknown>))) continue
+      if (incoming !== current?.[section]?.[key]) return `${section}.${key}`
+    }
+  }
+  return null
+}
 
 export interface WebServerOptions {
   port: number
@@ -223,11 +273,15 @@ export class RemoteWebServer {
     if (url.pathname === '/bridge' && req.method === 'POST') {
       const { channel, args } = JSON.parse(await readBody(req)) as { channel: string; args: unknown[] }
 
-      if (DESKTOP_ONLY.has(channel)) {
+      const privileged = channel === 'settings:patch' ? privilegedSettingsIn((args ?? [])[0]) : null
+
+      if (DESKTOP_ONLY.has(channel) || privileged) {
         res.writeHead(403, { 'Content-Type': 'application/json', ...baseHeaders })
         res.end(
           JSON.stringify({
-            error: `"${channel}" must be confirmed on the desktop app. Destructive and security-related actions are not available remotely.`
+            error: privileged
+              ? `"${privileged}" must be changed on the desktop app. Security-related settings are not available remotely.`
+              : `"${channel}" must be confirmed on the desktop app. Destructive and security-related actions are not available remotely.`
           })
         )
         return

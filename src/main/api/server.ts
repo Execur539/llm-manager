@@ -403,7 +403,7 @@ export class ApiServer {
     }
 
     if (!body.stream) {
-      const text = await requestQueue.enqueue(priority, () => llama.complete(opts))
+      const result = await requestQueue.enqueue(priority, () => llama.completeFull(opts))
       const t = llama.timings
       logRequest('/v1/chat/completions', llama.loaded.model.filename, t?.promptTokens ?? 0, t?.completionTokens ?? 0, Date.now() - started, client, ip, 200)
       json(res, 200, {
@@ -411,7 +411,25 @@ export class ApiServer {
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: llama.loaded.model.filename,
-        choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: result.text,
+              ...(result.toolCalls.length
+                ? {
+                    tool_calls: result.toolCalls.map((c) => ({
+                      id: c.id,
+                      type: 'function',
+                      function: { name: c.name, arguments: JSON.stringify(c.args) }
+                    }))
+                  }
+                : {})
+            },
+            finish_reason: result.toolCalls.length ? 'tool_calls' : 'stop'
+          }
+        ],
         usage: usageBlock(t)
       })
       return
@@ -425,20 +443,51 @@ export class ApiServer {
     })
 
     const id = `chatcmpl-${crypto.randomBytes(8).toString('hex')}`
+    let sawToolCall = false
     await requestQueue.enqueue(priority, async () => {
+      let callIndex = 0
       for await (const ev of llama.streamEvents(opts)) {
-        if (ev.type !== 'text') continue
-        res.write(
-          `data: ${JSON.stringify({
-            id,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: llama.loaded?.model.filename,
-            choices: [{ index: 0, delta: { content: ev.text }, finish_reason: null }]
-          })}\n\n`
-        )
+        if (ev.type === 'text') {
+          res.write(
+            `data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: llama.loaded?.model.filename,
+              choices: [{ index: 0, delta: { content: ev.text }, finish_reason: null }]
+            })}\n\n`
+          )
+        } else if (ev.type === 'tool_call') {
+          sawToolCall = true
+          res.write(
+            `data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: llama.loaded?.model.filename,
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: callIndex++,
+                        id: ev.call.id,
+                        type: 'function',
+                        function: { name: ev.call.name, arguments: JSON.stringify(ev.call.args) }
+                      }
+                    ]
+                  },
+                  finish_reason: null
+                }
+              ]
+            })}\n\n`
+          )
+        }
       }
-      res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`)
+      res.write(
+        `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: sawToolCall ? 'tool_calls' : 'stop' }] })}\n\n`
+      )
       res.write('data: [DONE]\n\n')
       res.end()
     })

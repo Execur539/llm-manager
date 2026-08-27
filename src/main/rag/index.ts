@@ -430,7 +430,16 @@ export async function retrieve(
     where.push('d.chat_id = ?')
     params.push(scope.chatId)
   }
-  const clause = where.length ? `WHERE ${where.join(' OR ')}` : ''
+  /*
+   * No scope means no results, not every result.
+   *
+   * An empty WHERE returned every chunk in the database, across every collection — and this is
+   * a bridge handler, so it is reachable from a remote session as well as the local UI. A
+   * caller that fails to name a scope is asking a question with no answer, and answering it
+   * with the entire corpus is the wrong way to be helpful.
+   */
+  if (!where.length) return []
+  const clause = `WHERE ${where.join(' OR ')}`
 
   const rows = all<{
     document_id: string

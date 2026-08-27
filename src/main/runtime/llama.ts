@@ -462,6 +462,22 @@ export class LlamaRuntime extends EventEmitter {
     return out
   }
 
+  /**
+   * Like `complete`, but also surfaces tool calls instead of discarding them.
+   *
+   * `complete`/`stream` exist for plain-chat callers that only want text; API clients that pass
+   * `tools` need the calls themselves, which only `streamEvents` carries.
+   */
+  async completeFull(opts: CompletionOptions): Promise<{ text: string; toolCalls: StreamedToolCall[] }> {
+    let text = ''
+    const toolCalls: StreamedToolCall[] = []
+    for await (const ev of this.streamEvents(opts)) {
+      if (ev.type === 'text') text += ev.text
+      else if (ev.type === 'tool_call') toolCalls.push(ev.call)
+    }
+    return { text, toolCalls }
+  }
+
   /** Embeddings via the same server; used by RAG when the embedding model is loaded. */
   async embed(texts: string[], port?: number): Promise<number[][]> {
     const target = port ?? this.current?.port

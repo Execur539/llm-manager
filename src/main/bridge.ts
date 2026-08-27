@@ -40,7 +40,14 @@ import { downloadQueue } from './downloads/queue'
 import { apiServer } from './api/server'
 import { tunnel } from './remote/tunnel'
 import { remoteWeb } from './remote/web'
-import { certificates, startDdnsUpdates, stopDdnsUpdates, updateFreedns, verifyDomainPointsHere, publicIp } from './remote/selfhost'
+import {
+  certificates,
+  startDdnsUpdates,
+  stopDdnsUpdates,
+  updateFreedns,
+  verifyDomainPointsHere,
+  publicIp
+} from './remote/selfhost'
 import {
   generateApiKey,
   getApiKey,
@@ -79,6 +86,17 @@ const pendingPermissions = new Map<string, (d: PermissionDecision) => void>()
  * cut off another.
  */
 const inFlightChats = new Map<string, AbortController>()
+
+/**
+ * The agent turn in flight, covering the orchestration around the loop as well as the loop.
+ *
+ * `agent.stop()` aborts whatever request the loop is making, which is enough for an ordinary
+ * turn. Under Ultra it is not: each planning sample runs its own loop with its own controller,
+ * so stopping one merely ended that sample and the next began — several more minutes of work
+ * after the user asked for none. This is checked between samples and passed to the synthesis
+ * call, which had no signal at all and could not be interrupted.
+ */
+let agentTurnAbort: AbortController | null = null
 
 /**
  * Settle every outstanding approval prompt as a denial.
@@ -271,8 +289,14 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
     JSON.stringify(actual),
     Date.now()
   )
-  run('INSERT OR REPLACE INTO model_meta (model_id, repo, favourite, tags, last_used_at) VALUES (?, ?, COALESCE((SELECT favourite FROM model_meta WHERE model_id = ?), 0), ?, ?)',
-    model.id, model.repo, model.id, JSON.stringify(model.tags), Date.now())
+  run(
+    'INSERT OR REPLACE INTO model_meta (model_id, repo, favourite, tags, last_used_at) VALUES (?, ?, COALESCE((SELECT favourite FROM model_meta WHERE model_id = ?), 0), ?, ?)',
+    model.id,
+    model.repo,
+    model.id,
+    JSON.stringify(model.tags),
+    Date.now()
+  )
 
   emit('model:status', {
     model: model.filename,
@@ -326,10 +350,7 @@ async function pruneStagedUploads(): Promise<void> {
  * Paths are still named alongside, because they remain genuinely useful: the agent can copy,
  * move or convert a file it can also see.
  */
-async function attachmentTurn(
-  input: string,
-  files: string[]
-): Promise<{ text: string; media: ContentPart[] }> {
+async function attachmentTurn(input: string, files: string[]): Promise<{ text: string; media: ContentPart[] }> {
   const caps = llama.loaded?.model.caps
   if (!caps) return { text: input, media: [] }
 
@@ -502,7 +523,10 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   },
 
   // ---- auto-fit
-  'autofit:plan': async (modelId: string, overrides?: Record<string, unknown>): Promise<FitResult | { error: string }> => {
+  'autofit:plan': async (
+    modelId: string,
+    overrides?: Record<string, unknown>
+  ): Promise<FitResult | { error: string }> => {
     const model = library.find((m) => m.id === modelId)
     if (!model) return { error: 'Model not found' }
     if (!model.arch) return { error: model.error ?? 'Model metadata could not be parsed' }
@@ -556,7 +580,11 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       cancelled = true
     }
     relocationCancel = off
-    const result = await performMove(proposal, (p) => emit('relocation:progress', p), () => cancelled)
+    const result = await performMove(
+      proposal,
+      (p) => emit('relocation:progress', p),
+      () => cancelled
+    )
     relocationCancel = null
     return result
   },
@@ -645,11 +673,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const result = await dialog.showSaveDialog({
       title: 'Export conversation',
       defaultPath: `${exportFilename(title, `chat-${id.slice(0, 8)}`)}.${format}`,
-      filters: [
-        format === 'md'
-          ? { name: 'Markdown', extensions: ['md'] }
-          : { name: 'JSON', extensions: ['json'] }
-      ]
+      filters: [format === 'md' ? { name: 'Markdown', extensions: ['md'] } : { name: 'JSON', extensions: ['json'] }]
     })
     if (result.canceled || !result.filePath) return null
     return offerReveal(writeExport(id, format, result.filePath))
@@ -753,21 +777,20 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      * chat:delta, which means everything downstream — the store, the caret, the markdown
      * renderer — sees exactly what it sees for an ordinary turn.
      */
-    if (isUltra(reasoning ?? null)) {
-      const cfg = loadSettings().ultra
-      const { synthesis } = await ultraSamples(request, cfg, {
-        onSampleStart: (index, total) => emit('chat:ultra-sample-start', { chatId, index, total }),
-        onSampleDelta: (index, t) => emit('chat:ultra-sample-delta', { chatId, index, text: t }),
-        onSampleReasoning: (index, t) =>
-          emit('chat:ultra-sample-reasoning', { chatId, index, text: t }),
-        onSample: (sample) => emit('chat:ultra-sample', { chatId, sample }),
-        onSynthesisStart: () => emit('chat:ultra-synthesis', { chatId })
-      })
-      request.messages = synthesis
-    }
-
     let stopped = false
     try {
+      if (isUltra(reasoning ?? null)) {
+        const cfg = loadSettings().ultra
+        const { synthesis } = await ultraSamples(request, cfg, {
+          onSampleStart: (index, total) => emit('chat:ultra-sample-start', { chatId, index, total }),
+          onSampleDelta: (index, t) => emit('chat:ultra-sample-delta', { chatId, index, text: t }),
+          onSampleReasoning: (index, t) => emit('chat:ultra-sample-reasoning', { chatId, index, text: t }),
+          onSample: (sample) => emit('chat:ultra-sample', { chatId, sample }),
+          onSynthesisStart: () => emit('chat:ultra-synthesis', { chatId })
+        })
+        request.messages = synthesis
+      }
+
       for await (const ev of llama.streamEvents(request)) {
         if (ev.type === 'text') {
           answer += ev.text
@@ -789,7 +812,15 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       if (!abort.signal.aborted) throw err
       stopped = true
     } finally {
-      inFlightChats.delete(chatId)
+      /*
+       * Only clear the entry if it is still ours.
+       *
+       * A second turn on the same conversation replaces the controller before this one unwinds —
+       * the API server and a remote browser can both send into a chat the desktop is already
+       * using. Deleting unconditionally removed the *new* turn's controller, leaving it running
+       * with no way to stop it.
+       */
+      if (inFlightChats.get(chatId) === abort) inFlightChats.delete(chatId)
     }
 
     const assistantMsg = {
@@ -816,12 +847,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     syncAgentOptions()
     return a.listTools()
   },
-  'agent:run': async (
-    sessionId: string,
-    input: string,
-    reasoning?: ReasoningChoice,
-    attachments?: string[]
-  ) => {
+  'agent:run': async (sessionId: string, input: string, reasoning?: ReasoningChoice, attachments?: string[]) => {
     const session = chats.loadSession(sessionId)
     if (!session) throw new Error(`No session ${sessionId}`)
 
@@ -869,6 +895,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
 
     const before = session.messages.length
     activeAgentSessionId = sessionId
+    const turnAbort = new AbortController()
+    agentTurnAbort = turnAbort
     a.hydrate(session)
     // A prompt left unanswered by an earlier turn (window reloaded, remote tab closed) would
     // otherwise sit in the map forever and never be answerable again.
@@ -892,6 +920,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         const plans: string[] = []
 
         for (let i = 0; i < count; i++) {
+          // Asked to stop, stop — rather than starting the next several minutes of planning.
+          if (turnAbort.signal.aborted) break
           emit('agent:ultra-sample-start', { sessionId, index: i, total: count })
           const startedAt = Date.now()
           const plan = await a.planOnce(session, turn.text, turn.media, temps[i], {
@@ -913,7 +943,12 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         }
 
         emit('agent:ultra-synthesis', { sessionId })
-        const chosen = await llama.complete({ messages: planSynthesisMessages(turn.text, plans) })
+        const chosen = turnAbort.signal.aborted
+          ? ''
+          : await llama.complete({
+              messages: planSynthesisMessages(turn.text, plans),
+              signal: turnAbort.signal
+            })
         // A synthesis that comes back empty must not silently strip the user's own request.
         prompt = chosen.trim() ? `${turn.text}\n\n${planPreamble(chosen)}` : turn.text
         // Shown in a box of its own. It shapes everything that follows, so it should be
@@ -924,15 +959,30 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         }
       }
 
-      await a.run(session, prompt, turn.media, displayText, { userMessageId, plan: chosenPlan })
+      if (!turnAbort.signal.aborted) {
+        await a.run(session, prompt, turn.media, displayText, { userMessageId, plan: chosenPlan })
+      }
     } finally {
       drainPendingPermissions()
       // Persist on the way out either way. A turn that ends in an error still did real work —
       // the user's message, and any tool exchanges that already completed — and throwing that
       // away silently is worse than showing a transcript that stops mid-turn. Approvals the
       // user granted during the turn are worth keeping for the same reason.
+      /*
+       * A turn stopped during planning never reached the loop, so nothing recorded the message
+       * that started it — it would have been on screen until the next reload and then gone.
+       */
+      if (session.messages.length === before) {
+        session.messages.push({
+          id: userMessageId,
+          role: 'user',
+          content: displayText,
+          createdAt: Date.now()
+        })
+      }
       for (const m of session.messages.slice(before)) chats.appendMessage(sessionId, m)
       persistPermissionRules()
+      if (agentTurnAbort === turnAbort) agentTurnAbort = null
     }
 
     chats.autoTitle(sessionId)
@@ -944,6 +994,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     return true
   },
   'agent:stop': () => {
+    agentTurnAbort?.abort()
     agent?.stop()
     // Aborting the run does not settle a prompt the agent is already awaiting.
     drainPendingPermissions()
@@ -1029,9 +1080,11 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
 
       let warning: string | null = null
       if (!caps) warning = 'No model is loaded yet.'
-      else if (kind === 'image' && !caps.vision) warning = 'This model has no vision projector, so the image will be skipped.'
+      else if (kind === 'image' && !caps.vision)
+        warning = 'This model has no vision projector, so the image will be skipped.'
       else if (kind === 'audio' && !caps.audio) warning = 'This model does not accept audio, so it will be skipped.'
-      else if (kind === 'video' && !caps.videoPossible) warning = 'This model cannot read video without a vision projector.'
+      else if (kind === 'video' && !caps.videoPossible)
+        warning = 'This model cannot read video without a vision projector.'
 
       out.push({ path: file, name: path.basename(file), kind, bytes, warning })
     }
@@ -1069,7 +1122,12 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const dir = path.join(TOOL_OUTPUT_DIR, 'attachments')
     await fsp.mkdir(dir, { recursive: true })
 
-    const dest = uniquePath(dir, `${Date.now().toString(36)}-${safe.replace(/\.[^.]*$/, '')}`, ext.replace(/^\./, '') || 'bin', (p) => fs.existsSync(p))
+    const dest = uniquePath(
+      dir,
+      `${Date.now().toString(36)}-${safe.replace(/\.[^.]*$/, '')}`,
+      ext.replace(/^\./, '') || 'bin',
+      (p) => fs.existsSync(p)
+    )
     await fsp.writeFile(dest, Buffer.from(String(base64 ?? ''), 'base64'))
     const [info] = (await handlers['attachments:describe']([dest] as never)) as AttachmentInfo[]
     return info
@@ -1090,7 +1148,9 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   'rag:ingest': async (target: { collectionId?: string; chatId?: string }) => {
     const result = await dialog.showOpenDialog({
       properties: ['openFile', 'multiSelections'],
-      filters: [{ name: 'Documents', extensions: ['txt', 'md', 'pdf', 'json', 'csv', 'ts', 'js', 'py', 'rs', 'go', 'java'] }]
+      filters: [
+        { name: 'Documents', extensions: ['txt', 'md', 'pdf', 'json', 'csv', 'ts', 'js', 'py', 'rs', 'go', 'java'] }
+      ]
     })
     if (result.canceled) return []
 
