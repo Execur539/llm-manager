@@ -1306,15 +1306,20 @@ const scenarios = {
       report.check('rag-ingest', 'a document is ingested',
         Array.isArray(ingested) && ingested.length > 0, JSON.stringify(ingested).slice(0, 200))
 
+      // Both of these take a scope object, not a bare id. Passing the id positionally made
+      // `rag:documents` list every document in the database and `rag:retrieve` search all of
+      // them for the collection's id as if it were the query — so both assertions passed while
+      // testing something else entirely, and the retrieval one only turned red once an unscoped
+      // search stopped meaning "everything".
       const docs = await page.evaluate(
-        (id) => window.api.invoke('rag:documents', id),
+        (id) => window.api.invoke('rag:documents', { collectionId: id }),
         collectionId
       )
       report.check('rag-ingest', 'the document is listed in the collection',
         Array.isArray(docs) && docs.length > 0, `${(docs ?? []).length} documents`)
 
       const hits = await page.evaluate(
-        (id) => window.api.invoke('rag:retrieve', id, 'how does grouped query attention affect the cache?', 3),
+        (id) => window.api.invoke('rag:retrieve', 'how does grouped query attention affect the cache?', { collectionId: id }),
         collectionId
       ).catch((e) => ({ error: String(e) }))
       report.check('rag-ingest', 'retrieval returns chunks',
@@ -1753,13 +1758,26 @@ const scenarios = {
             await page.waitForTimeout(140)
           }
         }
+        /*
+         * The panel opens upward over the composer, which is where the room is — the meta row it
+         * hangs off sits at the bottom of the window. A person dismisses it by clicking away
+         * before typing; `fill()` dispatches no pointer event, so the panel stayed open and
+         * Playwright refused to click a send button it could see was covered.
+         */
+        const closeEffort = async () => {
+          if ((await page.getByTestId('reasoning-pop').count()) > 0) {
+            await page.keyboard.press('Escape')
+            await page.waitForTimeout(140)
+          }
+        }
 
         // Stops are read from the template: low, medium, xhigh — plus an off position, which is
-        // offered for every reasoning model whether or not the template has a switch of its own.
+        // offered for every reasoning model whether or not the template has a switch of its own,
+        // and Ultra at the far end, which is a runtime mode rather than a level the model knows.
         await openEffort()
         const range = page.getByTestId('reasoning-slider')
         const max = Number(await range.getAttribute('max'))
-        report.check('reasoning', 'a stop per level, plus off', max === 3, `max=${max}`)
+        report.check('reasoning', 'a stop per level, plus off and ultra', max === 4, `max=${max}`)
 
         const initial = await level()
         report.check('reasoning', "it starts on the template's own default", initial === 'Extra high', String(initial))
@@ -1771,8 +1789,8 @@ const scenarios = {
           await page.waitForTimeout(120)
           names.push(await level())
         }
-        report.check('reasoning', 'stops are ordered off -> weakest -> strongest',
-          names.join(',') === 'Off,Low,Medium,Extra high', names.join(','))
+        report.check('reasoning', 'stops are ordered off -> weakest -> strongest -> ultra',
+          names.join(',') === 'Off,Low,Medium,Extra high,Ultra', names.join(','))
         // 'high' is an alias for 'xhigh' in this template; offering it would be a dead stop.
         report.check('reasoning', 'an aliased level is not offered as its own stop',
           !names.includes('High'), names.join(','))
@@ -1782,6 +1800,7 @@ const scenarios = {
         // ---- does the choice actually reach llama-server?
         await range.fill('1') // low
         await page.waitForTimeout(150)
+        await closeEffort()
         await page.getByTestId('chat-input').fill('[[mock:params]] what did you get?')
         await page.getByTestId('chat-send').click()
         await page.waitForFunction(
@@ -1797,8 +1816,10 @@ const scenarios = {
           /"reasoning_effort"\s*:\s*"low"/.test(body), body.slice(-200))
 
         // ---- off must disable thinking through both switches
+        await openEffort()
         await range.fill('0')
         await page.waitForTimeout(150)
+        await closeEffort()
         await page.getByTestId('chat-input').fill('[[mock:params]] and now?')
         await page.getByTestId('chat-send').click()
         await page.waitForFunction(
@@ -1825,6 +1846,7 @@ const scenarios = {
           !/"reasoning_effort"\s*:\s*"none"/.test(body), body.slice(-260))
 
         // The choice belongs to the conversation, not the app.
+        await closeEffort()
         await page.getByTestId('new-conversation').click()
         await page.waitForTimeout(500)
         const fresh = await level()
@@ -1835,6 +1857,7 @@ const scenarios = {
         await openEffort()
         await page.getByTestId('reasoning-slider').fill('1')
         await page.waitForTimeout(150)
+        await closeEffort()
         await goTo(page, 'Dashboard')
         await goTo(page, 'Chat')
         await page.waitForTimeout(500)

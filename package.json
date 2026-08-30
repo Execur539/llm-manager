@@ -19,7 +19,8 @@
     "dist": "npm run pack:installer && npm run pack:portable",
     "test:e2e": "node scripts/e2e/run.mjs",
     "verify:packaged": "node scripts/e2e/verify-packaged.mjs",
-    "verify:portable": "node scripts/e2e/verify-portable.mjs"
+    "verify:portable": "node scripts/e2e/verify-portable.mjs",
+    "make-icon": "node scripts/make-icon.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
@@ -64,6 +65,7 @@
       "target": [
         "nsis"
       ],
+      "icon": "build/icon.ico",
       "artifactName": "LLM-Manager-${version}-setup.${ext}"
     },
     "nsis": {

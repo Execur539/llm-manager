@@ -134,7 +134,9 @@ added so this cannot hide again: the resolved root is logged on every launch, an
 Verified from the portable exe's own log:
 
 ```
-[vendor] root=...untime-0.1.0esourcesendor exists=true
+[vendor] root=...
+untime-0.1.0
+esourcesendor exists=true
          present: llama.cpp, ffmpeg, python, cloudflared, rg, chromium, models
          missing: []
 ```
@@ -163,12 +165,19 @@ Two further corrections this exposed, both mine:
 2. NSIS cannot emit an output above ~2 GB. The first attempt failed at 1.94 GB, which is what
    surfaced the `.cache` packaging bug.
 
+Since covered by the end-to-end suite (`npm run test:e2e`, 40 scenarios against the real app and
+a stand-in inference server): the agent loop including tool approval, plan mode, checkpoints and
+rewind; RAG ingestion, embedding and retrieval; the OpenAI and Anthropic HTTP surfaces including
+streaming; MCP against a live server; attachments; the remote UI's auth gating; and the reasoning
+control end to end.
+
 Still unexercised:
-- The full agent loop (the tool-call *mechanism* is verified; the loop around it is not).
-- RAG embedding — needs the second llama-server for the embedding model.
-- Multimodal message construction and FFmpeg frame extraction.
-- The tunnel, ACME issuance, and the remote web UI end to end.
-- The API server's HTTP surface.
+- The Cloudflare tunnel and ACME issuance — both need the real internet and a real domain.
+- The remote web UI over an actual tunnel, as opposed to its handlers and auth gating.
+- Ultra's budget forcing against a real model. The plumbing and the degeneracy detection are
+  covered by unit tests, but whether reopening a `<think>` block actually continues the thought
+  depends on the template, and that has only been reasoned about, not measured.
+- Cross-volume relocation of a large models folder, and the updater's exe-swap script.
 
 **Untested code paths that don't need a model:**
 - Cross-volume relocation of a large models folder.

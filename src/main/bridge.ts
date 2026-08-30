@@ -13,6 +13,7 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import type {
   AppSettings,
+  Backend,
   FitPlan,
   FitResult,
   HardwareSnapshot,
@@ -425,7 +426,16 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     return hardware
   },
   'runtime:missing-binaries': async () => missingBinaries((await getHardware()).backend),
-  'runtime:vendor-diagnostics': async () => vendorDiagnostics((await getHardware()).backend),
+  /**
+   * What the bundled vendor tree looks like, for a backend of the caller's choosing.
+   *
+   * The argument was accepted and ignored. `verify:packaged` loops over cuda, vulkan and cpu and
+   * reports a line for each — so the pre-ship check that exists to prove all three backends are
+   * present was verifying the detected one three times, and an incomplete Vulkan tree would have
+   * shipped green from a CUDA machine.
+   */
+  'runtime:vendor-diagnostics': async (backend?: Backend) =>
+    vendorDiagnostics(backend ?? (await getHardware()).backend),
   'runtime:vendor-info': async () => ({
     exeDir: exeDir(),
     modelsDir: modelsDir(),

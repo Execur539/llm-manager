@@ -64,7 +64,8 @@ try {
 
   // ---- the thing that was broken before
   const paths = await page.evaluate(() => window.api.invoke('app:paths'))
-  console.log(`\n  resources: ${paths?.resources ?? '?'}`)
+  // `app:paths` returns exeDir and modelsDir; the old label named a field it never had.
+  console.log(`\n  exe dir:   ${paths?.exeDir ?? '?'}`)
   console.log(`  models:    ${paths?.modelsDir ?? '?'}`)
 
   for (const backend of ['cuda', 'vulkan', 'cpu']) {
@@ -77,10 +78,22 @@ try {
     )
   }
 
-  // ---- the sidecars the agent tools depend on
+  /*
+   * The sidecars the agent tools depend on.
+   *
+   * `missing` is a list, and every value here used to be tested with `!!value` — so the one field
+   * that actually reports a problem passed whether it was empty or full, under the label "sidecar
+   * present: missing". It is checked for emptiness now, and the rest keep the truthiness test
+   * that suits a path or a flag.
+   */
   const info = await page.evaluate(() => window.api.invoke('runtime:vendor-info'))
-  for (const [name, present] of Object.entries(info ?? {})) {
-    check(`sidecar present: ${name}`, !!present, String(present))
+  for (const [name, value] of Object.entries(info ?? {})) {
+    if (name === 'missing') {
+      const list = Array.isArray(value) ? value : []
+      check('nothing is reported missing', list.length === 0, list.join(', ') || 'none')
+      continue
+    }
+    check(`sidecar present: ${name}`, !!value, String(value))
   }
 
   // ---- hardware detection has to work from the packaged process too

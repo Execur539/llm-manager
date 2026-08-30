@@ -141,7 +141,18 @@ async function detectCapabilities(
       const keys = Object.keys(kv).join(' ').toLowerCase()
       vision = keys.includes('clip.vision') || keys.includes('clip.has_vision_encoder') || keys.includes('clip.')
       audio = keys.includes('clip.has_audio_encoder') || keys.includes('audio') || keys.includes('whisper')
+      /*
+       * The declared value wins over the presence of the key.
+       *
+       * The guesses above match key *names*, so a projector carrying
+       * `clip.has_audio_encoder = false` — a vision-only one being explicit about it — was read
+       * as accepting audio, because the substring is there either way. Vision had this
+       * correction; audio only had the half that turns it on, so the model advertised an input
+       * it would reject.
+       */
       if (kv['clip.has_vision_encoder'] === false) vision = false
+      if (kv['clip.has_vision_encoder'] === true) vision = true
+      if (kv['clip.has_audio_encoder'] === false) audio = false
       if (kv['clip.has_audio_encoder'] === true) audio = true
     } catch {
       // An unreadable mmproj still signals *some* multimodal intent; assume vision.

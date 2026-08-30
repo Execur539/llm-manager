@@ -30,6 +30,13 @@ predicted speed and context and lets you choose.
 **Chat.** Streaming conversations with history, search and export. Images, audio and video
 attachments on capable models. Document collections for retrieval-grounded answers.
 
+**Effort.** Reasoning models expose their own effort levels, read out of the model's chat template
+rather than guessed — plus Off on every one of them, and **Ultra**: a stop above the model's native
+maximum, built from the runtime rather than the template. It runs several independent attempts,
+pushes each to keep thinking past where it would have stopped, and reads them together into one
+answer. In the agent it investigates the task several times with read-only tools, then executes
+the winning plan once for real.
+
 **Agent.** A supervised tool-calling loop in the spirit of Claude Code: read and write files, run
 commands and background jobs, search and browse the web, control the desktop, execute Python and
 JavaScript, and connect any MCP server for everything else. Reads run freely; writes and commands
@@ -70,7 +77,7 @@ failing mysteriously.
 
 ```bash
 npm run typecheck        # both tsconfigs
-npm test                 # 102 assertions over the pure logic
+npm test                 # 282 assertions over the pure logic
 npm run pack:installer   # NSIS installer
 npm run pack:portable    # single-file portable exe
 ```
@@ -81,8 +88,7 @@ on **every** launch and deletes it on exit — measured at ~24s per launch here.
 `portable.unpackDirName` only stabilises the directory name; it does not make the extraction
 skippable.
 
-Our launcher unpacks once to `%LOCALAPPDATA%\LLMManager
-untime-<version>` and writes a
+Our launcher unpacks once to `%LOCALAPPDATA%\LLMManager\runtime-<version>` and writes a
 completion marker, so later launches start immediately. The marker is written last, so a
 half-finished extraction is never mistaken for a good one, and old `runtime-*` directories are
 removed after a successful upgrade.
@@ -110,7 +116,7 @@ Builds are unsigned, so Windows SmartScreen warns on first run.
 ├── llmmanager.db              chats, sessions, stats, RAG, memory
 ├── models-path.json           breadcrumb that makes relocation possible
 ├── checkpoints/               per-turn file snapshots for rewind
-├── tool-output/               full text of truncated tool results
+├── tool-output/               truncated tool results, screenshots, video frames
 └── logs/                      rotating logs
 ```
 

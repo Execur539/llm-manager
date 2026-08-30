@@ -32,6 +32,15 @@ const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
 const VERSION = pkg.version
 const PRODUCT = pkg.build?.productName ?? 'LLM Manager'
 const OUTFILE = path.join(RELEASE, `${PRODUCT.replace(/\s+/g, '-')}-${VERSION}-portable.exe`)
+const ICON = path.join(ROOT, 'build', 'icon.ico')
+/*
+ * NSIS's VIProductVersion demands exactly four numeric parts.
+ *
+ * package.json's version is semver, so anything with a prerelease tag — 1.0.0-rc.1 — would make
+ * makensis fail on a field that has nothing to do with what is being built. Derived here, where
+ * string handling is possible, rather than in the script, where it is not.
+ */
+const VERSION4 = [...VERSION.split('-')[0].split('.'), '0', '0', '0', '0'].slice(0, 4).join('.')
 
 /**
  * The payload ships as two archives.
@@ -289,12 +298,15 @@ async function main() {
     run(makensis, [
       '/V2',
       `/DVERSION=${VERSION}`,
+      `/DVERSION4=${VERSION4}`,
       `/DAPP_ARCHIVE=${APP_ARCHIVE}`,
       `/DVENDOR_ARCHIVE=${VENDOR_ARCHIVE}`,
       `/DEXTRACTOR=${sevenZip}`,
       `/DAPPEXE=${PRODUCT}.exe`,
       `/DBUILDID=${buildId}`,
       `/DOUTFILE=${OUTFILE}`,
+      // Optional: the launcher falls back to the NSIS default if the icon has not been generated.
+      ...(fs.existsSync(ICON) ? [`/DICON=${ICON}`] : []),
       path.join(ROOT, 'build', 'portable.nsi')
     ])
   )

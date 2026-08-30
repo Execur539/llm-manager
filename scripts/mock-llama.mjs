@@ -167,10 +167,20 @@ function promptReply(messages) {
   return typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? null)
 }
 
+/*
+ * Every reasoning field the request could carry, so a scenario can assert on any of them.
+ *
+ * This reported only the two the template reads. The budget fields arrived later — they are how
+ * Off works on a template that enumerates levels and offers no way to say "none" — and were
+ * invisible here, so the assertion that Off actually sets a budget could not pass however
+ * correct the app was. Both spellings, because the request sends both.
+ */
 function paramsReply(body) {
   return JSON.stringify({
     reasoning_effort: body.reasoning_effort ?? null,
-    chat_template_kwargs: body.chat_template_kwargs ?? null
+    chat_template_kwargs: body.chat_template_kwargs ?? null,
+    reasoning_budget: body.reasoning_budget ?? null,
+    thinking_budget: body.thinking_budget ?? null
   })
 }
 
