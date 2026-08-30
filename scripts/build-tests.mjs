@@ -16,6 +16,7 @@ await build({
     gpu: path.join(ROOT, 'src/main/hardware/gpu.ts'),
     filenames: path.join(ROOT, 'src/main/storage/filenames.ts'),
     db: path.join(ROOT, 'src/main/storage/db.ts'),
+    repo: path.join(ROOT, 'src/main/chat/repo.ts'),
     ultra: path.join(ROOT, 'src/main/ultra/index.ts'),
     markdown: path.join(ROOT, 'src/renderer/src/lib/markdown.ts')
   },

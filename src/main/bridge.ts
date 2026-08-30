@@ -7,7 +7,7 @@
  * so a handler cannot forget to check.
  */
 
-import { app, dialog, BrowserWindow } from 'electron'
+import { app, dialog, shell, BrowserWindow } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -32,12 +32,12 @@ import { missingBinaries, embeddingModelPath, vendorDiagnostics } from './runtim
 import { Agent } from './agent/loop'
 import { killAllJobs } from './agent/tools/exec'
 import { closeBrowser } from './agent/tools/browser'
-import { listCheckpoints, rewindTo } from './agent/checkpoints'
+import { listCheckpoints, rewindTo, discardCheckpoints } from './agent/checkpoints'
 import { mcpManager } from './agent/mcp'
 import { addMemory, allMemory, deleteMemory, updateMemory } from './agent/memory'
 import { searchModels, listFiles, recommendQuant, findMmprojFor } from './downloads/hf'
 import { downloadQueue } from './downloads/queue'
-import { apiServer } from './api/server'
+import { apiServer, requestQueue } from './api/server'
 import { tunnel } from './remote/tunnel'
 import { remoteWeb } from './remote/web'
 import {
@@ -66,7 +66,7 @@ import { historicalStats, liveStats, requestLog, recordGeneration, clearStats, s
 import { buildDiagnostics, logger } from './log'
 import { exportChat, writeExport, all, run, get } from './storage/db'
 import { exportFilename, uniquePath } from './storage/filenames'
-import { reasoningRequestFields, isUltra, type ReasoningChoice } from './models/reasoning'
+import { reasoningRequestFields, isUltra, sendableChoice, type ReasoningChoice } from './models/reasoning'
 import { ultraSamples, sampleTemperatures, planSynthesisMessages, planPreamble } from './ultra'
 import { checkForUpdate, applyUpdate } from './update'
 
@@ -315,25 +315,42 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
 const STAGED_UPLOAD_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 /**
- * Remove old staged uploads.
+ * Remove everything in the tool-output directory that has aged out.
  *
- * A remote session cannot send a path, so its files are written here and referenced by path from
- * then on. Nothing else ever deletes them, so without this the directory grows for the life of
- * the install. A week is long enough that the file outlives the conversation it was sent in, and
- * short enough that a few large videos do not accumulate silently.
+ * Four things write here and only one of them was ever cleaned up:
+ *   - staged uploads, because a remote session cannot send a path and posts the bytes instead;
+ *   - the full text of any tool result too large to fit in context, kept so the agent can page
+ *     back into it with read_file;
+ *   - desktop and browser screenshots, several megabytes each on a high-resolution display;
+ *   - video frames, sixteen JPEGs per clip.
+ *
+ * Only the first had a sweep, so the rest grew for the life of the install — a few long agent
+ * sessions with screenshots and big greps put hundreds of megabytes here permanently. A week is
+ * long enough that everything outlives the conversation that produced it.
  */
 async function pruneStagedUploads(): Promise<void> {
-  const dir = path.join(TOOL_OUTPUT_DIR, 'attachments')
   const cutoff = Date.now() - STAGED_UPLOAD_TTL_MS
 
-  for (const name of await fsp.readdir(dir).catch(() => [] as string[])) {
-    const file = path.join(dir, name)
-    try {
-      if ((await fsp.stat(file)).mtimeMs < cutoff) await fsp.rm(file, { force: true })
-    } catch {
-      // Best effort: a file that cannot be examined is left alone.
+  const sweep = async (dir: string): Promise<void> => {
+    for (const entry of await fsp.readdir(dir, { withFileTypes: true }).catch(() => [])) {
+      const target = path.join(dir, entry.name)
+      try {
+        // `attachments` is the long-lived home for staged uploads; its contents age out, it does
+        // not. Everything else here — including each `frames-*` directory — goes as a unit.
+        if (entry.isDirectory() && dir === TOOL_OUTPUT_DIR && entry.name === 'attachments') {
+          await sweep(target)
+          continue
+        }
+        if ((await fsp.stat(target)).mtimeMs < cutoff) {
+          await fsp.rm(target, { recursive: true, force: true })
+        }
+      } catch {
+        // Best effort: anything that cannot be examined is left alone.
+      }
     }
   }
+
+  await sweep(TOOL_OUTPUT_DIR)
 }
 
 /**
@@ -656,8 +673,11 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     chats.renameChat(id, title)
     return true
   },
-  'chat:delete': (id: string) => {
+  'chat:delete': async (id: string) => {
     chats.deleteChat(id)
+    // Messages, tasks and attachments cascade out of the database; a session's file snapshots
+    // live on disk and were left behind, holding a full copy of everything the agent had edited.
+    await discardCheckpoints(id)
     return true
   },
   'chat:search': (query: string) => chats.searchChats(query),
@@ -690,6 +710,10 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   ) => {
     const loaded = llama.loaded
     if (!loaded) throw new Error('No model is loaded')
+
+    // A choice the loaded model cannot express is no choice — see sendableChoice. Narrowed here
+    // rather than trusted, because the API server and a remote browser send this field too.
+    const effort = sendableChoice(loaded.model.caps.reasoning, reasoning ?? null)
 
     const history = chats.loadMessages(chatId)
     const messages = history.map((m) => ({
@@ -766,7 +790,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       messages: [...messages, { role: 'user', content: userContent }],
       signal: abort.signal,
       // Dropped silently if the model never advertised the level — see reasoningRequestFields.
-      ...reasoningRequestFields(loaded.model.caps.reasoning, reasoning ?? null)
+      ...reasoningRequestFields(loaded.model.caps.reasoning, effort)
     }
 
     /*
@@ -779,7 +803,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      */
     let stopped = false
     try {
-      if (isUltra(reasoning ?? null)) {
+      if (isUltra(effort)) {
         const cfg = loadSettings().ultra
         const { synthesis } = await ultraSamples(request, cfg, {
           onSampleStart: (index, total) => emit('chat:ultra-sample-start', { chatId, index, total }),
@@ -874,9 +898,13 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       ? `${input}\n\n[Attached: ${attachments.map((f) => path.basename(f)).join(', ')}]`
       : input
 
+    // Same narrowing as the chat path: the stored level may belong to a model that is no longer
+    // the one loaded.
+    const effort = sendableChoice(llama.loaded?.model.caps.reasoning, reasoning ?? null)
+
     const a = getAgent()
     syncAgentOptions()
-    a.updateOptions({ cwd: session.cwd, reasoningChoice: reasoning ?? null })
+    a.updateOptions({ cwd: session.cwd, reasoningChoice: effort })
 
     /*
      * Show the user's message before doing anything slow with it.
@@ -913,7 +941,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
        */
       let prompt = turn.text
       let chosenPlan: string | undefined
-      if (isUltra(reasoning ?? null)) {
+      if (isUltra(effort)) {
         const cfg = loadSettings().ultra
         const count = Math.max(1, Math.min(8, Math.round(cfg.samples)))
         const temps = sampleTemperatures(count)
@@ -1200,7 +1228,22 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     emit('server:status', { running: false, port: null })
     return { running: false }
   },
-  'server:status': () => ({ running: apiServer.running, port: apiServer.port, queue: 0 }),
+  /*
+   * Everything the Server view needs to describe the server honestly.
+   *
+   * `queue` used to be hardcoded to zero while requests were genuinely backed up. `hasApiKey`
+   * is here because the view had no way to learn that a key already existed — it showed "none
+   * set" on every launch, so the obvious move was to generate one, silently invalidating the key
+   * every configured client was already using. It reports only whether a key exists, never the
+   * key, because this handler answers remote callers too.
+   */
+  'server:status': () => ({
+    running: apiServer.running,
+    port: apiServer.port,
+    queue: requestQueue.depth,
+    hasApiKey: !!getApiKey(),
+    networkBlocked: apiServer.exposureRefused
+  }),
   'server:generate-key': () => generateApiKey(),
   'server:clear-key': () => {
     setApiKey(null)
@@ -1231,6 +1274,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       await remoteWeb.start({
         port: 443,
         invoke: invokeBridge,
+        mode: 'own-domain',
         tls: { certPath: cert.certPath, keyPath: cert.keyPath }
       })
       patchSettings({ remote: { enabled: true, mode, domain } })
@@ -1238,7 +1282,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       return { url: `https://${domain}` }
     }
 
-    await remoteWeb.start({ port: webPort, invoke: invokeBridge })
+    await remoteWeb.start({ port: webPort, invoke: invokeBridge, mode: 'tunnel' })
     const state = await tunnel.start(webPort)
     patchSettings({ remote: { enabled: true, mode: 'tunnel', domain: null } })
     emit('remote:status', { url: state.url, mode: 'tunnel' })
@@ -1269,9 +1313,23 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   'diagnostics:build': async () => buildDiagnostics(),
   'diagnostics:reveal': async () => {
     const { path: p } = await buildDiagnostics()
-    const { shell } = await import('electron')
     shell.showItemInFolder(p)
     return p
+  },
+
+  /**
+   * Show a file this process wrote in the file manager.
+   *
+   * The allow-list above was already being maintained for this, but the handler it was written
+   * for did not exist — so the "Show" button on an export toast called an unknown channel and
+   * threw instead of opening anything. Only paths `offerReveal` has handed out are accepted, so
+   * the argument is a token rather than a path the caller gets to choose.
+   */
+  'shell:reveal': (file: string) => {
+    const resolved = path.resolve(String(file ?? ''))
+    if (!revealable.has(resolved)) throw new Error('That file was not offered for reveal.')
+    shell.showItemInFolder(resolved)
+    return true
   },
 
   // ---- updates

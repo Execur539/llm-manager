@@ -228,6 +228,23 @@ class DownloadQueue extends EventEmitter {
 
       await pipeline(source, out)
       this.setProgress(item.id, done)
+
+      /*
+       * A short file is a failure, not a finished download.
+       *
+       * Nothing checked the length before renaming, so a connection dropped near the end — or a
+       * proxy that closed the body early — produced a truncated .gguf sitting in the models
+       * folder under its real name, indistinguishable from a good one until something tried to
+       * load it. Left as a .partial, it resumes from where it stopped instead.
+       */
+      // Only when the server said how long the body would be. Without Content-Length, `total`
+      // collapses to whatever the resume started at, and every good chunked resume looks short.
+      if (contentLength > 0 && done !== total) {
+        throw new Error(
+          `Download stopped at ${done} of ${total} bytes. The partial file was kept, so resuming will continue from there.`
+        )
+      }
+
       await this.finalise(item, partial)
     } catch (err) {
       this.active.delete(item.id)

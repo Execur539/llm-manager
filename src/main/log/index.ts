@@ -27,20 +27,52 @@ function logFile(): string {
   return path.join(LOGS_DIR, `llmmanager-${new Date().toISOString().slice(0, 10)}.log`)
 }
 
-function ensureStream(): fs.WriteStream {
+/** Set while a rotation is closing the old file; writes are dropped rather than misdirected. */
+let rotating = false
+/** When rotation last failed, so a locked file is not retried on every single line. */
+let rotationBlockedUntil = 0
+
+/**
+ * The open log stream, or null while the file is being rotated.
+ *
+ * Rotation used to be `end()` then `renameSync()` in one synchronous breath. On Windows a file
+ * with an open write handle cannot be renamed, and `end()` has not closed the handle by the time
+ * the next statement runs — so the rename threw, the catch swallowed it, and `stream` was left
+ * pointing at a stream that had already been ended. Every later write then threw into the
+ * catch-all in `log()`, and the app stopped logging entirely, silently, for the rest of the
+ * session. The close is awaited through its callback instead, and nothing writes in between.
+ */
+function ensureStream(): fs.WriteStream | null {
+  if (rotating) return null
   const target = logFile()
-  if (stream && currentFile === target) {
-    // Rotate when the day's file gets large.
+
+  if (stream && currentFile === target && Date.now() >= rotationBlockedUntil) {
+    let size = 0
     try {
-      if (fs.statSync(target).size > MAX_LOG_BYTES) {
-        stream.end()
-        fs.renameSync(target, `${target}.${Date.now()}`)
-        stream = null
-      }
+      size = fs.statSync(target).size
     } catch {
-      /* fall through and reopen */
+      size = 0
+    }
+    if (size > MAX_LOG_BYTES) {
+      const finished = stream
+      stream = null
+      currentFile = null
+      rotating = true
+      finished.end(() => {
+        try {
+          fs.renameSync(target, `${target}.${Date.now()}`)
+        } catch {
+          // Something else is holding the file. Keep appending to it and try again in a while,
+          // rather than attempting a rename per log line.
+          rotationBlockedUntil = Date.now() + 60_000
+        }
+        rotating = false
+        void pruneOldLogs()
+      })
+      return null
     }
   }
+
   if (!stream || currentFile !== target) {
     fs.mkdirSync(LOGS_DIR, { recursive: true })
     stream = fs.createWriteStream(target, { flags: 'a' })
@@ -71,7 +103,9 @@ export function log(level: LogLevel, scope: string, message: string, extra?: unk
     extra !== undefined ? ` ${safeJson(extra)}` : ''
   }\n`
   try {
-    ensureStream().write(line)
+    // Null while a rotation is in flight — a handful of lines during the swap is the price of
+    // never writing into a file that is about to be renamed out from under the handle.
+    ensureStream()?.write(line)
   } catch {
     /* logging must never throw */
   }

@@ -44,6 +44,27 @@ export const ULTRA = 'ultra'
 
 export type Choice = string | 'off' | typeof ULTRA | null
 
+/**
+ * The choice as this model can actually express it, or null for "leave the default alone".
+ *
+ * The effort setting is remembered per conversation while level names belong to the model, so
+ * changing models leaves a choice the new one has never heard of. Two ways that went wrong, in
+ * opposite directions: a level the new template does not list was dropped by the request builder
+ * but still displayed, so the control read "Off" while the model quietly used its default; and
+ * Ultra, chosen on a levels model, survived onto a toggle model where the control has no way to
+ * show it — the switch read "on" and three sampling passes ran with nothing to explain the wait.
+ *
+ * Used by the control to decide what to render and by the composers to decide what to send, so
+ * the two cannot disagree.
+ */
+export function sendableChoice(support: ReasoningSupport | undefined | null, value: Choice): Choice {
+  if (!support || support.kind === 'none' || value === null) return null
+  if (value === 'off') return 'off'
+  if (support.kind === 'toggle') return value === ULTRA ? null : value
+  if (value === ULTRA) return ULTRA
+  return support.levels.includes(value) ? value : null
+}
+
 export default function ReasoningControl({
   support,
   value,
@@ -98,7 +119,9 @@ export default function ReasoningControl({
   // native setting, so it belongs at the end of the same scale rather than in a control of its
   // own. It is marked so it never passes for something the model advertised.
   const stops: Choice[] = ['off', ...support.levels, ULTRA]
-  const effective = value ?? support.defaultLevel ?? support.levels.at(-1) ?? null
+  // See sendableChoice: a level this model does not list falls back to its default here for the
+  // same reason it is dropped from the request, so the two never disagree.
+  const effective = sendableChoice(support, value) ?? support.defaultLevel ?? support.levels.at(-1) ?? null
   const index = Math.max(0, stops.indexOf(effective))
   const max = stops.length - 1
 

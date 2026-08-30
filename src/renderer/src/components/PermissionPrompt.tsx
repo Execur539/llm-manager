@@ -42,17 +42,26 @@ export default function PermissionPrompt(): JSX.Element | null {
   return (
     <div className="overlay" data-testid="permission-overlay">
       <div className="modal" role="dialog" aria-modal="true" aria-label="Approve action">
+        {/*
+          * A prompt for a hard-blocked action only happens when hard blocks are off.
+          *
+          * The engine refuses these outright while the list is on — it never asks. So reaching
+          * this dialog means the user has already been through the buried setting and its typed
+          * confirmation, and the honest thing is to warn loudly and still let them decide. It
+          * used to hide every Allow button here instead, which made the whole escape hatch inert:
+          * turning hard blocks off changed nothing, because the only remaining answer was Deny.
+          */}
         <h2>
-          <span>{current.hardBlocked ? 'Blocked action' : 'Approve action'}</span>
+          <span>{current.hardBlocked ? 'Dangerous action' : 'Approve action'}</span>
           <span className={`badge ${current.tier === 'execute' ? 'bad' : 'warn'}`}>{current.tier}</span>
         </h2>
 
         {current.hardBlocked && (
           <div className="card error-card">
-            <span className="badge bad">hard-blocked</span> {current.blockReason}
+            <span className="badge bad">normally blocked</span> {current.blockReason}
             <div className="faint tiny-note">
-              This cannot be approved here. Hard blocks are only disabled in Settings, behind a typed
-              confirmation.
+              This is on the hard-block list and would normally be refused outright. You have hard
+              blocks disabled in Settings, so it is yours to approve — it is not reversible.
             </div>
           </div>
         )}
@@ -83,11 +92,14 @@ export default function PermissionPrompt(): JSX.Element | null {
           <button className="danger" onClick={() => respond('deny')} data-testid="permission-deny">
             Deny
           </button>
-          {!current.hardBlocked && (
-            <button className="primary" onClick={() => respond('allow-once')} data-testid="permission-allow">
-              Allow once
-            </button>
-          )}
+          {/* Once only, never remembered: an unrecoverable action should be decided every time. */}
+          <button
+            className={current.hardBlocked ? 'danger' : 'primary'}
+            onClick={() => respond('allow-once')}
+            data-testid="permission-allow"
+          >
+            {current.hardBlocked ? 'Allow anyway' : 'Allow once'}
+          </button>
         </div>
       </div>
     </div>

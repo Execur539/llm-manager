@@ -25,7 +25,30 @@ import { installCrashHandlers, logger } from './log'
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
-let quitting = false
+/**
+ * The user has already said they want to quit, so the close prompt must not appear again.
+ *
+ * Deliberately separate from `shuttingDown`. One flag used to serve both purposes, and the two
+ * questions have different answers: the tray's Quit and the close dialog's Quit both set it
+ * before calling app.quit(), which then made `before-quit` believe shutdown had already run and
+ * return immediately. Those are the two most likely ways to quit, and both left llama-server
+ * holding VRAM, MCP servers running, and background jobs alive after the app was gone.
+ */
+let userChoseQuit = false
+/** Set once the shutdown handler has taken responsibility for this quit. */
+let shuttingDown = false
+
+/**
+ * One emitter feeds both surfaces: the desktop window over IPC, and every connected remote
+ * browser over SSE. Neither can silently miss an event the other gets.
+ *
+ * Named rather than inlined into `setEmitter` so the tray — which is not a bridge caller — can
+ * announce things through the same path.
+ */
+function emitToSurfaces(channel: string, payload: unknown): void {
+  if (!mainWindow?.isDestroyed()) mainWindow?.webContents.send(channel, payload)
+  remoteWeb.broadcast(channel, payload)
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -49,7 +72,7 @@ function createWindow(): void {
 
   // Round 11: ask on first close, then remember the answer.
   mainWindow.on('close', (event) => {
-    if (quitting) return
+    if (userChoseQuit) return
     const settings = loadSettings()
 
     if (settings.ui.closeAction === 'quit') return
@@ -77,7 +100,7 @@ function createWindow(): void {
     patchSettings({ ui: { closeAction: action } })
 
     if (action === 'quit') {
-      quitting = true
+      userChoseQuit = true
       app.quit()
     } else {
       mainWindow?.hide()
@@ -122,13 +145,16 @@ function createTray(): void {
         {
           label: 'Unload model',
           enabled: !!loaded,
-          click: () => void llama.unload()
+          // Through the bridge, not straight to the runtime. Calling `llama.unload()` here
+          // skipped the `model:status` the handler emits, so the window went on showing the
+          // model as loaded — with a working composer that answered "No model is loaded".
+          click: () => void invokeBridge('model:unload', [])
         },
         { type: 'separator' },
         {
           label: 'Quit',
           click: () => {
-            quitting = true
+            userChoseQuit = true
             app.quit()
           }
         }
@@ -138,6 +164,17 @@ function createTray(): void {
 
   rebuild()
   llama.on('status', rebuild)
+
+  /*
+   * A backend that dies takes the "loaded" badge with it.
+   *
+   * llama-server exiting on its own — an OOM, a crash, the user killing it — cleared the
+   * runtime's state and rebuilt the tray, but told the window nothing. The sidebar went on
+   * naming a model that was gone, and the composer stayed enabled until someone tried to use it.
+   */
+  llama.on('status', (s: { phase?: string }) => {
+    if (s?.phase === 'exited' && !llama.loaded) emitToSurfaces('model:status', null)
+  })
   tray.on('double-click', () => {
     mainWindow?.show()
     mainWindow?.focus()
@@ -201,12 +238,7 @@ app.whenReady().then(async () => {
   // the directory exists, and unawaited so a slow disk never delays the window.
   void handlers['attachments:prune']?.()
 
-  // One emitter feeds both surfaces: the desktop window over IPC, and every connected
-  // remote browser over SSE. Neither can silently miss an event the other gets.
-  setEmitter((channel, payload) => {
-    if (!mainWindow?.isDestroyed()) mainWindow?.webContents.send(channel, payload)
-    remoteWeb.broadcast(channel, payload)
-  })
+  setEmitter(emitToSurfaces)
 
   registerIpc()
   createWindow()
@@ -223,11 +255,19 @@ app.whenReady().then(async () => {
     },
     (err) => logger.warn('downloads', 'could not clean orphaned partials', err)
   )
-  downloadQueue.on('update', (list) => mainWindow?.webContents.send('downloads:update', list))
+  /*
+   * Progress goes to both surfaces.
+   *
+   * These five were sent straight to the desktop window, so a remote browser watching a download
+   * saw a queue that never moved, a library that never refreshed after one finished, and MCP
+   * status that stayed blank — while the bridge's own events reached it fine. Parity is only
+   * true if everything uses the same emitter.
+   */
+  downloadQueue.on('update', (list) => emitToSurfaces('downloads:update', list))
   downloadQueue.on('completed', () => {
     void scanLibrary(modelsDir()).then((models) => {
       setLibrary(models)
-      mainWindow?.webContents.send('library:update', models)
+      emitToSurfaces('library:update', models)
     })
   })
 
@@ -245,20 +285,20 @@ app.whenReady().then(async () => {
         present: vendor.present,
         missing: vendor.missing
       })
-      mainWindow?.webContents.send('hardware:update', hw)
+      emitToSurfaces('hardware:update', hw)
     })
     .catch((err) => logger.warn('hardware', 'detection failed', String(err)))
 
   void scanLibrary(modelsDir())
     .then((models) => {
       setLibrary(models)
-      mainWindow?.webContents.send('library:update', models)
+      emitToSurfaces('library:update', models)
     })
     .catch((err) => logger.warn('library', 'scan failed', String(err)))
 
   void mcpManager.connectAll().then((results) => {
     if (results.length) logger.info('mcp', `connected ${results.filter((r) => r.ok).length}/${results.length}`)
-    mainWindow?.webContents.send('mcp:update', mcpManager.status())
+    emitToSurfaces('mcp:update', mcpManager.status())
   })
 
   // Restart the API server if it was running when the app last closed.
@@ -280,8 +320,9 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', async (event) => {
-  if (quitting) return
-  quitting = true
+  if (shuttingDown) return
+  shuttingDown = true
+  userChoseQuit = true
   event.preventDefault()
   logger.info('app', 'shutting down')
   await shutdown()

@@ -147,6 +147,18 @@ export function makeAgentTools(deps: AgentToolDeps): Tool[] {
         updateMemory(String(args.id), String(args.replace_with))
         return `Updated memory ${args.id}.`
       }
+      /*
+       * `confirm` is checked rather than merely advertised.
+       *
+       * The parameter was declared and then ignored, so a model that read the schema, decided a
+       * deletion needed confirming and left it unset had the memory deleted anyway — and this is
+       * a read-tier tool, so nothing else asks. Deletion is the one irreversible thing here.
+       */
+      // Accepts the string too: a model whose template stringifies its arguments should not have
+      // its explicit confirmation read as a refusal.
+      if (args.confirm !== true && args.confirm !== 'true') {
+        return `Not deleted. Call forget again with confirm=true to remove memory ${args.id}, or pass replace_with to edit it instead.`
+      }
       deleteMemory(String(args.id))
       return `Deleted memory ${args.id}.`
     }

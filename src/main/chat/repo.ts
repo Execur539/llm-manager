@@ -7,6 +7,7 @@
  */
 
 import crypto from 'node:crypto'
+import os from 'node:os'
 import path from 'node:path'
 import fsp from 'node:fs/promises'
 import { all, get, run, transaction } from '../storage/db'
@@ -111,11 +112,14 @@ export function deleteChat(id: string): void {
 }
 
 export function searchChats(query: string): { chatId: string; title: string; snippet: string }[] {
+  // `%` and `_` are LIKE wildcards, so a literal search for "50%" or "read_file" matched far
+  // more than the user asked for — and then the snippet could not find the term it matched on.
+  const escaped = query.replace(/[\\%_]/g, (c) => `\\${c}`)
   return all<{ chat_id: string; title: string; content: string }>(
     `SELECT m.chat_id, c.title, m.content
      FROM messages m JOIN chats c ON c.id = m.chat_id
-     WHERE m.content LIKE ? ORDER BY m.created_at DESC LIMIT 50`,
-    `%${query}%`
+     WHERE m.content LIKE ? ESCAPE '\\' ORDER BY m.created_at DESC LIMIT 50`,
+    `%${escaped}%`
   ).map((r) => {
     const idx = r.content.toLowerCase().indexOf(query.toLowerCase())
     const start = Math.max(0, idx - 60)
@@ -145,8 +149,15 @@ export function appendMessage(chatId: string, message: AgentMessage): void {
   })
 }
 
+/**
+ * A conversation's messages in the order they happened.
+ *
+ * Ordered by rowid as well as timestamp. `created_at` is milliseconds, and an agent turn writes
+ * an assistant message and its tool result in the same one routinely — leaving the tie to
+ * SQLite meant a transcript that could come back with a tool result above the call that made it.
+ */
 export function loadMessages(chatId: string): AgentMessage[] {
-  return all<MessageRow>('SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at', chatId).map((r) => ({
+  return all<MessageRow>('SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at, rowid', chatId).map((r) => ({
     id: r.id,
     role: r.role as AgentMessage['role'],
     content: r.content,
@@ -158,12 +169,21 @@ export function loadMessages(chatId: string): AgentMessage[] {
   }))
 }
 
-/** Drop everything from a message onward — used when rewinding to a checkpoint. */
+/**
+ * Drop everything from a message onward — used when rewinding to a checkpoint.
+ *
+ * Cut at the same (created_at, rowid) position the transcript is ordered by. Comparing
+ * timestamps alone made the boundary ambiguous whenever messages shared a millisecond: rewinding
+ * to a tool result also deleted the assistant turn that preceded it, and rewinding to that turn
+ * left the result behind.
+ */
 export function truncateFrom(chatId: string, messageId: string): number {
-  const target = get<MessageRow>('SELECT * FROM messages WHERE id = ?', messageId)
+  const target = get<MessageRow & { rowid: number }>('SELECT rowid, * FROM messages WHERE id = ?', messageId)
   if (!target) return 0
-  const doomed = all<{ id: string }>('SELECT id FROM messages WHERE chat_id = ? AND created_at >= ?', chatId, target.created_at)
-  run('DELETE FROM messages WHERE chat_id = ? AND created_at >= ?', chatId, target.created_at)
+  const where = 'chat_id = ? AND (created_at > ? OR (created_at = ? AND rowid >= ?))'
+  const args = [chatId, target.created_at, target.created_at, target.rowid] as const
+  const doomed = all<{ id: string }>(`SELECT id FROM messages WHERE ${where}`, ...args)
+  run(`DELETE FROM messages WHERE ${where}`, ...args)
   return doomed.length
 }
 
@@ -174,7 +194,15 @@ export function loadSession(chatId: string): AgentSessionState | null {
   return {
     id: row.id,
     title: row.title,
-    cwd: row.cwd ?? process.cwd(),
+    /*
+     * The home directory, not the process's.
+     *
+     * `process.cwd()` is wherever the launcher happened to start the app — for a portable build
+     * that is the extraction cache under LOCALAPPDATA, which is deleted on upgrade. A session
+     * saved without a folder would have pointed the agent's writes at disposable storage. Home is
+     * what the agent is constructed with elsewhere, so this matches.
+     */
+    cwd: row.cwd ?? os.homedir(),
     planMode: false,
     messages: loadMessages(chatId),
     taskList: all<{ id: string; text: string; done: number }>(
@@ -203,7 +231,10 @@ export function setChatCwd(chatId: string, cwd: string): void {
 export function autoTitle(chatId: string): void {
   const row = get<ChatRow>('SELECT * FROM chats WHERE id = ?', chatId)
   if (!row || row.title !== 'New chat') return
-  const first = get<MessageRow>("SELECT * FROM messages WHERE chat_id = ? AND role = 'user' ORDER BY created_at LIMIT 1", chatId)
+  const first = get<MessageRow>(
+    "SELECT * FROM messages WHERE chat_id = ? AND role = 'user' ORDER BY created_at, rowid LIMIT 1",
+    chatId
+  )
   if (!first) return
   const title = first.content.replace(/\s+/g, ' ').trim().slice(0, 60)
   if (title) renameChat(chatId, title)

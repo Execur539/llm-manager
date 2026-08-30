@@ -4,8 +4,11 @@
  * Two things make this more than a proxy to llama-server:
  *   - JIT model loading: a request naming a model that is not resident loads it first, so
  *     external tools "just work" without the user switching models by hand.
- *   - Local-user priority: desktop activity is never queued behind a remote request. The
- *     runtime serialises work, and local requests jump ahead of remote ones.
+ *   - Local-user priority: a request from another machine never overtakes one from this one.
+ *     Every call into the runtime from here goes through `requestQueue`, which admits one at a
+ *     time and lets loopback callers jump the line. (The app's own chat and agent turns do not
+ *     pass through this queue — they talk to llama-server directly and take their turn in its
+ *     own scheduler.)
  *
  * Anthropic support exists because llama.cpp now speaks that API too, which means a
  * Claude-compatible client can point at LLM Manager as its backend.
@@ -17,6 +20,7 @@ import type { AddressInfo } from 'node:net'
 import { llama, type ChatMessage } from '../runtime/llama'
 import { reasoningRequestFields } from '../models/reasoning'
 import { run } from '../storage/db'
+import { logger } from '../log'
 
 export interface ApiServerOptions {
   port: number
@@ -170,16 +174,49 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.end(text)
 }
 
+/**
+ * Read a request body, refusing one that is too large.
+ *
+ * The socket is destroyed rather than merely rejected: leaving the `data` listener attached let
+ * an oversized body keep accumulating in memory after the request had already been failed.
+ */
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = ''
-    req.on('data', (c: Buffer) => {
+    const onData = (c: Buffer): void => {
       data += c
-      if (data.length > 64 * 1024 * 1024) reject(new Error('Request body too large'))
-    })
+      if (data.length > 64 * 1024 * 1024) {
+        req.off('data', onData)
+        data = ''
+        req.destroy()
+        reject(new BadRequest('Request body too large', 413))
+      }
+    }
+    req.on('data', onData)
     req.on('end', () => resolve(data))
     req.on('error', reject)
   })
+}
+
+/**
+ * An abort signal that fires when the client hangs up.
+ *
+ * Without one, closing a streaming client left the model generating to the end of its reply into
+ * a dead socket — holding the single inference slot, and everything queued behind it, for a
+ * response nobody was going to read.
+ *
+ * Watches the *response*, not the request. `req` emits 'close' when the request body has been
+ * read, which on an ordinary POST happens before the answer is even started — so listening there
+ * either aborts every request instantly or, if the listener goes on after the body is consumed,
+ * attaches to an already-closed stream and never fires at all. `res` closing with
+ * `writableFinished` false is the one event that means "the client is gone".
+ */
+function abortOnDisconnect(res: http.ServerResponse): AbortSignal {
+  const controller = new AbortController()
+  res.on('close', () => {
+    if (!res.writableFinished) controller.abort()
+  })
+  return controller.signal
 }
 
 /** Anthropic content blocks -> flat text, so both API shapes share one path. */
@@ -199,6 +236,13 @@ function flattenAnthropicContent(content: unknown): string {
 export class ApiServer {
   private server: http.Server | null = null
   private opts: ApiServerOptions | null = null
+  /** True when network exposure was asked for but refused for want of an API key. */
+  private networkBlocked = false
+
+  /** Why the server is loopback-only despite remote access being on, if it is. */
+  get exposureRefused(): boolean {
+    return this.networkBlocked
+  }
 
   get port(): number | null {
     const addr = this.server?.address()
@@ -215,6 +259,17 @@ export class ApiServer {
 
     const server = http.createServer((req, res) => {
       void this.handle(req, res).catch((err) => {
+        /*
+         * Nothing to report to a client that has already gone.
+         *
+         * A disconnect now aborts the generation, which surfaces here as an error — and writing
+         * a 500 into a socket that is closed (or a stream whose headers went out long ago) is
+         * either a no-op or a second, more confusing failure.
+         */
+        if (res.writableEnded || res.destroyed || res.headersSent) {
+          res.end()
+          return
+        }
         const status = err instanceof BadRequest ? err.status : 500
         const type = err instanceof BadRequest ? err.type : 'api_error'
         json(res, status, {
@@ -223,9 +278,28 @@ export class ApiServer {
       })
     })
 
+    /*
+     * Reaching beyond loopback requires a key.
+     *
+     * `exposeToNetwork` follows the remote-access setting, and the API key is a separate switch
+     * the user has to find and turn on, so enabling remote access published an unauthenticated
+     * OpenAI-compatible endpoint — one that will load models on demand — to the whole local
+     * network. `authorised()` returns true when no key is configured, which is a reasonable
+     * default for a loopback-only server and an open door on 0.0.0.0. Binding locally is the
+     * conservative reading of "expose", and the reason is reported rather than silently applied.
+     */
+    const exposed = opts.exposeToNetwork && !!opts.apiKey
+    if (opts.exposeToNetwork && !opts.apiKey) {
+      logger.warn(
+        'api',
+        'network exposure was requested without an API key; binding to 127.0.0.1 instead. Generate a key in Settings to reach the API from other machines.'
+      )
+    }
+    this.networkBlocked = opts.exposeToNetwork && !opts.apiKey
+
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject)
-      server.listen(opts.port, opts.exposeToNetwork ? '0.0.0.0' : '127.0.0.1', () => resolve())
+      server.listen(opts.port, exposed ? '0.0.0.0' : '127.0.0.1', () => resolve())
     })
 
     this.server = server
@@ -366,13 +440,21 @@ export class ApiServer {
       throw new BadRequest("'messages' must be a non-empty array")
     }
 
-    await this.ensureModel(body.model)
+    const priority = client === 'local' ? 0 : 1
+
+    /*
+     * A JIT model swap takes the queue slot like any other work.
+     *
+     * Loading tears llama-server down and starts a new one, so running it outside the queue
+     * meant a second client naming a different model could kill a generation that was already
+     * streaming to somebody else. Queued at this request's own priority, the swap waits its turn.
+     */
+    await requestQueue.enqueue(priority, () => this.ensureModel(body.model))
     if (!llama.loaded) {
       json(res, 503, { error: { message: 'No model is loaded and JIT loading did not resolve one.' } })
       return
     }
 
-    const priority = client === 'local' ? 0 : 1
     const tools = body.tools?.map((t) => ({
       name: t.function.name,
       description: t.function.description,
@@ -387,6 +469,9 @@ export class ApiServer {
       maxTokens: body.max_tokens,
       stop: body.stop,
       tools,
+      // A client that hangs up stops the generation. Without this the model kept writing into a
+      // closed socket, holding the one inference slot against everything queued behind it.
+      signal: abortOnDisconnect(res),
       /*
        * Reasoning controls are forwarded rather than interpreted.
        *
@@ -518,7 +603,11 @@ export class ApiServer {
       throw new BadRequest("'messages' must be a non-empty array")
     }
 
-    await this.ensureModel(body.model)
+    const priority = client === 'local' ? 0 : 1
+
+    // Queued for the same reason as the OpenAI path: a swap restarts llama-server, and doing
+    // that outside the queue kills whatever is streaming at the time.
+    await requestQueue.enqueue(priority, () => this.ensureModel(body.model))
     if (!llama.loaded) {
       json(res, 503, { error: { type: 'overloaded_error', message: 'No model is loaded.' } })
       return
@@ -535,11 +624,12 @@ export class ApiServer {
       messages.push({ role: m.role, content: flattenAnthropicContent(m.content) })
     }
 
-    const priority = client === 'local' ? 0 : 1
     const opts = {
       messages,
       temperature: body.temperature,
       maxTokens: body.max_tokens,
+      // As above: a disconnected client should not leave the model generating.
+      signal: abortOnDisconnect(res),
       /*
        * Anthropic expresses thinking as a token budget, and llama.cpp has one too, so the two
        * now line up exactly rather than being approximated through a named level.

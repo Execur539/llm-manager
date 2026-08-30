@@ -33,6 +33,9 @@ const DESKTOP_ONLY = new Set([
   'remote:enable',
   'mcp:add',
   'mcp:remove',
+  // Replaces the executable and relaunches it. The URL is verified against the release feed
+  // regardless, but deciding to replace the app is not something to do from somewhere else.
+  'update:apply',
   // Quitting the host from a remote tab is not a feature.
   'app:quit',
   /*
@@ -40,10 +43,24 @@ const DESKTOP_ONLY = new Set([
    *
    * A remote caller cannot see or dismiss one, so the request hangs until somebody walks over to
    * the machine — and the dialog appears unbidden on someone else's screen either way.
+   *
+   * The list was originally written from the two obvious cases and then not revisited as more
+   * pickers appeared, so `attachments:pick` and `rag:ingest` — both plain file dialogs — were
+   * reachable remotely and would hang the request for exactly the documented reason.
    */
   'library:import',
   'chat:export',
-  'agent:set-cwd'
+  'agent:set-cwd',
+  'attachments:pick',
+  'rag:ingest',
+  /*
+   * These pop an Explorer window on the host.
+   *
+   * Nobody sitting in front of the machine asked for it, and the remote caller cannot see the
+   * result, so the only effect a remote invocation has is on someone else's screen.
+   */
+  'diagnostics:reveal',
+  'shell:reveal'
 ])
 
 /*
@@ -93,6 +110,19 @@ export interface WebServerOptions {
   invoke: (channel: string, args: unknown[]) => Promise<unknown>
   /** TLS material for the own-domain path; omitted means plain HTTP behind a tunnel */
   tls?: { certPath: string; keyPath: string }
+  /**
+   * How this server is reached, which decides two things that must agree.
+   *
+   * Behind a tunnel, cloudflared connects from this machine, so the socket address is always
+   * loopback and the real client is only knowable from `CF-Connecting-IP` — which Cloudflare
+   * overwrites, so it can be trusted. Serving a domain directly, the socket address *is* the
+   * client and that header is whatever the client typed.
+   *
+   * Getting this wrong is not cosmetic: the login lockout is keyed on the address. Trusting the
+   * header on a directly-reachable server let anyone send a different value on every attempt and
+   * guess the password without limit.
+   */
+  mode: 'tunnel' | 'own-domain'
 }
 
 const MIME: Record<string, string> = {
@@ -123,13 +153,27 @@ function parseCookies(header: string | undefined): Record<string, string> {
   return out
 }
 
+/*
+ * Read a request body, refusing one that is too large.
+ *
+ * Rejecting is not enough on its own: the promise settles but the `data` listener keeps firing
+ * and keeps concatenating, so an oversized upload carried on growing the string long after the
+ * caller had given up on it. The socket is destroyed and the listener detached, which is what
+ * makes the limit an actual limit.
+ */
 function readBody(req: http.IncomingMessage, limit = 32 * 1024 * 1024): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = ''
-    req.on('data', (c: Buffer) => {
+    const onData = (c: Buffer): void => {
       data += c
-      if (data.length > limit) reject(new Error('body too large'))
-    })
+      if (data.length > limit) {
+        req.off('data', onData)
+        data = ''
+        req.destroy()
+        reject(new Error('body too large'))
+      }
+    }
+    req.on('data', onData)
     req.on('end', () => resolve(data))
     req.on('error', reject)
   })
@@ -199,9 +243,19 @@ export class RemoteWebServer {
         )
       : http.createServer(handler)
 
+    /*
+     * Listen only as widely as the deployment needs.
+     *
+     * A tunnel is reached through cloudflared running on this machine, so loopback is enough —
+     * binding every interface additionally published the UI to the local network, where the
+     * spoofable-header problem above is reachable and where nobody asked for it to be. Serving a
+     * domain directly does need every interface, because the client really is out there.
+     */
+    const host = opts.mode === 'own-domain' ? '0.0.0.0' : '127.0.0.1'
+
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject)
-      server.listen(opts.port, '0.0.0.0', () => resolve())
+      server.listen(opts.port, host, () => resolve())
     })
     this.server = server
     return opts.port
@@ -216,7 +270,9 @@ export class RemoteWebServer {
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
-    const ip = (req.headers['cf-connecting-ip'] as string) ?? req.socket.remoteAddress ?? 'unknown'
+    // See WebServerOptions.mode: the header is only meaningful when Cloudflare set it.
+    const forwarded = this.opts?.mode === 'tunnel' ? (req.headers['cf-connecting-ip'] as string | undefined) : undefined
+    const ip = forwarded ?? req.socket.remoteAddress ?? 'unknown'
     const cookies = parseCookies(req.headers.cookie)
     const authed = verifySession(cookies.llmm_session)
 

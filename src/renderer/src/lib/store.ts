@@ -497,6 +497,9 @@ function wire(): void {
      * drained, so two undrained copies would both be shown.
      */
     state.pending[id] = [...(state.pending[id] ?? []).filter((m) => m.id !== message.id), message]
+    // Once the plan is on the message it belongs to, the live copy is a duplicate of it — both
+    // were rendering at once for the rest of the turn.
+    if (message.plan) delete state.ultraPlan[id]
     emitChange()
   })
 

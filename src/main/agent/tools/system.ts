@@ -18,11 +18,19 @@ import { TOOL_OUTPUT_DIR } from '../../storage/paths'
 
 const exec = promisify(execFile)
 
-async function powershell(script: string, timeoutMs = 20000): Promise<string> {
+/**
+ * Run a PowerShell snippet.
+ *
+ * Takes the turn's abort signal so stop actually stops. Every tool in this file went through
+ * here without one, which meant hitting stop left a thirty-second registry sweep running — and,
+ * worse, left a `type_text` or `press_key` still driving the real keyboard after the user had
+ * asked for the turn to end.
+ */
+async function powershell(script: string, timeoutMs = 20000, signal?: AbortSignal): Promise<string> {
   const { stdout } = await exec(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-    { timeout: timeoutMs, windowsHide: true, maxBuffer: 16 * 1024 * 1024 }
+    { timeout: timeoutMs, windowsHide: true, maxBuffer: 16 * 1024 * 1024, signal }
   )
   return stdout
 }
@@ -93,11 +101,11 @@ const listProcesses: Tool = {
   description: 'List running processes with CPU and memory usage, highest memory first.',
   tier: 'read',
   parameters: schema({ filter: str('Only show processes whose name matches this text'), top: int('How many to return (default 30)') }),
-  async run(args) {
+  async run(args, ctx) {
     const top = Number(args.top ?? 30)
     const filter = args.filter ? String(args.filter) : null
     const script = `Get-Process | ${filter ? `Where-Object { $_.ProcessName -like '*${filter.replace(/'/g, "''")}*' } | ` : ''}Sort-Object WorkingSet64 -Descending | Select-Object -First ${top} Id, ProcessName, @{n='MemoryMB';e={[math]::Round($_.WorkingSet64/1MB,1)}}, @{n='CPU';e={[math]::Round($_.CPU,1)}} | ConvertTo-Json -Compress`
-    const out = await powershell(script)
+    const out = await powershell(script, 20000, ctx.signal)
     try {
       const parsed = JSON.parse(out.trim() || '[]')
       const list = Array.isArray(parsed) ? parsed : [parsed]
@@ -117,7 +125,7 @@ const installedApps: Tool = {
   description: 'List installed applications from the Windows uninstall registry keys.',
   tier: 'read',
   parameters: schema({ filter: str('Only show apps whose name matches this text') }),
-  async run(args) {
+  async run(args, ctx) {
     const filter = args.filter ? String(args.filter).replace(/'/g, "''") : null
     const script = `
 $paths = @(
@@ -129,7 +137,7 @@ Get-ItemProperty $paths -ErrorAction SilentlyContinue |
   Where-Object { $_.DisplayName ${filter ? `-like '*${filter}*'` : '-ne $null'} } |
   Select-Object DisplayName, DisplayVersion, Publisher |
   Sort-Object DisplayName -Unique | ConvertTo-Json -Compress`
-    const out = await powershell(script, 30000)
+    const out = await powershell(script, 30000, ctx.signal)
     try {
       const parsed = JSON.parse(out.trim() || '[]')
       const list = Array.isArray(parsed) ? parsed : [parsed]
@@ -145,9 +153,9 @@ const readRegistry: Tool = {
   description: 'Read a Windows registry key and its values. Read-only; writing the registry is not exposed.',
   tier: 'read',
   parameters: schema({ key: str("Registry path, e.g. 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'") }, ['key']),
-  async run(args) {
+  async run(args, ctx) {
     const key = String(args.key).replace(/'/g, "''")
-    const out = await powershell(`Get-ItemProperty -Path '${key}' | ConvertTo-Json -Compress -Depth 3`)
+    const out = await powershell(`Get-ItemProperty -Path '${key}' | ConvertTo-Json -Compress -Depth 3`, 20000, ctx.signal)
     return out.trim() || '(no values)'
   }
 }
@@ -159,7 +167,7 @@ const clickMouse: Tool = {
     'this happen. Take a screenshot first to find the coordinates.',
   tier: 'execute',
   parameters: schema({ x: int('Screen X'), y: int('Screen Y'), button: str("'left' or 'right' (default left)") }, ['x', 'y']),
-  async run(args) {
+  async run(args, ctx) {
     const x = Number(args.x)
     const y = Number(args.y)
     const right = String(args.button ?? 'left') === 'right'
@@ -180,7 +188,7 @@ Start-Sleep -Milliseconds 60
 [M]::mouse_event(${down},0,0,0,[IntPtr]::Zero)
 [M]::mouse_event(${up},0,0,0,[IntPtr]::Zero)
 'clicked'`
-    await powershell(script)
+    await powershell(script, 20000, ctx.signal)
     return `Clicked ${right ? 'right' : 'left'} at (${x}, ${y}).`
   }
 }
@@ -192,12 +200,14 @@ const typeText: Tool = {
     'target field first.',
   tier: 'execute',
   parameters: schema({ text: str('Text to type') }, ['text']),
-  async run(args) {
+  async run(args, ctx) {
     const text = String(args.text)
     // SendKeys treats these as control characters, so they must be brace-escaped.
     const escaped = text.replace(/([+^%~(){}[\]])/g, '{$1}').replace(/'/g, "''")
     await powershell(
-      `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${escaped}'); 'typed'`
+      `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${escaped}'); 'typed'`,
+      20000,
+      ctx.signal
     )
     return `Typed ${text.length} characters into the focused window.`
   }
@@ -208,9 +218,13 @@ const pressKey: Tool = {
   description: "Press a key or combination, e.g. 'ENTER', 'TAB', '^c' (ctrl+c), '%{F4}' (alt+F4).",
   tier: 'execute',
   parameters: schema({ keys: str('SendKeys-format key sequence') }, ['keys']),
-  async run(args) {
+  async run(args, ctx) {
     const keys = String(args.keys).replace(/'/g, "''")
-    await powershell(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${keys}'); 'sent'`)
+    await powershell(
+      `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${keys}'); 'sent'`,
+      20000,
+      ctx.signal
+    )
     return `Sent keys: ${args.keys}`
   }
 }

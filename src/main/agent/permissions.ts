@@ -128,7 +128,6 @@ function truncate(s: string, n: number): string {
 
 export class PermissionEngine {
   private rules: PermissionRule[] = []
-  private sessionAllowedTools = new Set<string>()
   /**
    * Calls denied during the current turn.
    *
@@ -198,7 +197,6 @@ export class PermissionEngine {
 
     if (tier === 'read') return { allowed: true }
 
-    if (this.sessionAllowedTools.has(tool)) return { allowed: true }
     if (this.matches(tool, resolved, cwd)) return { allowed: true }
 
     const signature = `${tool}::${resolved}`

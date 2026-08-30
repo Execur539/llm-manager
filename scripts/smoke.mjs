@@ -654,6 +654,44 @@ section('Reasoning: off')
     Object.keys(reasoningRequestFields(detectReasoning('{{ messages }}'), 'off')).length === 0)
 }
 
+/*
+ * The effort choice is remembered per conversation, and level names belong to the model. Loading
+ * a different model therefore leaves a choice it has never heard of, and the two things that read
+ * that choice used to disagree about it: the request builder dropped an unknown level while the
+ * slider rendered it as position zero ("Off"), and `isUltra` recognised Ultra on a model whose
+ * control cannot offer it, running three sampling passes for no visible reason.
+ */
+section('Reasoning: a choice the model cannot express')
+{
+  const { sendableChoice } = await import('./built/reasoning.js')
+
+  const levels = detectReasoning(
+    `{%- if reasoning_effort in ('xhigh', 'medium', 'low') %}{%- endif %}`
+  )
+  const otherLevels = detectReasoning(`{%- if reasoning_effort in ('high', 'medium', 'low') %}{%- endif %}`)
+  const toggle = detectReasoning(
+    `{%- if enable_thinking is defined and enable_thinking is false %}<think></think>{%- endif %}`
+  )
+  const none = detectReasoning('{{ messages }}')
+
+  check('a level this model has survives', sendableChoice(levels, 'medium') === 'medium')
+  check('a level from a different model does not', sendableChoice(otherLevels, 'xhigh') === null,
+    String(sendableChoice(otherLevels, 'xhigh')))
+  check('and what it becomes is what the request builder does with it — nothing',
+    Object.keys(reasoningRequestFields(otherLevels, sendableChoice(otherLevels, 'xhigh'))).length === 0)
+
+  check('off is expressible on any reasoning model', sendableChoice(levels, 'off') === 'off')
+  check('off survives on a toggle model too', sendableChoice(toggle, 'off') === 'off')
+
+  check('ultra survives where the control can offer it', sendableChoice(levels, 'ultra') === 'ultra')
+  check('ultra does not survive onto a toggle model', sendableChoice(toggle, 'ultra') === null,
+    String(sendableChoice(toggle, 'ultra')))
+  check('a toggle model keeps its own on', sendableChoice(toggle, 'on') === 'on')
+
+  check('a model with no reasoning at all expresses nothing', sendableChoice(none, 'medium') === null)
+  check('null stays null', sendableChoice(levels, null) === null)
+}
+
 section('Export filenames')
 {
   const F = (t) => exportFilename(t, 'fallback')
@@ -772,6 +810,102 @@ process.env.LLMM_APPDATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-tes
   }
   check('a fresh database applies every migration cleanly', ok)
   fresh.close()
+}
+
+{
+  /*
+   * A migration that fails part-way must leave nothing behind.
+   *
+   * Migration 4 rebuilds `tasks` across four statements. Run outside a transaction, a failure
+   * between the DROP and the RENAME left a database with no `tasks` table and no record of the
+   * attempt — and the retry on the next launch then died on `tasks_new` already existing, for
+   * good. This mirrors what getDb now does: BEGIN, apply, record, COMMIT — or ROLLBACK.
+   */
+  const { DatabaseSync } = await import('node:sqlite')
+
+  const db = new DatabaseSync(':memory:')
+  db.exec('CREATE TABLE keep (id INTEGER PRIMARY KEY);')
+  db.exec("INSERT INTO keep (id) VALUES (1);")
+  db.exec('CREATE TABLE _migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);')
+
+  // A migration that does real work and then fails, exactly like a rebuild dying mid-sequence.
+  const broken = 'CREATE TABLE added (id INTEGER); DROP TABLE keep; SELECT this_is_not_valid_sql();'
+  let threw = false
+  db.exec('BEGIN')
+  try {
+    db.exec(broken)
+    db.prepare('INSERT INTO _migrations (id, applied_at) VALUES (?, ?)').run(99, 1)
+    db.exec('COMMIT')
+  } catch {
+    db.exec('ROLLBACK')
+    threw = true
+  }
+
+  check('a failing migration reports rather than half-applying', threw)
+
+  const tables = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+    .all()
+    .map((r) => r.name)
+  check('the table it dropped is still there', tables.includes('keep'), tables.join(','))
+  check('the table it created is not', !tables.includes('added'), tables.join(','))
+  check('and it is not recorded as applied, so the next launch retries it',
+    db.prepare('SELECT COUNT(*) n FROM _migrations').get().n === 0)
+
+  db.close()
+}
+
+// ---------------------------------------------------------------- transcript order
+
+/*
+ * `created_at` is a millisecond stamp, and an agent turn writes several messages inside one.
+ * Ordering by it alone leaves the arrangement of a whole turn to whatever SQLite feels like
+ * returning, and cutting a transcript at a timestamp cannot express "from this message onward"
+ * when several share one. Both are ordered and cut by (created_at, rowid) instead.
+ */
+section('Transcript order and truncation')
+{
+  const { createChat, appendMessage, loadMessages, truncateFrom } = await import('./built/repo.js')
+
+  const chat = createChat({ title: 'Ordering', kind: 'agent' })
+  // One millisecond, five messages — the shape an agent turn with two tool calls produces.
+  const t = 1_700_000_000_000
+  const ids = ['m1-user', 'm2-assistant', 'm3-tool', 'm4-assistant', 'm5-tool']
+  for (const id of ids) {
+    appendMessage(chat.id, { id, role: 'user', content: id, createdAt: t })
+  }
+
+  const ordered = loadMessages(chat.id).map((m) => m.id)
+  check('messages sharing a millisecond keep the order they were written', ordered.join(',') === ids.join(','), ordered.join(','))
+
+  const removed = truncateFrom(chat.id, 'm3-tool')
+  const left = loadMessages(chat.id).map((m) => m.id)
+  check('rewinding cuts from exactly that message', left.join(',') === 'm1-user,m2-assistant', left.join(','))
+  check('and reports what it removed', removed === 3, String(removed))
+
+  // A later message must still be cut even though its timestamp is larger.
+  appendMessage(chat.id, { id: 'm6-later', role: 'user', content: 'later', createdAt: t + 50 })
+  truncateFrom(chat.id, 'm2-assistant')
+  check('a later message goes too', loadMessages(chat.id).map((m) => m.id).join(',') === 'm1-user')
+}
+
+{
+  const { createChat, appendMessage, searchChats } = await import('./built/repo.js')
+
+  // LIKE treats % and _ as wildcards, so an unescaped query matched far more than was asked for.
+  const chat = createChat({ title: 'Search', kind: 'chat' })
+  appendMessage(chat.id, { id: 's1', role: 'user', content: 'battery at 50% today', createdAt: 1 })
+  appendMessage(chat.id, { id: 's2', role: 'user', content: 'battery at 5091 today', createdAt: 2 })
+  appendMessage(chat.id, { id: 's3', role: 'user', content: 'call read_file next', createdAt: 3 })
+  appendMessage(chat.id, { id: 's4', role: 'user', content: 'call readXfile next', createdAt: 4 })
+
+  const percent = searchChats('50%')
+  check('a percent sign is a character, not a wildcard', percent.length === 1, JSON.stringify(percent.map((r) => r.snippet)))
+
+  const underscore = searchChats('read_file')
+  check('an underscore matches only itself', underscore.length === 1, JSON.stringify(underscore.map((r) => r.snippet)))
+
+  check('ordinary searches still work', searchChats('battery').length === 2)
 }
 
 // ---------------------------------------------------------------- ultra

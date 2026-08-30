@@ -97,9 +97,14 @@ class TunnelManager extends EventEmitter {
     this.update({ running: false, url: null })
     if (!child) return
     await new Promise<void>((resolve) => {
-      child.once('exit', () => resolve())
+      // Cleared on a clean exit, so stopping the tunnel does not leave a three-second timer
+      // holding the event loop open behind it.
+      const giveUp = setTimeout(resolve, 3000)
+      child.once('exit', () => {
+        clearTimeout(giveUp)
+        resolve()
+      })
       child.kill()
-      setTimeout(resolve, 3000)
     })
   }
 }

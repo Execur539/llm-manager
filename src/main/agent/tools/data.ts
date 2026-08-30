@@ -9,23 +9,39 @@ import { DatabaseSync } from 'node:sqlite'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 import type { Tool } from './base'
-import { schema, str, int, bool } from './base'
+import { schema, str, int } from './base'
 
 function resolve(cwd: string, p: string): string {
   return path.isAbsolute(p) ? path.normalize(p) : path.resolve(cwd, p)
 }
 
+/**
+ * A rough "this writes" test, used only to give a better error than SQLite's own.
+ *
+ * Not a security boundary and not treated as one — the read tool opens the file read-only, so
+ * anything this misses (a leading comment, a CTE wrapping a DELETE) still fails at the engine.
+ */
+const MODIFIES_SQL = /^\s*(insert|update|delete|drop|create|alter|replace|truncate|vacuum|attach|pragma\s+\w+\s*=)/i
+
+/**
+ * Reading and writing are separate tools because tier is what the permission gate reads.
+ *
+ * There used to be one `sqlite_query` at read tier with a `write: true` flag. Read tier means
+ * "runs freely, no prompt", so setting that flag dropped tables in the user's database with no
+ * approval asked — and, being read tier, the tool stayed available in plan mode and in Ultra's
+ * read-only planning samples, both of which promise nothing will be modified. A tool that can be
+ * either is a tool whose tier is a lie about half its calls.
+ */
 const sqliteQuery: Tool = {
   name: 'sqlite_query',
   description:
-    'Run a SQL query against a SQLite database file and return the rows. Read-only by default; ' +
-    'set write=true for statements that modify data.',
+    'Run a read-only SQL query against a SQLite database file and return the rows. Use ' +
+    'sqlite_execute for statements that modify data.',
   tier: 'read',
   parameters: schema(
     {
       database: str('Path to the .db / .sqlite file'),
-      sql: str('SQL to execute'),
-      write: bool('Required for INSERT/UPDATE/DELETE/CREATE and similar'),
+      sql: str('SELECT (or other read-only) SQL'),
       limit: int('Maximum rows to return (default 200)')
     },
     ['database', 'sql']
@@ -33,18 +49,14 @@ const sqliteQuery: Tool = {
   async run(args, ctx) {
     const file = resolve(ctx.cwd, String(args.database))
     const sql = String(args.sql)
-    const isWrite = /^\s*(insert|update|delete|drop|create|alter|replace|truncate|pragma\s+\w+\s*=)/i.test(sql)
 
-    if (isWrite && !args.write) {
-      throw new Error('This statement modifies the database. Set write=true to proceed.')
+    // The database is opened read-only, so this is a clearer error rather than the gate itself.
+    if (MODIFIES_SQL.test(sql)) {
+      throw new Error('This statement modifies the database. Use sqlite_execute instead.')
     }
 
-    const db = new DatabaseSync(file, { readOnly: !args.write })
+    const db = new DatabaseSync(file, { readOnly: true })
     try {
-      if (isWrite) {
-        db.prepare(sql).run()
-        return 'Statement executed.'
-      }
       const rows = db.prepare(sql).all() as Record<string, unknown>[]
       const limit = Number(args.limit ?? 200)
       const shown = rows.slice(0, limit)
@@ -53,6 +65,28 @@ const sqliteQuery: Tool = {
       const body = shown.map((r) => Object.values(r).map((v) => String(v ?? '')).join(' | ')).join('\n')
       const more = rows.length > limit ? `\n\n[${rows.length - limit} more rows]` : ''
       return `${header}\n${'-'.repeat(header.length)}\n${body}${more}`
+    } finally {
+      db.close()
+    }
+  }
+}
+
+const sqliteExecute: Tool = {
+  name: 'sqlite_execute',
+  description:
+    'Run a statement that modifies a SQLite database — INSERT, UPDATE, DELETE, CREATE, ALTER, ' +
+    'DROP. Changes are not reversible, so say what you intend to change before calling it.',
+  tier: 'write',
+  parameters: schema(
+    { database: str('Path to the .db / .sqlite file'), sql: str('The statement to execute') },
+    ['database', 'sql']
+  ),
+  async run(args, ctx) {
+    const file = resolve(ctx.cwd, String(args.database))
+    const db = new DatabaseSync(file)
+    try {
+      db.prepare(String(args.sql)).run()
+      return 'Statement executed.'
     } finally {
       db.close()
     }
@@ -128,6 +162,12 @@ const parseData: Tool = {
   ),
   async run(args, ctx) {
     const file = resolve(ctx.cwd, String(args.path))
+    // Reading is unbounded otherwise, and this tool exists precisely because the file might be
+    // large. `read_file` refuses at the same point, so the two agree on what "too big" means.
+    const { size } = await fsp.stat(file)
+    if (size > 200 * 1024 * 1024) {
+      throw new Error(`${file} is ${(size / 1e6).toFixed(0)} MB — too large to parse in memory.`)
+    }
     const text = await fsp.readFile(file, 'utf8')
     const ext = path.extname(file).toLowerCase()
     const format = String(args.format ?? (ext === '.json' ? 'json' : ext === '.tsv' ? 'tsv' : 'csv'))
@@ -164,4 +204,4 @@ const parseData: Tool = {
   }
 }
 
-export const dataTools: Tool[] = [sqliteQuery, sqliteSchema, parseData]
+export const dataTools: Tool[] = [sqliteQuery, sqliteExecute, sqliteSchema, parseData]

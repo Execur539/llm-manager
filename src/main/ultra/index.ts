@@ -272,7 +272,9 @@ export async function ultraSamples(
     )
   }
 
-  events.onSynthesisStart?.(samples)
+  // A stopped run has no synthesis to announce. Firing it anyway collapsed the sample boxes and
+  // told the UI the real answer was arriving, moments before the aborted request threw.
+  if (!base.signal?.aborted) events.onSynthesisStart?.(samples)
   return { samples, synthesis: synthesisMessages(base.messages, samples) }
 }
 

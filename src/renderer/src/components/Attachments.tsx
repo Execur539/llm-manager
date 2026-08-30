@@ -41,6 +41,8 @@ export function useAttachments(): {
 } {
   const [items, setItems] = useState<AttachmentInfo[]>([])
   const [busy, setBusy] = useState(false)
+  /** `pick` is defined above `addFiles`, and in the remote shell it needs to call it. */
+  const addFilesRef = useRef<((files: FileList | File[]) => Promise<void>) | null>(null)
 
   const merge = useCallback((incoming: AttachmentInfo[]) => {
     setItems((prev) => {
@@ -49,7 +51,27 @@ export function useAttachments(): {
     })
   }, [])
 
+  /*
+   * Two pickers, because there are two shells.
+   *
+   * The desktop opens a native dialog through the bridge, which is the only way to get a real
+   * path. A remote browser cannot: that dialog would open on the host machine, in front of
+   * whoever is sitting at it, and the request would hang until they dismissed it. The browser's
+   * own file input goes through the upload path instead, which is what drag-and-drop already
+   * used — until now the paperclip was the one way in that a remote session could not use.
+   */
   const pick = useCallback(async () => {
+    if (!isDesktop) {
+      const input = document.createElement('input')
+      input.type = 'file'
+      input.multiple = true
+      input.onchange = () => {
+        if (input.files?.length) void addFilesRef.current?.(input.files)
+      }
+      input.click()
+      return
+    }
+
     setBusy(true)
     try {
       merge((await invoke<AttachmentInfo[]>('attachments:pick')) ?? [])
@@ -100,6 +122,8 @@ export function useAttachments(): {
     },
     [merge]
   )
+
+  addFilesRef.current = addFiles
 
   return {
     items,
@@ -203,7 +227,10 @@ export function DropZone({
         e.dataTransfer.dropEffect = 'copy'
       }}
       onDragLeave={(e) => {
-        if (disabled) return
+        // Guarded exactly as the enter is. Without the same test, dragging something that is not
+        // a file across the pane decremented a counter nothing had incremented, and the overlay
+        // then flickered off partway through a real drag.
+        if (disabled || !e.dataTransfer?.types?.includes('Files')) return
         e.preventDefault()
         depth.current -= 1
         if (depth.current <= 0) reset()

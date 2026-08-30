@@ -30,7 +30,7 @@ import type {
 } from '@shared/types'
 import { llama, estimateTokens, type ChatMessage, type ContentPart } from '../runtime/llama'
 import { reasoningRequestFields, type ReasoningChoice } from '../models/reasoning'
-import { PermissionEngine, type PermissionRule } from './permissions'
+import { PermissionEngine, isSecretPath, type PermissionRule } from './permissions'
 import { ToolRegistry, makeResult, type Tool, type ToolContext } from './tools/base'
 import { filesystemTools } from './tools/filesystem'
 import { execTools } from './tools/exec'
@@ -42,6 +42,7 @@ import { makeAgentTools } from './tools/agentic'
 import { checkpointFiles } from './checkpoints'
 import { mcpManager } from './mcp'
 import { readMemory } from './memory'
+import { APPDATA_DIR } from '../storage/paths'
 
 export interface AgentOptions {
   cwd: string
@@ -258,6 +259,28 @@ Platform: Windows (PowerShell)${memoryBlock}`
       )
     }
 
+    /*
+     * The app's own secrets file is off limits to every tool, at every tier.
+     *
+     * `isSecretPath` was written for exactly this and then never called, so the guard existed in
+     * the source and nowhere in the behaviour. It matters most for read-class tools, which run
+     * without asking: `read_file` and `fetch_url` are both read tier, so a model following
+     * instructions it found in a web page or a repository could have gone looking for the remote
+     * password hash, the API key and the HuggingFace token without a single prompt appearing.
+     * (They are encrypted at rest wherever the OS offers it, which is not everywhere.)
+     */
+    const secret = collectPaths(call.args, this.opts.cwd).find((p) => isSecretPath(p, APPDATA_DIR))
+    if (secret) {
+      return makeResult(
+        call.id,
+        `${secret} holds this application's own credentials and is not readable or writable by tools.`,
+        call.name,
+        started,
+        false,
+        'app secrets are off limits'
+      )
+    }
+
     const auth = await this.permissions.authorise(tool.name, tool.tier, call.args, this.opts.cwd)
     if (!auth.allowed) {
       return makeResult(call.id, auth.reason ?? 'Denied.', call.name, started, false, auth.reason)
@@ -352,7 +375,10 @@ Platform: Windows (PowerShell)${memoryBlock}`
           { role: 'user', content: transcript }
         ],
         temperature: 0.2,
-        maxTokens: 1024
+        maxTokens: 1024,
+        // Compaction runs between iterations of a turn the user may already have stopped, and
+        // summarising a long session is not quick. Without the signal, stop had to wait it out.
+        signal: this.abort?.signal
       })
     } catch {
       summary = '(compaction failed; older turns were dropped)'
@@ -388,7 +414,8 @@ Platform: Windows (PowerShell)${memoryBlock}`
             { role: 'user', content: transcript }
           ],
           temperature: 0.2,
-          maxTokens: 1024
+          maxTokens: 1024,
+          signal: this.abort?.signal
         })
         .catch(() => '(compaction failed)')
       this.history = [system, { role: 'user', content: `[Summary of earlier work]\n${summary}` }, ...recent]
@@ -600,8 +627,19 @@ Platform: Windows (PowerShell)${memoryBlock}`
           }))
         })
 
+        /*
+         * Every announced call gets an answer, even the ones that never ran.
+         *
+         * The assistant turn above is pushed with its full `tool_calls` list before any of them
+         * execute. Stopping part-way through left the later calls with no matching `tool`
+         * message, and that history is what the next turn is built from — an assistant turn
+         * claiming three calls followed by one result is not a shape the OpenAI format allows,
+         * and what a chat template does with it is anyone's guess.
+         */
+        const answered = new Set<string>()
         for (const call of toolCalls) {
           if (signal.aborted) break
+          answered.add(call.id)
           calls++
           this.emit('toolCall', call)
 
@@ -626,6 +664,16 @@ Platform: Windows (PowerShell)${memoryBlock}`
             name: call.name
           })
         }
+
+        for (const call of toolCalls) {
+          if (answered.has(call.id)) continue
+          this.history.push({
+            role: 'tool',
+            content: 'Not run: the user stopped the turn before this call was reached.',
+            tool_call_id: call.id,
+            name: call.name
+          })
+        }
       }
 
       this.emit('done', 'limit')
@@ -643,11 +691,28 @@ Platform: Windows (PowerShell)${memoryBlock}`
    * context-slot splitting.
    */
   private async runSubAgent(prompt: string, cwd?: string): Promise<string> {
+    /*
+     * The child inherits plan mode rather than clearing it.
+     *
+     * `delegate` is a read-tier tool, so it is offered in plan mode and during Ultra's planning
+     * samples — both of which exist to guarantee that nothing is written or executed. Handing the
+     * child `planMode: false` gave it the full tool set, which meant "investigate only" could be
+     * stepped around by delegating the work instead of doing it, and a planning sample that was
+     * documented as safe to run three times could write files three times.
+     */
     const child = new Agent(
-      { ...this.opts, cwd: cwd ?? this.opts.cwd, planMode: false },
+      { ...this.opts, cwd: cwd ?? this.opts.cwd, planMode: this.opts.planMode },
       this.depth + 1
     )
     child.loadPermissionRules(this.permissions.export())
+
+    // Stop stops the whole tree. The child builds its own controller, so aborting the parent
+    // ended the call this loop was awaiting and left the sub-agent running its remaining
+    // iterations unattended.
+    const parentSignal = this.abort?.signal
+    const stopChild = (): void => child.stop()
+    if (parentSignal?.aborted) stopChild()
+    else parentSignal?.addEventListener('abort', stopChild, { once: true })
 
     const session: AgentSessionState = {
       id: `sub-${crypto.randomBytes(4).toString('hex')}`,
@@ -661,7 +726,11 @@ Platform: Windows (PowerShell)${memoryBlock}`
     }
 
     child.on('toolCall', (c) => this.emit('subToolCall', c))
-    await child.run(session, prompt)
+    try {
+      await child.run(session, prompt)
+    } finally {
+      parentSignal?.removeEventListener('abort', stopChild)
+    }
 
     const last = [...session.messages].reverse().find((m) => m.role === 'assistant')
     return last?.content ?? '(sub-agent produced no answer)'

@@ -21,6 +21,16 @@ import { TOOL_OUTPUT_DIR } from '../../storage/paths'
 
 let browser: Browser | null = null
 let page: Page | null = null
+/**
+ * The context behind the current page.
+ *
+ * Tracked so it can be closed. A page that goes away — the site closed it, it crashed, a
+ * navigation killed it — sent the next tool call down the `newContext()` path, and the old
+ * context stayed open in the Chromium process with its own cookies, storage and memory. Nothing
+ * ever closed one, so a session that lost a page a few times accumulated them until the browser
+ * was closed outright.
+ */
+let context: Awaited<ReturnType<Browser['newContext']>> | null = null
 
 async function getPage(): Promise<Page> {
   if (page && !page.isClosed()) return page
@@ -34,9 +44,11 @@ async function getPage(): Promise<Page> {
       )
     }
     browser = await chromium.launch({ executablePath, headless: true })
+    context = null
   }
 
-  const context = await browser.newContext({
+  await context?.close().catch(() => undefined)
+  context = await browser.newContext({
     viewport: { width: 1280, height: 900 },
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
@@ -52,6 +64,7 @@ export async function closeBrowser(): Promise<void> {
     /* already gone */
   }
   browser = null
+  context = null
   page = null
 }
 

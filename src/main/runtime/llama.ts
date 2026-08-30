@@ -136,8 +136,6 @@ export class LlamaRuntime extends EventEmitter {
   private current: LoadedModel | null = null
   private starting: Promise<LoadedModel> | null = null
   private lastTimings: Timings | null = null
-  /** Serialises requests so the local user's work is never interleaved with remote work. */
-  private queue: Promise<unknown> = Promise.resolve()
 
   get loaded(): LoadedModel | null {
     return this.current
@@ -155,10 +153,10 @@ export class LlamaRuntime extends EventEmitter {
       '--ctx-size', String(plan.contextLength),
       '--n-gpu-layers', String(plan.gpuLayers),
       '--batch-size', String(plan.batchSize),
-      // llama-server defaults to 4 parallel slots. We serialise every request through a
-      // priority queue instead, so extra slots buy nothing — and they cost real memory:
-      // slots divide the context budget, and on hybrid models the recurrent-state cache is
-      // allocated *per slot*, which is enough to turn a fitting plan into an OOM.
+      // llama-server defaults to 4 parallel slots. One is deliberate: slots divide the context
+      // budget between them, and on hybrid models the recurrent-state cache is allocated *per
+      // slot*, which is enough to turn a fitting plan into an OOM. Concurrent callers wait —
+      // API requests in this process's own priority queue, everything else in the server's.
       '--parallel', '1',
       // Jinja templates enable llama.cpp's native tool-calling handlers.
       '--jinja'
@@ -175,64 +173,103 @@ export class LlamaRuntime extends EventEmitter {
     return args
   }
 
+  /**
+   * Load a model, replacing whatever was resident.
+   *
+   * Serialised by chaining onto the previous load rather than by checking a flag: the guard used
+   * to be `if (this.starting) await it`, followed by an `await this.unload()` before `starting`
+   * was assigned. Two callers arriving together — the desktop and a JIT load from the API server
+   * — both saw a null `starting`, both awaited the unload, and both spawned. The second child
+   * overwrote `this.child`, so the first was never killed: an orphaned llama-server holding a
+   * model's worth of VRAM for the life of the machine.
+   */
   async load(model: ModelRecord, plan: FitPlan, backend: Backend): Promise<LoadedModel> {
-    if (this.starting) await this.starting.catch(() => undefined)
-    await this.unload()
-
-    this.starting = (async () => {
-      const port = await freePort()
-      const args = this.buildArgs(model, plan, port)
-
-      this.emit('status', { phase: 'starting', model: model.filename, args })
-
-      // Test mode: swap in a stand-in server that speaks the same HTTP surface. Everything
-      // above the process boundary — health polling, SSE parsing, tool-call accumulation,
-      // timings, unload — runs unchanged; only the inference is fake. Guarded by an env var so
-      // it can never engage in a normal run.
-      const useMock = process.env.LLMM_MOCK_LLAMA === '1'
-      const exe = useMock ? process.execPath : llamaServerPath(backend)
-      const spawnArgs = useMock ? [mockServerPath(), ...args] : args
-      const env = useMock ? { ...childEnv(), ELECTRON_RUN_AS_NODE: '1' } : childEnv()
-
-      const child = spawn(exe, spawnArgs, { windowsHide: true, env })
-      this.child = child
-
-      let stderr = ''
-      const capture = (d: Buffer): void => {
-        const text = d.toString()
-        stderr += text
-        if (stderr.length > 256 * 1024) stderr = stderr.slice(-128 * 1024)
-        this.emit('log', text)
-      }
-      child.stderr?.on('data', capture)
-      child.stdout?.on('data', capture)
-      child.on('error', (err) => {
-        stderr += `\nspawn error: ${err.message}`
-      })
-      child.on('exit', (code) => {
-        this.emit('status', { phase: 'exited', code })
-        if (this.current?.port === port) this.current = null
-        this.child = null
-      })
-
-      await this.waitForHealth(port, child, () => stderr)
-
-      const loaded: LoadedModel = { model, plan, port, startedAt: Date.now() }
-      this.current = loaded
-      this.emit('status', { phase: 'ready', model: model.filename, port })
-      return loaded
+    const previous = this.starting
+    const attempt = (async () => {
+      await previous?.catch(() => undefined)
+      return this.doLoad(model, plan, backend)
     })()
+    this.starting = attempt
 
     try {
-      return await this.starting
+      return await attempt
     } finally {
-      this.starting = null
+      if (this.starting === attempt) this.starting = null
     }
   }
 
-  private async waitForHealth(port: number, child: ChildProcess, stderr: () => string): Promise<void> {
+  private async doLoad(model: ModelRecord, plan: FitPlan, backend: Backend): Promise<LoadedModel> {
+    await this.unload()
+
+    const port = await freePort()
+    const args = this.buildArgs(model, plan, port)
+
+    this.emit('status', { phase: 'starting', model: model.filename, args })
+
+    // Test mode: swap in a stand-in server that speaks the same HTTP surface. Everything
+    // above the process boundary — health polling, SSE parsing, tool-call accumulation,
+    // timings, unload — runs unchanged; only the inference is fake. Guarded by an env var so
+    // it can never engage in a normal run.
+    const useMock = process.env.LLMM_MOCK_LLAMA === '1'
+    const exe = useMock ? process.execPath : llamaServerPath(backend)
+    const spawnArgs = useMock ? [mockServerPath(), ...args] : args
+    const env = useMock ? { ...childEnv(), ELECTRON_RUN_AS_NODE: '1' } : childEnv()
+
+    const child = spawn(exe, spawnArgs, { windowsHide: true, env })
+    this.child = child
+
+    let stderr = ''
+    let spawnFailure: Error | null = null
+    const capture = (d: Buffer): void => {
+      const text = d.toString()
+      stderr += text
+      if (stderr.length > 256 * 1024) stderr = stderr.slice(-128 * 1024)
+      this.emit('log', text)
+    }
+    child.stderr?.on('data', capture)
+    child.stdout?.on('data', capture)
+    child.on('error', (err) => {
+      // A process that could not be started never exits, so `exitCode` stays null and the health
+      // poll had nothing to notice. A missing or unrunnable llama-server binary therefore looked
+      // exactly like a slow load, for ten minutes, before failing with a timeout that said
+      // nothing about the real cause.
+      spawnFailure = err
+      stderr += `\nspawn error: ${err.message}`
+    })
+    child.on('exit', (code) => {
+      this.emit('status', { phase: 'exited', code })
+      if (this.current?.port === port) this.current = null
+      this.child = null
+    })
+
+    try {
+      await this.waitForHealth(port, child, () => stderr, () => spawnFailure)
+    } catch (err) {
+      // A load that fails takes its child with it. Left running, a server that came up but never
+      // reported healthy would sit on the model's VRAM until the next load happened to unload it
+      // — or forever, if the user gave up and tried something else.
+      await this.unload()
+      throw err
+    }
+
+    const loaded: LoadedModel = { model, plan, port, startedAt: Date.now() }
+    this.current = loaded
+    this.emit('status', { phase: 'ready', model: model.filename, port })
+    return loaded
+  }
+
+  private async waitForHealth(
+    port: number,
+    child: ChildProcess,
+    stderr: () => string,
+    spawnFailure: () => Error | null = () => null
+  ): Promise<void> {
     const deadline = Date.now() + 10 * 60 * 1000 // big models genuinely take minutes
     while (Date.now() < deadline) {
+      const failed = spawnFailure()
+      if (failed) {
+        throw new Error(`llama-server could not be started: ${failed.message}\n${stderr().slice(-2000)}`)
+      }
       if (child.exitCode !== null) {
         throw new Error(`llama-server exited with code ${child.exitCode}.\n${stderr().slice(-2000)}`)
       }
@@ -256,9 +293,10 @@ export class LlamaRuntime extends EventEmitter {
     this.child = null
     this.current = null
     await new Promise<void>((resolve) => {
-      child.once('exit', () => resolve())
-      child.kill()
-      setTimeout(() => {
+      // Cleared when the child goes quietly, so a normal unload does not leave a four-second
+      // timer holding the event loop open behind it — which on quit is four seconds of the
+      // process refusing to exit.
+      const force = setTimeout(() => {
         try {
           child.kill('SIGKILL')
         } catch {
@@ -266,17 +304,12 @@ export class LlamaRuntime extends EventEmitter {
         }
         resolve()
       }, 4000)
+      child.once('exit', () => {
+        clearTimeout(force)
+        resolve()
+      })
+      child.kill()
     })
-  }
-
-  /**
-   * Enqueue work so concurrent callers (local UI, API server, remote web UI) are serialised
-   * rather than interleaving on one llama-server slot.
-   */
-  enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.queue.then(fn, fn)
-    this.queue = next.catch(() => undefined)
-    return next
   }
 
   private requestBody(opts: CompletionOptions, stream: boolean): Record<string, unknown> {
@@ -439,7 +472,10 @@ export class LlamaRuntime extends EventEmitter {
         }
       }
       yield* flushCalls()
-      this.lastTimings = finalise(startedAt, ttft, completionTokens)
+      // Prompt tokens carried through here too. A stream that ends by the body simply closing —
+      // rather than with an explicit [DONE] — took the other branch, which omitted the argument
+      // and reported prompt_tokens as zero to every client that reads usage.
+      this.lastTimings = finalise(startedAt, ttft, completionTokens, promptTokens)
     } finally {
       try {
         await reader.cancel()
@@ -485,7 +521,10 @@ export class LlamaRuntime extends EventEmitter {
     const res = await fetch(`http://127.0.0.1:${target}/v1/embeddings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input: texts })
+      body: JSON.stringify({ input: texts }),
+      // A server that has wedged would otherwise hang ingestion for the life of the process,
+      // with no error and nothing to cancel.
+      signal: AbortSignal.timeout(5 * 60 * 1000)
     })
     if (!res.ok) throw new Error(`Embeddings failed: HTTP ${res.status}`)
     const json = (await res.json()) as { data: { embedding: number[] }[] }

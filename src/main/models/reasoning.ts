@@ -125,6 +125,29 @@ export function strongestLevel(support: ReasoningSupport | undefined | null): st
 }
 
 /**
+ * Narrow a remembered choice to something the loaded model can actually express.
+ *
+ * The effort setting is remembered per conversation while level names belong to the model, so
+ * switching models leaves a choice the new one has never heard of. `reasoningRequestFields`
+ * already drops an unknown level, but `isUltra` did not ask the same question — so Ultra chosen
+ * on a levels model survived onto a toggle model, where the control has no way to show it, and
+ * ran three sampling passes with nothing on screen to explain the wait.
+ *
+ * Applied here rather than only in the renderer because the renderer is not the only caller: the
+ * API server and a remote browser send this field too, and neither is obliged to be sensible.
+ *
+ * The renderer keeps a copy of this rule, because it decides what to *draw* from the same facts;
+ * they are checked against each other by construction being three lines long.
+ */
+export function sendableChoice(support: ReasoningSupport | undefined | null, choice: ReasoningChoice): ReasoningChoice {
+  if (!support || support.kind === 'none' || choice === null) return null
+  if (choice === 'off') return 'off'
+  if (support.kind === 'toggle') return choice === ULTRA ? null : choice
+  if (choice === ULTRA) return ULTRA
+  return support.levels.includes(choice) ? choice : null
+}
+
+/**
  * Turn a choice into request fields, given what the model actually supports.
  *
  * Deliberately conservative: anything the model did not advertise is dropped rather than sent

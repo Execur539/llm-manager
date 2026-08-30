@@ -4,6 +4,12 @@ import { invoke, on, fmtDuration } from '../lib/api'
 interface ServerStatus {
   running: boolean
   port: number | null
+  /** Requests waiting on the one inference slot, including the one in flight. */
+  queue?: number
+  /** Whether a key exists. Never the key itself — this status is readable remotely. */
+  hasApiKey?: boolean
+  /** True when network exposure was asked for and refused because no key is set. */
+  networkBlocked?: boolean
 }
 
 interface RequestEntry {
@@ -20,6 +26,13 @@ interface RequestEntry {
 export default function ServerView(): JSX.Element {
   const [status, setStatus] = useState<ServerStatus>({ running: false, port: null })
   const [requests, setRequests] = useState<RequestEntry[]>([])
+  /*
+   * The key as generated in this session, so it can be read once and copied.
+   *
+   * Whether a key *exists* comes from the status instead. Nothing used to ask, so the panel said
+   * "none set" after every restart and the natural response — press Generate — replaced a key
+   * that every configured client was still using.
+   */
   const [apiKey, setApiKey] = useState<string | null>(null)
   const [port, setPort] = useState(1234)
   const [jitLoad, setJitLoad] = useState(true)
@@ -35,6 +48,8 @@ export default function ServerView(): JSX.Element {
 
     const tick = (): void => {
       void invoke<RequestEntry[]>('server:requests', 50).then(setRequests).catch(() => undefined)
+      // Queue depth and key state move without any event to announce them.
+      void invoke<ServerStatus>('server:status').then(setStatus).catch(() => undefined)
     }
     tick()
     const timer = setInterval(tick, 3000)
@@ -121,23 +136,48 @@ export default function ServerView(): JSX.Element {
           </dd>
           <dt>API key</dt>
           <dd>
-            {apiKey ? <span className="mono">{apiKey}</span> : <span className="faint">none set</span>}
-            <button style={{ marginLeft: 8 }} onClick={async () => setApiKey(await invoke<string>('server:generate-key'))}>
-              Generate
+            {apiKey ? (
+              <span className="mono">{apiKey}</span>
+            ) : status.hasApiKey ? (
+              <span className="faint">set — generating a new one replaces it</span>
+            ) : (
+              <span className="faint">none set</span>
+            )}
+            <button
+              style={{ marginLeft: 8 }}
+              onClick={async () => {
+                setApiKey(await invoke<string>('server:generate-key'))
+                setStatus(await invoke<ServerStatus>('server:status'))
+              }}
+            >
+              {status.hasApiKey ? 'Replace' : 'Generate'}
             </button>
-            {apiKey && (
+            {(apiKey || status.hasApiKey) && (
               <button
                 style={{ marginLeft: 6 }}
                 onClick={async () => {
                   await invoke('server:clear-key')
                   setApiKey(null)
+                  setStatus(await invoke<ServerStatus>('server:status'))
                 }}
               >
                 Clear
               </button>
             )}
           </dd>
+          <dt>Queue</dt>
+          <dd>
+            {status.queue ? `${status.queue} waiting` : <span className="faint">idle</span>}
+          </dd>
         </dl>
+
+        {status.networkBlocked && (
+          <div className="card note" style={{ marginTop: 12 }}>
+            Remote access is on, but the API has no key — so it is listening on 127.0.0.1 only
+            rather than publishing an unauthenticated endpoint to your network. Generate a key
+            above and restart the server to reach it from another machine.
+          </div>
+        )}
 
         <button className={status.running ? 'danger' : 'primary'} style={{ marginTop: 12 }} onClick={() => void toggle()}>
           {status.running ? 'Stop server' : 'Start server'}

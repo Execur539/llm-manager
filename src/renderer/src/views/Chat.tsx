@@ -21,7 +21,7 @@ import MessageRow from '../components/MessageRow'
 import ThinkingBlock from '../components/ThinkingBlock'
 import UltraSamples from '../components/UltraSamples'
 import RailToggle from '../components/RailToggle'
-import ReasoningControl from '../components/ReasoningControl'
+import ReasoningControl, { sendableChoice } from '../components/ReasoningControl'
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
 import { Spinner } from '../components/Spinner'
 import EmptyState from '../components/EmptyState'
@@ -105,14 +105,17 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
     }
   }, [activeId])
 
-  // Absorb anything that arrived while this view was unmounted.
+  // Absorb anything that arrived while this view was unmounted. A repeated id replaces the copy
+  // already on screen rather than being dropped, so a message that is revised after it was first
+  // shown keeps its place in the transcript and gains whatever the later copy added.
   useEffect(() => {
     if (!activeId) return
     const pending = takePending(activeId)
     if (pending.length) {
       setMessages((prev) => {
-        const seen = new Set(prev.map((m) => m.id))
-        return [...prev, ...pending.filter((m) => !seen.has(m.id))]
+        const byId = new Map(prev.map((m) => [m.id, m]))
+        for (const m of pending) byId.set(m.id, m)
+        return [...byId.values()]
       })
     }
   }, [activeId, stream.pending])
@@ -159,7 +162,8 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
 
     // Read from the render-time snapshot, which is the only place the draft choice exists —
     // adoptReasoning has mutated the store, but `stream` here was captured before it did.
-    const effort = stream.reasoning[effortId] ?? null
+    // Narrowed to what this model can express — see sendableChoice.
+    const effort = sendableChoice(loaded?.caps?.reasoning, stream.reasoning[effortId] ?? null)
 
     const text = input
     setInput('')

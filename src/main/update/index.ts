@@ -110,6 +110,25 @@ export async function applyUpdate(
     return { ok: false, message: 'Updates only apply to a packaged build. In development, pull and rebuild.' }
   }
 
+  /*
+   * The URL is checked against the feed rather than trusted.
+   *
+   * What this function does with its argument is download it, overwrite the running executable
+   * with it, and launch it — so whoever supplies the argument decides what code runs as the user,
+   * permanently. The caller is the renderer, and the same handler map serves the remote web UI,
+   * so "the caller is us" was never a safe assumption. The only URL that may be applied is the
+   * one the release feed is offering right now.
+   */
+  const offered = await checkForUpdate()
+  if (!offered.downloadUrl || url !== offered.downloadUrl) {
+    return {
+      ok: false,
+      message: offered.error
+        ? `Could not confirm the update against the release feed: ${offered.error}`
+        : 'That download does not match the published release. Nothing was changed.'
+    }
+  }
+
   const currentExe = app.getPath('exe')
   const dir = path.dirname(currentExe)
   const staged = path.join(dir, `.update-${Date.now()}.exe`)

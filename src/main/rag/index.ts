@@ -94,21 +94,55 @@ class EmbeddingService {
         }
       )
       this.child = child
+
+      /*
+       * The child's pipes are read, not just opened.
+       *
+       * spawn defaults stdio to 'pipe', and llama-server logs every request it serves. Nothing
+       * consumed either stream here, so once the OS buffer filled — 64 KB, which is a few
+       * minutes of ingestion — the server blocked on its next write and stayed blocked. RAG
+       * stopped working with no error anywhere: requests simply never came back.
+       */
+      let log = ''
+      const capture = (d: Buffer): void => {
+        log = `${log}${d.toString()}`.slice(-8192)
+      }
+      child.stdout?.on('data', capture)
+      child.stderr?.on('data', capture)
+
       child.on('exit', () => {
         this.child = null
         this.port = null
       })
 
+      let healthy = false
       const deadline = Date.now() + 120000
       while (Date.now() < deadline) {
-        if (child.exitCode !== null) throw new Error(`Embedding server exited (${child.exitCode})`)
+        if (child.exitCode !== null) {
+          throw new Error(`Embedding server exited (${child.exitCode})\n${log.slice(-1000)}`)
+        }
         try {
           const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) })
-          if (res.ok) break
+          if (res.ok) {
+            healthy = true
+            break
+          }
         } catch {
           /* not up yet */
         }
         await new Promise((r) => setTimeout(r, 400))
+      }
+
+      /*
+       * A timeout is a failure, not a start.
+       *
+       * The loop used to fall through on expiry and record the port regardless, so a server that
+       * never came up was cached as ready — and every later call failed on connection refused,
+       * two minutes after the thing that actually went wrong.
+       */
+      if (!healthy) {
+        await this.stop()
+        throw new Error(`Embedding server did not become ready within two minutes.\n${log.slice(-1000)}`)
       }
 
       this.port = port
@@ -148,9 +182,14 @@ class EmbeddingService {
     this.port = null
     if (!child) return
     await new Promise<void>((resolve) => {
-      child.once('exit', () => resolve())
+      // Cleared on a clean exit, so a normal stop does not leave a three-second timer holding
+      // the process open behind it.
+      const giveUp = setTimeout(resolve, 3000)
+      child.once('exit', () => {
+        clearTimeout(giveUp)
+        resolve()
+      })
       child.kill()
-      setTimeout(resolve, 3000)
     })
   }
 }
@@ -178,8 +217,30 @@ export const embeddings = new EmbeddingService()
  * PDF handling is deliberately simple: pull text objects out of the raw stream. It copes with
  * ordinary text PDFs and gives up honestly on scanned ones rather than returning noise.
  */
+/**
+ * The most this will read into memory.
+ *
+ * Nothing capped it, and both callers hand it whatever the user picked: attaching a multi-gigabyte
+ * log to a chat read the whole thing as a Buffer and then doubled it converting to a string. The
+ * text is going to be truncated to sixty thousand characters or chunked for embedding either way,
+ * so a file this size is already the wrong tool for the job — better to say so than to run out of
+ * memory finding out.
+ */
+const MAX_EXTRACT_BYTES = 128 * 1024 * 1024
+
+async function refuseIfHuge(file: string): Promise<void> {
+  const { size } = await fsp.stat(file)
+  if (size > MAX_EXTRACT_BYTES) {
+    throw new Error(
+      `${path.basename(file)} is ${(size / 1e6).toFixed(0)} MB — too large to read as text. ` +
+        'Extract the part you need first, or point a document collection at it.'
+    )
+  }
+}
+
 export async function extractText(file: string): Promise<string> {
   const ext = path.extname(file).toLowerCase()
+  await refuseIfHuge(file)
 
   if (ext === '.pdf') return extractPdf(file)
 
@@ -288,9 +349,24 @@ function toBlob(vector: number[]): Buffer {
   return Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength)
 }
 
+/**
+ * Read a stored vector back without assuming anything about how it is laid out in memory.
+ *
+ * A Float32Array view demands a byte offset that is a multiple of four and enough bytes behind
+ * it. Neither is guaranteed here: SQLite hands back a Uint8Array, and where that lands depends
+ * on Node's internal buffer pool, while `dim` comes from a column that a change of embedding
+ * model can leave disagreeing with the blob beside it. The aligned, long-enough case — which is
+ * every case in practice — still takes the zero-copy view; the rest copy rather than throwing a
+ * RangeError, or silently scoring against whatever memory happened to follow.
+ */
 function fromBlob(blob: Buffer | Uint8Array, dim: number): Float32Array {
   const buf = Buffer.isBuffer(blob) ? blob : Buffer.from(blob)
-  return new Float32Array(buf.buffer, buf.byteOffset, dim)
+  const usable = Math.min(dim, Math.floor(buf.byteLength / 4))
+  if (buf.byteOffset % 4 === 0) return new Float32Array(buf.buffer, buf.byteOffset, usable)
+
+  const aligned = new Uint8Array(usable * 4)
+  aligned.set(buf.subarray(0, usable * 4))
+  return new Float32Array(aligned.buffer)
 }
 
 export function createCollection(name: string): { id: string; name: string } {

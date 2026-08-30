@@ -127,8 +127,20 @@ class ChunkReader {
     const want = Math.max(n, this.chunkSize)
     const size = Math.min(want, this.fileSize - this.pos)
     const next = Buffer.alloc(size)
-    await this.fh.read(next, 0, size, this.pos)
-    this.buf = next
+    const { bytesRead } = await this.fh.read(next, 0, size, this.pos)
+    /*
+     * A short read is a failure, not a shorter buffer.
+     *
+     * The count came back and was thrown away, so anything the read did not fill stayed as the
+     * zeroes `Buffer.alloc` left there — and the parser read them as real values. On a local disk
+     * this does not happen; over SMB, which is where a large model library often lives, it does,
+     * and the result is a plausible-looking but wrong architecture: wrong layer count, wrong
+     * VRAM estimate, a fit plan that OOMs on load with nothing pointing back to here.
+     */
+    if (bytesRead < Math.min(n, size)) {
+      throw new Error(`GGUF: short read at ${this.pos} (wanted ${size} bytes, got ${bytesRead})`)
+    }
+    this.buf = next.subarray(0, bytesRead)
     this.bufStart = this.pos
   }
 

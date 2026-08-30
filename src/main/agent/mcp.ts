@@ -52,6 +52,8 @@ class McpConnection {
   private nextId = 1
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
   private buffer = ''
+  /** Tail of the server's stderr, kept for diagnostics and drained so the pipe cannot fill. */
+  private stderr = ''
   private sessionId: string | null = null
   tools: McpToolSpec[] = []
   connected = false
@@ -77,7 +79,10 @@ class McpConnection {
       this.lastError = null
     } catch (err) {
       this.connected = false
-      this.lastError = err instanceof Error ? err.message : String(err)
+      const message = err instanceof Error ? err.message : String(err)
+      // A server that fails to start usually says why on stderr and nowhere else.
+      const tail = this.stderr.trim().slice(-500)
+      this.lastError = tail ? `${message}\n${tail}` : message
       throw err
     }
   }
@@ -92,6 +97,17 @@ class McpConnection {
     this.child = child
 
     child.stdout?.on('data', (d: Buffer) => this.onStdout(d.toString()))
+    /*
+     * stderr is piped, so it has to be read.
+     *
+     * An unread pipe fills — 64 KB on Windows — and then the writer blocks on its next write.
+     * MCP servers log to stderr as a matter of course, so a talkative one would eventually stop
+     * dead mid-conversation with no error anywhere: every subsequent request simply timed out.
+     * The tail is kept because it is the only diagnostic a server that fails to start leaves.
+     */
+    child.stderr?.on('data', (d: Buffer) => {
+      this.stderr = `${this.stderr}${d.toString()}`.slice(-8192)
+    })
     child.on('exit', () => {
       this.connected = false
       for (const [, p] of this.pending) p.reject(new Error('MCP server exited'))

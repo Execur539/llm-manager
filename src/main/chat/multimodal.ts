@@ -88,15 +88,25 @@ async function videoDurationSeconds(file: string): Promise<number | null> {
       ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file],
       { windowsHide: true }
     )
+    // Probing is a metadata read; if it has not answered in half a minute something is wrong
+    // with the file and the frame sampler can fall back to a flat rate.
+    const timer = setTimeout(() => child.kill('SIGKILL'), 30_000)
     let out = ''
     child.stdout?.on('data', (d: Buffer) => {
       out += d.toString()
     })
+    // stderr is piped by default and nothing else reads it; an unread pipe that fills blocks
+    // the child, which is exactly the hang this timeout would then have to clean up.
+    child.stderr?.resume()
     child.on('close', () => {
+      clearTimeout(timer)
       const n = Number(out.trim())
       resolve(Number.isFinite(n) && n > 0 ? n : null)
     })
-    child.on('error', () => resolve(null))
+    child.on('error', () => {
+      clearTimeout(timer)
+      resolve(null)
+    })
   })
 }
 
@@ -126,10 +136,24 @@ export async function extractFrames(file: string, count: number): Promise<string
   await new Promise<void>((resolve, reject) => {
     const child = spawn(ffmpeg, args, { windowsHide: true })
     let stderr = ''
+    let timedOut = false
+    /*
+     * Sampling a clip has to finish or fail; it cannot just sit there.
+     *
+     * This runs inside `chat:send` before the turn's abort controller is even registered, so an
+     * ffmpeg that wedged on a malformed file produced a chat turn that could not be stopped by
+     * any means short of killing the app.
+     */
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGKILL')
+    }, 5 * 60 * 1000)
+
     child.stderr?.on('data', (d: Buffer) => {
-      stderr += d.toString()
+      stderr = `${stderr}${d.toString()}`.slice(-8192)
     })
-    child.on('error', (err) =>
+    child.on('error', (err) => {
+      clearTimeout(timer)
       reject(
         new Error(
           err.message.includes('ENOENT')
@@ -137,8 +161,12 @@ export async function extractFrames(file: string, count: number): Promise<string
             : err.message
         )
       )
-    )
-    child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(stderr.slice(-500) || `ffmpeg exited ${code}`))))
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      if (timedOut) return reject(new Error('FFmpeg took more than five minutes on this file and was stopped.'))
+      return code === 0 ? resolve() : reject(new Error(stderr.slice(-500) || `ffmpeg exited ${code}`))
+    })
   })
 
   const files = (await fsp.readdir(dir)).filter((f) => f.endsWith('.jpg')).sort()

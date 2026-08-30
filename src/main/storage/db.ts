@@ -261,10 +261,26 @@ export function getDb(): DatabaseSync {
   const applied = new Set(
     (db.prepare('SELECT id FROM _migrations').all() as { id: number }[]).map((r) => r.id)
   )
+  /*
+   * Each migration is all-or-nothing, including the row that records it.
+   *
+   * SQLite makes DDL transactional, and these need it: migration 4 rebuilds a table across four
+   * statements, so a failure between the DROP and the RENAME would have left the database with
+   * neither `tasks` nor a record of having tried — and the retry on next launch would then fail
+   * on `tasks_new` already existing, permanently. Rolling back leaves the schema exactly as it
+   * was, so the next launch tries the same migration from the same starting point.
+   */
   for (const m of MIGRATIONS) {
     if (applied.has(m.id)) continue
-    db.exec(m.sql)
-    db.prepare('INSERT INTO _migrations (id, applied_at) VALUES (?, ?)').run(m.id, Date.now())
+    db.exec('BEGIN')
+    try {
+      db.exec(m.sql)
+      db.prepare('INSERT INTO _migrations (id, applied_at) VALUES (?, ?)').run(m.id, Date.now())
+      db.exec('COMMIT')
+    } catch (err) {
+      db.exec('ROLLBACK')
+      throw err
+    }
   }
   return db
 }
@@ -321,7 +337,10 @@ export function exportChat(chatId: string, format: 'md' | 'json'): string {
     tool_calls: string | null
     tool_result: string | null
   }>(
-    'SELECT role, content, created_at, reasoning, tool_calls, tool_result FROM messages WHERE chat_id = ? ORDER BY created_at',
+    // rowid breaks ties on created_at, which is a millisecond stamp — an assistant turn and the
+    // tool result it produced routinely share one, and without the tiebreak the export could
+    // print the answer before the question it answered.
+    'SELECT role, content, created_at, reasoning, tool_calls, tool_result FROM messages WHERE chat_id = ? ORDER BY created_at, rowid',
     chatId
   )
 

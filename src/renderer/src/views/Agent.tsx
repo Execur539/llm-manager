@@ -21,7 +21,7 @@ import MessageRow from '../components/MessageRow'
 import ThinkingBlock from '../components/ThinkingBlock'
 import UltraSamples from '../components/UltraSamples'
 import RailToggle from '../components/RailToggle'
-import ReasoningControl from '../components/ReasoningControl'
+import ReasoningControl, { sendableChoice } from '../components/ReasoningControl'
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
 import { Spinner } from '../components/Spinner'
 import EmptyState from '../components/EmptyState'
@@ -145,14 +145,23 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
     }
   }, [activeId])
 
-  // Absorb anything that streamed in while this view was unmounted.
+  /*
+   * Absorb anything that streamed in while this view was unmounted.
+   *
+   * A message whose id is already on screen replaces it in place rather than being discarded.
+   * The same id legitimately arrives twice: the user's turn is announced before Ultra starts
+   * planning and stored again when the loop finally runs, and only the second copy carries the
+   * chosen plan. Skipping known ids meant the transcript kept the earlier, plan-less copy — so
+   * the plan vanished the moment the live box was cleared and only reappeared on reload.
+   */
   useEffect(() => {
     if (!activeId) return
     const pending = takePending(activeId)
     if (pending.length) {
       setMessages((prev) => {
-        const seen = new Set(prev.map((m) => m.id))
-        return [...prev, ...pending.filter((m) => !seen.has(m.id))]
+        const byId = new Map(prev.map((m) => [m.id, m]))
+        for (const m of pending) byId.set(m.id, m)
+        return [...byId.values()]
       })
       void refreshSessions()
     }
@@ -199,7 +208,8 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
     }
 
     // As in chat: `stream` predates the adopt, so the draft key is where the choice still is.
-    const effort = stream.reasoning[effortId] ?? null
+    // Narrowed to what this model can express — see sendableChoice.
+    const effort = sendableChoice(loaded?.caps?.reasoning, stream.reasoning[effortId] ?? null)
 
     const text = input
     setInput('')

@@ -107,8 +107,32 @@ export async function rewindTo(sessionId: string, checkpointId: string): Promise
     }
   }
 
+  /*
+   * The snapshots go with the manifest entries.
+   *
+   * Only the manifest was trimmed, so the copies stayed on disk with nothing left pointing at
+   * them — a session that edited a few large files repeatedly left a full copy of each behind on
+   * every rewind, and nothing ever collected them.
+   */
+  for (const c of checkpoints.slice(index)) {
+    await fsp.rm(path.join(CHECKPOINTS_DIR, sessionId, c.id), { recursive: true, force: true }).catch(() => undefined)
+  }
+
   await writeManifest(sessionId, checkpoints.slice(0, index))
   return { restored, removed }
+}
+
+/**
+ * Forget a session's checkpoints entirely, manifest and snapshots alike.
+ *
+ * Called when the conversation they belong to is deleted: everything else that conversation owns
+ * cascades out of the database, while these live on disk and were simply never collected.
+ */
+export async function discardCheckpoints(sessionId: string): Promise<void> {
+  await Promise.allSettled([
+    fsp.rm(path.join(CHECKPOINTS_DIR, sessionId), { recursive: true, force: true }),
+    fsp.rm(manifestPath(sessionId), { force: true })
+  ])
 }
 
 export async function listCheckpoints(sessionId: string): Promise<{ id: string; createdAt: number; files: string[] }[]> {
