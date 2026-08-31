@@ -196,17 +196,28 @@ body {
   letter-spacing: 0.1px;
 }
 
+/*
+ * The one saturated element in the chrome: it anchors the eye at the top-left.
+ *
+ * Three shadows rather than one. The flat version — a single gradient and a soft glow — read as
+ * a coloured rectangle with a glyph on it. A hairline of light along the top edge and a darker
+ * one along the bottom give the tile a physical edge, so it reads as an object sitting on the
+ * sidebar rather than a swatch painted onto it, and the glow underneath keeps the warmth.
+ */
 .brand-mark {
   display: grid;
   place-items: center;
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   flex-shrink: 0;
-  border-radius: var(--r-sm);
+  border-radius: 8px;
   color: var(--on-accent);
-  /* The one saturated element in the chrome: it anchors the eye at the top-left. */
-  background: linear-gradient(150deg, var(--accent-hover), var(--accent));
-  box-shadow: 0 1px 6px rgba(217, 119, 87, 0.35);
+  background: linear-gradient(148deg, var(--accent-hover) 0%, var(--accent) 58%, #c56245 100%);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.38),
+    0 4px 12px rgba(217, 119, 87, 0.26),
+    inset 0 1px 0 rgba(255, 255, 255, 0.3),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.14);
 }
 
 .brand-name {
@@ -1252,6 +1263,73 @@ button.link:active:not(:disabled) {
 
 /* ---- fit rationale ---- */
 
+/* ---- load plan dialog ---- */
+
+/*
+ * Wider than a confirm dialog because the alternatives grid needs two columns to be comparable,
+ * and a plan read as a single column of stacked specs is exactly the wall of text this replaced.
+ */
+.plan-modal {
+  width: min(700px, 94vw);
+  max-height: min(78vh, 780px);
+  /* The header stays put while the plans scroll, so the model being loaded is always named. */
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.plan-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 15px 16px 12px 18px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.plan-head-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.plan-modal .plan-head h2 {
+  margin: 0 0 2px;
+  font-size: 13.5px;
+}
+
+/*
+ * A well, not a panel.
+ *
+ * Cards are --surface-1 and so is the dialog, so on a flat background they would read as
+ * outlines rather than as raised surfaces. Dropping the body to --bg restores the contrast the
+ * cards were designed against when they sat on the page.
+ */
+.plan-body {
+  padding: 15px 18px 18px;
+  background: var(--bg);
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* Cards carry their own bottom margin; inside the grid it would double up with the gap. */
+.plan-body .grid-2 .card,
+.plan-body > *:last-child {
+  margin-bottom: 0;
+}
+
+.plan-body .subtitle {
+  margin: 0 0 12px;
+}
+
+.plan-pending {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 28px 2px;
+  font-size: 12px;
+}
+
 .fit-notes ul {
   margin: 0;
   padding: 0;
@@ -1440,16 +1518,74 @@ input[type='radio'] {
   margin-top: 2px;
 }
 
-/* Actions stay out of the way until the row is hovered or focused within. */
+/*
+ * Row actions: a small floating cluster, not an extra line in the card.
+ *
+ * Taken out of flow entirely. The previous version toggled display, so hovering a conversation
+ * added a row to it and pushed everything below down the rail — the list rearranged itself under
+ * the cursor. Nothing here affects the card's height, so the list is completely still.
+ *
+ * It reads as a control surface sitting above the row rather than a fade-out of it, which means
+ * no gradient has to be kept in sync with three different row backgrounds.
+ */
 .side-item-actions {
-  display: none;
-  gap: 4px;
-  margin-top: 6px;
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  display: flex;
+  gap: 1px;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.34);
+  opacity: 0;
+  /* Not reachable while invisible: a keyboard tab must not stop on a hidden control. */
+  pointer-events: none;
+  transform: translateY(-50%) translateX(3px) scale(0.96);
+  transition:
+    opacity 120ms ease,
+    transform 140ms cubic-bezier(0.2, 0, 0.2, 1);
 }
 
 .side-item:hover .side-item-actions,
-.side-item:focus-within .side-item-actions {
-  display: flex;
+.side-item:focus-within .side-item-actions,
+/* A pending confirmation outlives the pointer, so it cannot depend on hover. */
+.side-item-actions.confirming {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(-50%) translateX(0) scale(1);
+}
+
+.row-action {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background 110ms ease,
+    color 110ms ease;
+}
+
+.row-action:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
+.row-action.danger:hover {
+  background: rgba(229, 118, 108, 0.16);
+  color: var(--bad);
+}
+
+.row-action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
 }
 
 button.tiny {

@@ -144,6 +144,24 @@ export default function Library({
     setFits((prev) => ({ ...prev, [m.id]: result }))
   }
 
+  /*
+   * Escape closes the plan, except while a load is in flight.
+   *
+   * Dismissing it mid-load would leave the model loading with the surface that reports it gone,
+   * and no way back to the error if it failed.
+   */
+  useEffect(() => {
+    if (!selected) return
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape' && !busy) {
+        e.preventDefault()
+        setSelected(null)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [selected, busy])
+
   const load = async (plan: FitPlan): Promise<void> => {
     if (!selected) return
     setBusy(true)
@@ -151,6 +169,8 @@ export default function Library({
     try {
       await invoke('model:load', selected.id, plan)
       await onLoaded()
+      // The decision is made and acted on; leaving it open would hold a dialog over the result.
+      setSelected(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -250,7 +270,14 @@ export default function Library({
         </button>
       </div>
 
-      {error && (
+      {/*
+        * Suppressed while the plan dialog is up, where the same error is shown instead.
+        *
+        * A failed load leaves the dialog open on purpose — you need to see which plan failed and
+        * pick another. Rendered only here, the reason why would sit on the page behind the
+        * backdrop, so the load would appear to do nothing at all.
+        */}
+      {error && !selected && (
         <div className="card" style={{ borderColor: '#5c2626' }}>
           <span className="badge bad">error</span> {error}
         </div>
@@ -331,7 +358,7 @@ export default function Library({
                 title="Plan the fit for this model and choose how to load it"
                 data-testid="plan-model"
               >
-                {selected?.id === m.id ? 'Planning below…' : 'Load…'}
+                Load…
               </button>
               <button
                 className="danger subtle"
@@ -349,50 +376,103 @@ export default function Library({
         ))}
       </div>
 
+      {/*
+        * The plan opens over the library rather than unrolling beneath it.
+        *
+        * It used to append a heading, a notes card, a plan card and sometimes a two-up grid of
+        * alternatives to the bottom of the page. On a machine with one model that is most of a
+        * screenful appearing below the fold, and the button that triggered it said "Planning
+        * below…" because there was no other way to tell you where the result had gone. Choosing
+        * how to load a model is a decision with a beginning and an end, so it gets a surface
+        * with a beginning and an end.
+        */}
       {selected && (
-        <>
-          <h1 style={{ marginTop: 26 }}>Fit for {selected.filename}</h1>
-
-          {fit && 'error' in fit && (
-            <div className="card">
-              <span className="badge bad">cannot plan</span> {fit.error}
+        <div className="overlay" onClick={() => !busy && setSelected(null)} data-testid="plan-overlay">
+          <div
+            className="modal plan-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`Load ${selected.filename}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="plan-head">
+              <div className="plan-head-text">
+                <h2 className="truncate" title={selected.filename}>
+                  {selected.filename}
+                </h2>
+                <div className="faint" style={{ fontSize: 11 }}>
+                  Fitted to the VRAM you have free right now
+                </div>
+              </div>
+              <button
+                className="row-action"
+                onClick={() => setSelected(null)}
+                disabled={busy}
+                title="Close"
+                aria-label="Close"
+                data-testid="plan-close"
+              >
+                <Icon name="close" size={15} />
+              </button>
             </div>
-          )}
 
-          {fit && !('error' in fit) && (
-            <>
-              {fit.notes.length > 0 && (
-                <div className="card fit-notes">
-                  <div className="card-title">Why this plan</div>
-                  <ul>
-                    {fit.notes.map((n, i) => (
-                      <li key={i}>
-                        <Icon name="info" size={13} />
-                        <span>{n}</span>
-                      </li>
-                    ))}
-                  </ul>
+            <div className="plan-body">
+              {error && (
+                <div className="card" style={{ borderColor: '#5c2626' }}>
+                  <span className="badge bad">error</span> {error}
                 </div>
               )}
 
-              {fit.chosen && <PlanCard plan={fit.chosen} onLoad={(p) => void load(p)} busy={busy} />}
+              {/* The fit is recomputed on open, so the first paint has nothing to show yet. */}
+              {!fit && (
+                <div className="plan-pending">
+                  <Spinner size={15} />
+                  <span className="faint">Working out how this fits…</span>
+                </div>
+              )}
 
-              {fit.needsUserChoice && (
+              {fit && 'error' in fit && (
+                <div className="card">
+                  <span className="badge bad">cannot plan</span> {fit.error}
+                </div>
+              )}
+
+              {fit && !('error' in fit) && (
                 <>
-                  <p className="subtitle">
-                    The context target could not be met with every layer on GPU. Nothing was changed silently —
-                    choose which tradeoff you want:
-                  </p>
-                  <div className="grid-2">
-                    {fit.alternatives.map((p, i) => (
-                      <PlanCard key={i} plan={p} onLoad={(pl) => void load(pl)} busy={busy} />
-                    ))}
-                  </div>
+                  {fit.notes.length > 0 && (
+                    <div className="card fit-notes">
+                      <div className="card-title">Why this plan</div>
+                      <ul>
+                        {fit.notes.map((n, i) => (
+                          <li key={i}>
+                            <Icon name="info" size={13} />
+                            <span>{n}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {fit.chosen && <PlanCard plan={fit.chosen} onLoad={(p) => void load(p)} busy={busy} />}
+
+                  {fit.needsUserChoice && (
+                    <>
+                      <p className="subtitle">
+                        The context target could not be met with every layer on GPU. Nothing was changed
+                        silently — choose which tradeoff you want:
+                      </p>
+                      <div className="grid-2">
+                        {fit.alternatives.map((p, i) => (
+                          <PlanCard key={i} plan={p} onLoad={(pl) => void load(pl)} busy={busy} />
+                        ))}
+                      </div>
+                    </>
+                  )}
                 </>
               )}
-            </>
-          )}
-        </>
+            </div>
+          </div>
+        </div>
       )}
 
       <ConfirmDialog

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { closeRail, useStream } from '../lib/store'
 import { DRAWER_QUERY, useMediaQuery } from '../lib/media'
 import { fmtRelative } from '../lib/api'
+import Icon from './Icon'
 
 export interface ChatSummary {
   id: string
@@ -133,12 +134,26 @@ export default function ConversationList({
               </>
             )}
 
+            {/*
+              * A floating cluster over the row rather than a third line inside it.
+              *
+              * These used to be text buttons that went from display:none to display:flex on
+              * hover, which grew the card by a whole row under the cursor and shoved every
+              * conversation below it down the list. Moving the mouse down the rail made the
+              * thing you were aiming at walk away from you.
+              *
+              * Absolutely positioned, the row never changes size, so nothing moves. Icons keep
+              * the cluster narrow enough to sit over the title without a scrim, and the label
+              * survives for assistive tech as aria-label.
+              */}
             {!isEditing && (
-              <div className="side-item-actions">
+              <div className={`side-item-actions${isConfirming ? ' confirming' : ''}`}>
                 {isConfirming ? (
                   <>
                     <button
-                      className="tiny danger"
+                      className="row-action danger"
+                      title="Confirm delete"
+                      aria-label={`Confirm deleting ${item.title}`}
                       onClick={(e) => {
                         e.stopPropagation()
                         setConfirmingId(null)
@@ -146,23 +161,26 @@ export default function ConversationList({
                       }}
                       data-testid="confirm-delete"
                     >
-                      Delete
+                      <Icon name="check" size={13} />
                     </button>
                     <button
-                      className="tiny"
+                      className="row-action"
+                      title="Cancel"
+                      aria-label="Cancel delete"
                       onClick={(e) => {
                         e.stopPropagation()
                         setConfirmingId(null)
                       }}
                     >
-                      Cancel
+                      <Icon name="close" size={13} />
                     </button>
                   </>
                 ) : (
                   <>
                     <button
-                      className="tiny"
+                      className="row-action"
                       title="Rename"
+                      aria-label={`Rename ${item.title}`}
                       onClick={(e) => {
                         e.stopPropagation()
                         setDraft(item.title)
@@ -170,18 +188,19 @@ export default function ConversationList({
                       }}
                       data-testid="rename-conversation"
                     >
-                      Rename
+                      <Icon name="pencil" size={13} />
                     </button>
                     <button
-                      className="tiny"
+                      className="row-action danger"
                       title="Delete"
+                      aria-label={`Delete ${item.title}`}
                       onClick={(e) => {
                         e.stopPropagation()
                         setConfirmingId(item.id)
                       }}
                       data-testid="delete-conversation"
                     >
-                      Delete
+                      <Icon name="trash" size={13} />
                     </button>
                   </>
                 )}

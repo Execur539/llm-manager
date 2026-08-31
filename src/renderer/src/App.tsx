@@ -11,6 +11,7 @@ import ServerView from './views/Server'
 import RemoteView from './views/Remote'
 import Settings from './views/Settings'
 import Icon, { type IconName } from './components/Icon'
+import BrandMark from './components/BrandMark'
 import PermissionPrompt from './components/PermissionPrompt'
 import QuestionPrompt from './components/QuestionPrompt'
 import Toasts from './components/Toasts'
@@ -93,9 +94,7 @@ export default function App(): JSX.Element {
     <div className="app">
       <nav className="sidebar">
         <div className="brand">
-          <span className="brand-mark" aria-hidden="true">
-            <Icon name="sparkle" size={15} />
-          </span>
+          <BrandMark />
           <span className="brand-name">LLM Manager</span>
           {!isDesktop && <span className="badge">remote</span>}
         </div>
