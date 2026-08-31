@@ -21,7 +21,7 @@ import { logger } from '../log'
 
 /** Where releases are published. Overridable so a fork can point elsewhere. */
 const UPDATE_FEED =
-  process.env.LLMM_UPDATE_FEED ?? 'https://api.github.com/repos/llm-manager/llm-manager/releases/latest'
+  process.env.LLMM_UPDATE_FEED ?? 'https://api.github.com/repos/Execur539/llm-manager/releases/latest'
 
 export interface UpdateInfo {
   available: boolean

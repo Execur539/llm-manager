@@ -44,8 +44,8 @@ const check = (name, cond, extra = '') => {
   }
 }
 
-const CACHE_EXE = String.raw`C:\Users\aidan\AppData\Local\LLMManager\runtime-0.1.0\LLM Manager.exe`
-const CACHE_DIR = String.raw`C:\Users\aidan\AppData\Local\LLMManager\runtime-0.1.0`
+const CACHE_EXE = String.raw`C:\Users\dev\AppData\Local\LLMManager\runtime-0.1.0\LLM Manager.exe`
+const CACHE_DIR = String.raw`C:\Users\dev\AppData\Local\LLMManager\runtime-0.1.0`
 const REAL_DIR = String.raw`D:\CODE\LLM Manager\release`
 
 console.log('\nPortable launcher passes the real exe location')
@@ -67,7 +67,7 @@ check('the cache root itself is rejected', isInsideRuntimeCache(CACHE_EXE, CACHE
 check('nested deeper is still rejected', isInsideRuntimeCache(CACHE_EXE, `${CACHE_DIR}\\a\\b\\c`))
 check(
   'a sibling runtime dir is not inside this one',
-  !isInsideRuntimeCache(CACHE_EXE, String.raw`C:\Users\aidan\AppData\Local\LLMManager\runtime-0.2.0\LLMManagerModels`)
+  !isInsideRuntimeCache(CACHE_EXE, String.raw`C:\Users\dev\AppData\Local\LLMManager\runtime-0.2.0\LLMManagerModels`)
 )
 check('a path on another drive is fine', !isInsideRuntimeCache(CACHE_EXE, String.raw`D:\CODE\LLM Manager\LLMManagerModels`))
 check('traversal back out of the cache is not inside', !isInsideRuntimeCache(CACHE_EXE, `${CACHE_DIR}\\..\\Models`))

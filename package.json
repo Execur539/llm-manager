@@ -4,7 +4,7 @@
   "description": "LLM Manager",
   "main": "./out/main/index.js",
   "author": "Aidan Stafford",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "private": true,
   "scripts": {
     "dev": "electron-vite dev",
