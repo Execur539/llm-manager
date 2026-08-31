@@ -24,6 +24,7 @@ import RailToggle from '../components/RailToggle'
 import ReasoningControl, { sendableChoice } from '../components/ReasoningControl'
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
 import { Spinner } from '../components/Spinner'
+import PromptProgress from '../components/PromptProgress'
 import EmptyState from '../components/EmptyState'
 
 interface Collection {
@@ -49,6 +50,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   const partial = activeId ? (stream.partial[activeId] ?? '') : ''
   const reasoning = activeId ? (stream.reasoningPartial[activeId] ?? '') : ''
   const busy = activeId ? !!stream.running[activeId] : false
+  const progress = activeId ? (stream.promptProgress[activeId] ?? null) : null
   // Usable before the first message: the choice is held against a draft key and adopted by
   // whatever conversation the message goes on to create.
   const effortId = activeId ?? DRAFT_CHAT
@@ -281,13 +283,23 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               </div>
             </MessageRow>
           )}
-          {busy && !partial && !reasoning && !ultra.length && (
+          {busy && (progress || (!partial && !reasoning && !ultra.length)) && (
             <MessageRow role="assistant">
-              <div className="thinking">
-                <span className="dot" />
-                <span className="dot" />
-                <span className="dot" />
-              </div>
+              {/*
+                * Before the first token there is a real step to report, and until now it looked
+                * identical to being stuck. The dots stay as the fallback: a short prompt can be
+                * read faster than the server bothers to report, and a server too old to know
+                * `return_progress` never reports at all.
+                */}
+              {progress ? (
+                <PromptProgress {...progress} />
+              ) : (
+                <div className="thinking">
+                  <span className="dot" />
+                  <span className="dot" />
+                  <span className="dot" />
+                </div>
+              )}
             </MessageRow>
           )}
           <div ref={endRef} />

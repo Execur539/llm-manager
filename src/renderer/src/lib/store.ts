@@ -37,6 +37,15 @@ export interface StreamState {
    * its own collapsible block rather than inline with the answer.
    */
   reasoningPartial: Record<string, string>
+  /**
+   * Prompt-reading progress for the turn in flight, keyed the same way, or absent once
+   * generation has started.
+   *
+   * This covers the gap between sending and the first token, which for a long conversation or
+   * a freshly loaded model is the part of a turn that feels broken: nothing moves, and there is
+   * no way to tell a slow prompt from a hung one.
+   */
+  promptProgress: Record<string, { percent: number; processed: number; total: number; cached: number }>
   /** ids with a turn currently in flight */
   running: Record<string, boolean>
   /** messages that arrived while the view was unmounted, keyed by id */
@@ -134,6 +143,7 @@ function saveSelection(selection: { chat: string | null; agent: string | null })
 
 const state: StreamState = {
   partial: {},
+  promptProgress: {},
   reasoningPartial: {},
   running: {},
   pending: {},
@@ -162,6 +172,7 @@ let snapshot: StreamState = { ...state }
 function emitChange(): void {
   snapshot = {
     partial: { ...state.partial },
+    promptProgress: { ...state.promptProgress },
     reasoningPartial: { ...state.reasoningPartial },
     running: { ...state.running },
     pending: { ...state.pending },
@@ -201,11 +212,16 @@ export function setRunning(id: string, running: boolean): void {
     state.ultra[id] = []
     state.ultraSynthesising[id] = false
     delete state.ultraPlan[id]
+    // Last turn's figure would otherwise flash before the first frame of this one arrives.
+    delete state.promptProgress[id]
   } else {
     // The samples were scaffolding for an answer that now exists on its own.
     delete state.ultra[id]
     delete state.ultraSynthesising[id]
     delete state.ultraPlan[id]
+    // A turn that ended without ever generating — stopped, or failed — must not leave a
+    // progress bar sitting at whatever it had reached.
+    delete state.promptProgress[id]
   }
   emitChange()
 }
@@ -231,6 +247,7 @@ export function clearFor(id: string): void {
   if (state.selection.agent === id) state.selection.agent = null
   saveSelection(state.selection)
   delete state.partial[id]
+  delete state.promptProgress[id]
   delete state.reasoningPartial[id]
   delete state.running[id]
   delete state.pending[id]
@@ -357,21 +374,46 @@ export function dropPending(id: string): void {
 
 /** Wired once at import. Nothing here is torn down, because nothing here is owned by a view. */
 function wire(): void {
+  /*
+   * Prompt progress, and the two events that end it.
+   *
+   * The server does send a closing frame at 100%, so the bar is never left stranded partway —
+   * but it is the first token that actually retires it, because between that frame and the
+   * first token there is still a pause worth showing something for. Content and reasoning both
+   * count: a reasoning model's first visible act is a thought, not an answer.
+   */
+  on<{ chatId: string; percent: number; processed: number; total: number; cached: number }>(
+    'chat:prompt-progress',
+    (d) => {
+      const id = d.chatId || activeId
+      state.promptProgress[id] = {
+        percent: d.percent,
+        processed: d.processed,
+        total: d.total,
+        cached: d.cached
+      }
+      emitChange()
+    }
+  )
+
   on<{ chatId: string; text: string }>('chat:delta', (d) => {
     const id = d.chatId || activeId
     state.partial[id] = (state.partial[id] ?? '') + d.text
+    delete state.promptProgress[id]
     emitChange()
   })
 
   on<{ chatId: string; text: string }>('chat:reasoning', (d) => {
     const id = d.chatId || activeId
     state.reasoningPartial[id] = (state.reasoningPartial[id] ?? '') + d.text
+    delete state.promptProgress[id]
     emitChange()
   })
 
   on<{ chatId: string; message: AgentMessage }>('chat:message', (d) => {
     const id = d.chatId || activeId
     state.partial[id] = ''
+    delete state.promptProgress[id]
     // The finished message carries its own reasoning; the streamed copy has served its purpose.
     state.reasoningPartial[id] = ''
     state.pending[id] = [...(state.pending[id] ?? []), d.message]
@@ -483,10 +525,25 @@ function wire(): void {
     emitChange()
   })
 
+  on<{ sessionId?: string; percent: number; processed: number; total: number; cached: number }>(
+    'agent:prompt-progress',
+    (d) => {
+      const id = d.sessionId || activeId
+      state.promptProgress[id] = {
+        percent: d.percent,
+        processed: d.processed,
+        total: d.total,
+        cached: d.cached
+      }
+      emitChange()
+    }
+  )
+
   on<{ sessionId?: string; text: string } | string>('agent:delta', (payload) => {
     const id = typeof payload === 'string' ? activeId : payload.sessionId || activeId
     const text = typeof payload === 'string' ? payload : payload.text
     state.partial[id] = (state.partial[id] ?? '') + text
+    delete state.promptProgress[id]
     emitChange()
   })
 
@@ -494,6 +551,7 @@ function wire(): void {
     const id = typeof payload === 'string' ? activeId : payload.sessionId || activeId
     const text = typeof payload === 'string' ? payload : payload.text
     state.reasoningPartial[id] = (state.reasoningPartial[id] ?? '') + text
+    delete state.promptProgress[id]
     emitChange()
   })
 

@@ -800,6 +800,18 @@ pre {
 }
 
 /* An animated ellipsis while the model is still thinking, in place of static text. */
+/*
+ * The pre-generation progress readout, shown in place of the thinking dots.
+ *
+ * Deliberately narrow rather than fluid: stretched to the full width of a message row, a bar
+ * that fills in a second or two reads as a page-level loading state rather than as the status
+ * of this one turn.
+ */
+.prompt-progress {
+  width: min(320px, 100%);
+  padding: 1px 0 2px;
+}
+
 .thinking {
   display: flex;
   align-items: center;

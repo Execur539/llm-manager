@@ -628,6 +628,22 @@ Platform: Windows (PowerShell)${memoryBlock}`
           temperature: this.samplingTemperature ?? 0.6,
           ...reasoningRequestFields(llama.loaded?.model.caps.reasoning, this.opts.reasoningChoice ?? null)
         })) {
+          /*
+           * Reported before anything else, and worth more here than in chat: an agent turn
+           * carries the whole tool-result history, so re-reading the prompt is often the
+           * slowest part of a step and the one with nothing on screen to show for it.
+           *
+           * Not forwarded during Ultra sampling — the overridden `emit` above drops anything
+           * that is not a draft's own output, which is what we want for a discarded guess.
+           */
+          if (ev.type === 'prompt_progress') {
+            this.emit('promptProgress', {
+              percent: ev.percent,
+              processed: ev.processed,
+              total: ev.total,
+              cached: ev.cached
+            })
+          }
           if (ev.type === 'reasoning') {
             thinking += ev.text
             this.emit('reasoning', ev.text)

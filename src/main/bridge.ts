@@ -202,6 +202,9 @@ function getAgent(): Agent {
     const sid = (): string => activeAgentSessionId
     agent.on('delta', (t: string) => emit('agent:delta', { sessionId: sid(), text: t }))
     agent.on('reasoning', (t: string) => emit('agent:reasoning', { sessionId: sid(), text: t }))
+    agent.on('promptProgress', (p: { percent: number; processed: number; total: number; cached: number }) =>
+      emit('agent:prompt-progress', { sessionId: sid(), ...p })
+    )
     agent.on('message', (m) => emit('agent:message', { sessionId: sid(), message: m }))
     agent.on('toolCall', (c) => emit('agent:tool-call', { sessionId: sid(), call: c }))
     agent.on('toolResult', (r) => emit('agent:tool-result', { sessionId: sid(), result: r }))
@@ -860,6 +863,15 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         if (ev.type === 'reasoning') {
           thinking += ev.text
           emit('chat:reasoning', { chatId, text: ev.text })
+        }
+        if (ev.type === 'prompt_progress') {
+          emit('chat:prompt-progress', {
+            chatId,
+            percent: ev.percent,
+            processed: ev.processed,
+            total: ev.total,
+            cached: ev.cached
+          })
         }
       }
     } catch (err) {

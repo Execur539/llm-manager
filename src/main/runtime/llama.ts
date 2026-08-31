@@ -119,6 +119,18 @@ export type StreamEvent =
   | { type: 'reasoning'; text: string }
   | { type: 'tool_call'; call: StreamedToolCall }
   | { type: 'usage'; promptTokens: number; completionTokens: number }
+  /**
+   * How far the server has got through *reading* the prompt, before generation begins.
+   *
+   * A long conversation, a big pasted document or a model that has just been loaded can all
+   * spend many seconds here producing nothing, which from the outside is indistinguishable
+   * from the app having hung. llama.cpp only reports it when asked (`return_progress`).
+   *
+   * `total` counts the whole prompt and `cached` the prefix served from the KV cache, so a
+   * follow-up in a long conversation legitimately starts at a high percentage rather than at
+   * zero — that prefix really is already done.
+   */
+  | { type: 'prompt_progress'; processed: number; total: number; cached: number; percent: number }
 
 export interface Timings {
   ttftMs: number | null
@@ -323,6 +335,13 @@ export class LlamaRuntime extends EventEmitter {
       top_p: opts.topP ?? 0.95,
       cache_prompt: true
     }
+    /*
+     * Progress frames are only useful while streaming, and only cost anything there.
+     *
+     * A server built before the field existed ignores it rather than rejecting the request, so
+     * this needs no version check — the events simply never arrive and the UI never shows a bar.
+     */
+    if (stream) body.return_progress = true
     if (opts.topK !== undefined) body.top_k = opts.topK
     if (opts.minP !== undefined) body.min_p = opts.minP
     if (opts.repeatPenalty !== undefined) body.repeat_penalty = opts.repeatPenalty
@@ -426,11 +445,31 @@ export class LlamaRuntime extends EventEmitter {
               finish_reason?: string
             }[]
             usage?: { prompt_tokens?: number; completion_tokens?: number }
+            prompt_progress?: { total?: number; cache?: number; processed?: number; time_ms?: number }
           }
           try {
             json = JSON.parse(payload)
           } catch {
             continue // partial frame; the next chunk completes it
+          }
+
+          /*
+           * Progress frames arrive before generation and carry no delta, so they are read
+           * before the choice is looked at rather than inside it.
+           *
+           * `processed` is clamped to `total` because the server counts a cached prefix as
+           * processed the moment it is reused, which can briefly overshoot on a follow-up turn.
+           */
+          const pp = json.prompt_progress
+          if (pp && typeof pp.total === 'number' && pp.total > 0) {
+            const processed = Math.max(0, Math.min(pp.processed ?? 0, pp.total))
+            yield {
+              type: 'prompt_progress',
+              processed,
+              total: pp.total,
+              cached: pp.cache ?? 0,
+              percent: Math.round((processed / pp.total) * 100)
+            }
           }
 
           const choice = json.choices?.[0]

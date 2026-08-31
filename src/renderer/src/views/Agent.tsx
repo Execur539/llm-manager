@@ -25,6 +25,7 @@ import RailToggle from '../components/RailToggle'
 import ReasoningControl, { sendableChoice } from '../components/ReasoningControl'
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
 import { Spinner } from '../components/Spinner'
+import PromptProgress from '../components/PromptProgress'
 import EmptyState from '../components/EmptyState'
 
 /** Collapsed by default; one line of summary, expanding to arguments and full output. */
@@ -81,6 +82,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   const partial = activeId ? (stream.partial[activeId] ?? '') : ''
   const reasoning = activeId ? (stream.reasoningPartial[activeId] ?? '') : ''
   const running = activeId ? !!stream.running[activeId] : false
+  const progress = activeId ? (stream.promptProgress[activeId] ?? null) : null
   const error = activeId ? stream.errors[activeId] : null
   const notice = activeId ? stream.notices[activeId] : null
   const liveToolCalls = activeId ? (stream.toolCalls[activeId] ?? []) : []
@@ -388,13 +390,25 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
               </div>
             </MessageRow>
           )}
-          {running && !partial && !reasoning && !unsavedCalls.length && !ultra.length && (
+          {/*
+            * Progress wins over the other conditions rather than joining them.
+            *
+            * An agent turn is many requests, not one: every step after a tool result re-reads a
+            * prompt that has grown by whatever that tool returned. By then `partial` and the
+            * tool list are both non-empty, so gating on those — as the dots do — would hide the
+            * bar for exactly the steps where the wait is longest.
+            */}
+          {running && (progress || (!partial && !reasoning && !unsavedCalls.length && !ultra.length)) && (
             <MessageRow role="assistant">
-              <div className="thinking">
-                <span className="dot" />
-                <span className="dot" />
-                <span className="dot" />
-              </div>
+              {progress ? (
+                <PromptProgress {...progress} />
+              ) : (
+                <div className="thinking">
+                  <span className="dot" />
+                  <span className="dot" />
+                  <span className="dot" />
+                </div>
+              )}
             </MessageRow>
           )}
           <div ref={endRef} />
