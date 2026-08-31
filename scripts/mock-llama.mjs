@@ -323,6 +323,30 @@ const server = http.createServer(async (req, res) => {
 
     send(frame({ role: 'assistant', content: '' }))
 
+    /*
+     * Prompt-reading progress, which llama.cpp reports when asked for it.
+     *
+     * Only when the client sets `return_progress`, exactly as the real server behaves — a client
+     * that does not ask must not receive these, or the test would pass against a server that
+     * cannot be told to stay quiet. Reported in a few steps rather than one so the receiving end
+     * has to accumulate them, and the last frame lands on the total the way llama.cpp's does.
+     *
+     * Without this the mock reached the end of a stream before saying anything about the prompt
+     * at all, so a turn that was stopped part-way through — which is most of them in this suite —
+     * never reported its size, and everything downstream of that number went untested.
+     */
+    if (body.return_progress) {
+      const promptTotal = 100
+      for (const processed of [12, 48, 84, promptTotal]) {
+        if (aborted) return
+        send({
+          ...frame({ role: 'assistant', content: null }),
+          prompt_progress: { total: promptTotal, cache: 0, processed, time_ms: processed * 3 }
+        })
+        await sleep(8)
+      }
+    }
+
     // A reasoning model returns its chain of thought in reasoning_content, separately from the
     // answer, which is what llama.cpp does with --reasoning-format deepseek.
     if (marker(messages, 'think')) {

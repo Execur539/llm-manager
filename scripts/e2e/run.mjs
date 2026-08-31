@@ -12,7 +12,7 @@
 import path from 'node:path'
 import fsp from 'node:fs/promises'
 import { buildGguf, createEnv, addModel, addDocument, addEmbeddingModel, startMockHf, cleanupEnv, ROOT } from './fixtures.mjs'
-import { Report, launchApp, closeApp, goTo, shot, auditLayout, auditResponsive, stubDialogs, toastTexts, VIEWS, SHOTS_DIR } from './harness.mjs'
+import { Report, launchApp, closeApp, goTo, shot, auditLayout, auditResponsive, stubDialogs, toastTexts, VIEWS, SHOTS_DIR, scenarioContext } from './harness.mjs'
 import fs from 'node:fs'
 import os from 'node:os'
 
@@ -77,15 +77,30 @@ async function listGguf(root) {
 }
 
 /** Stop any running turn and wait until the composer is usable again. */
+/*
+ * End a turn that is still streaming.
+ *
+ * This always clicked `agent-stop`, which does not exist in chat — its send button turns into
+ * the stop control while a turn runs. So in every chat scenario the click found nothing and
+ * spent Playwright's default thirty-second timeout discovering that, then fell through to a
+ * twenty-second wait for a turn nobody had stopped. Fifty seconds, three times a run, to do
+ * nothing. It was most of the wall clock of the suite.
+ *
+ * The timeouts are short now as well: if the control is on screen the click lands immediately,
+ * and if it is not, no amount of waiting will change that.
+ */
 async function stopTurn(page, inputTestId) {
-  await page.getByTestId('agent-stop').click().catch(() => undefined)
+  const kind = inputTestId.startsWith('agent') ? 'agent' : 'chat'
+  const dedicated = page.getByTestId(`${kind}-stop`)
+  const control = (await dedicated.count()) ? dedicated : page.getByTestId(`${kind}-send`)
+  await control.first().click({ timeout: 4000 }).catch(() => undefined)
   await page.waitForFunction(
     (id) => {
       const el = document.querySelector(`[data-testid="${id}"]`)
       return el instanceof HTMLTextAreaElement && !el.disabled
     },
     inputTestId,
-    { timeout: 20000 }
+    { timeout: 15000 }
   ).catch(() => undefined)
 }
 
@@ -216,17 +231,44 @@ const scenarios = {
         )
       }
 
-      // And it must finish and persist.
-      //
-      // Waiting for the condition rather than sleeping a fixed amount: once the streamed node
-      // detaches, the view still has to reload the conversation from the database, and under
-      // full-suite load that took longer than the 800ms this used to allow.
-      await page.waitForSelector('[data-testid="streaming-message"]', { state: 'detached', timeout: 90000 }).catch(() => undefined)
+      /*
+       * And it must end and persist.
+       *
+       * Ended by stopping it rather than by waiting it out. This asked for a slow response of
+       * eight hundred words at a quarter-second a token — well over three minutes — and then
+       * waited ninety seconds for it to finish, which it never did. The timeout was swallowed
+       * and the scenario carried on, so the wait bought nothing at all and cost more wall clock
+       * than the rest of the suite put together.
+       *
+       * A stopped turn persists what it had written, by design, so the assertion below is
+       * testing the same path either way: a response that is over becomes a stored message.
+       */
+      await stopTurn(page, 'chat-input')
+      await page.waitForSelector('[data-testid="streaming-message"]', { state: 'detached', timeout: 20000 }).catch(() => undefined)
       await page
         .waitForFunction(() => document.querySelectorAll('.messages .msg').length >= 2, undefined, { timeout: 20000 })
         .catch(() => undefined)
       const messages = await page.locator('.messages .msg').count()
       report.check('streaming', 'finished response persists as a message', messages >= 2, `${messages} messages`)
+
+      /*
+       * The context reading, which must be a real measurement rather than a placeholder.
+       *
+       * Asserted on the parsed numbers rather than on the element existing, because the failure
+       * this guards against is the meter rendering with nothing behind it — the old estimate
+       * divided characters by four and could report a figure while knowing nothing about what
+       * the model had actually been sent.
+       */
+      const reading = await page
+        .getByTestId('context-meter')
+        .getAttribute('title')
+        .catch(() => null)
+      const parsed = reading?.match(/^([\d,]+) of ([\d,]+) tokens/)
+      const used = parsed ? Number(parsed[1].replace(/,/g, '')) : 0
+      const max = parsed ? Number(parsed[2].replace(/,/g, '')) : 0
+      report.check('streaming', 'the context meter reports a real usage figure', used > 0, reading ?? 'no meter')
+      report.check('streaming', 'and reports the window it is measured against', max > 0 && used <= max,
+        `${used} of ${max}`)
 
       await shot(page, 'streaming-complete')
     })
@@ -257,7 +299,7 @@ const scenarios = {
 
       await page.locator('button:has-text("Load with this plan")').first().click()
       await page.waitForSelector('[data-testid="model-loaded"]', { timeout: 30000 })
-      report.ok('model loads')
+      report.ok('model-lifecycle', 'model loads')
 
       await goTo(page, 'Dashboard')
       const inference = (await page.locator('.card', { hasText: 'Inference' }).first().textContent()) ?? ''
@@ -609,7 +651,7 @@ const scenarios = {
         await page.locator('.model-card', { hasText: 'Corrupt' }).click()
         await page.waitForTimeout(1500)
         await auditLayout(page, 'My models (corrupt file selected)', report)
-        report.ok('selecting a corrupt model does not break the view')
+        report.ok('bad-model', 'selecting a corrupt model does not break the view')
         await shot(page, 'bad-model')
       },
       { models: ['Test-27B-Q4_K_M.gguf'] }
@@ -829,7 +871,7 @@ const scenarios = {
       // single click. This previously used window.prompt, which Electron does not implement.
       await page.getByTestId('toggle-hard-blocks').click()
       await page.waitForSelector('[data-testid="confirm-overlay"]', { timeout: 5000 })
-      report.ok('hard-block override opens a confirmation')
+      report.ok('settings', 'hard-block override opens a confirmation')
 
       const blockedInitially = await page.getByTestId('confirm-accept').isDisabled()
       report.check('settings', 'confirm is disabled until the phrase is typed', blockedInitially)
@@ -926,7 +968,7 @@ const scenarios = {
         }
       }
       await page.setViewportSize({ width: 1440, height: 920 })
-      report.ok('survives resizing across five sizes')
+      report.ok('resize', 'survives resizing across five sizes')
     })
   },
 
@@ -1986,6 +2028,118 @@ const scenarios = {
     })
   },
 
+  /**
+   * The transcript must follow a response down, and stop following when the reader scrolls away.
+   *
+   * The bug: scrolling was a React effect listing the state it happened to know about, so a tool
+   * result — which mutates an entry already in the array rather than adding one — changed the
+   * card's height without the effect ever running. The view was left behind by exactly the
+   * height of the tool output. Compounded by scrolling smoothly, which restarted an unfinished
+   * animation on every token and never caught up during a fast stream.
+   *
+   * Measured as a distance from the bottom of the real scroll container, because that is the
+   * thing that was wrong. Asserting on the DOM or on which effects fired would only re-encode
+   * whichever implementation is current.
+   */
+  async autoScroll() {
+    const distanceFromBottom = (page, testId) =>
+      page.evaluate((id) => {
+        const el = document.querySelector(`[data-testid="${id}"]`)
+        return el ? Math.round(el.scrollHeight - el.scrollTop - el.clientHeight) : -1
+      }, testId)
+
+    await withApp('auto-scroll', async ({ page }) => {
+      await loadModel(page)
+
+      // ---- a tool call must not break the follow
+      await goTo(page, 'Agent')
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await page.getByTestId('agent-input').fill('[[mock:tool]] list the current directory')
+      await page.getByTestId('agent-send').click()
+
+      await page.waitForSelector('[data-testid="tool-card"]', { timeout: 25000 })
+      // Long enough for the result to arrive and grow the card, which is the exact moment the
+      // old implementation stopped following.
+      await page.waitForTimeout(1600)
+
+      const afterTool = await distanceFromBottom(page, 'agent-messages')
+      report.check('auto-scroll', 'still at the bottom after a tool card fills in',
+        afterTool >= 0 && afterTool <= 72, `${afterTool}px from the bottom`)
+
+      await stopTurn(page, 'agent-input')
+
+      // ---- scrolling away detaches, and the way back works
+      await goTo(page, 'Chat')
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await page.getByTestId('chat-input').fill('[[mock:slow]] [[mock:long]] explain something at length')
+      await page.getByTestId('chat-send').click()
+      await page.waitForSelector('[data-testid="streaming-message"]', { timeout: 25000 })
+      await page.waitForTimeout(1200)
+
+      const whileStreaming = await distanceFromBottom(page, 'chat-messages')
+      report.check('auto-scroll', 'follows a response as it streams',
+        whileStreaming >= 0 && whileStreaming <= 72, `${whileStreaming}px from the bottom`)
+
+      /*
+       * Wait for a transcript long enough to scroll before scrolling it.
+       *
+       * Detaching means getting further than 72px from the bottom, so a container with less than
+       * that much scrollable range cannot detach however hard it is scrolled — the first version
+       * of this test scrolled a nearly-full screen and then asserted on a button that was
+       * correctly still hidden.
+       */
+      await page
+        .waitForFunction(
+          () => {
+            const el = document.querySelector('[data-testid="chat-messages"]')
+            return !!el && el.scrollHeight - el.clientHeight > 240
+          },
+          undefined,
+          { timeout: 20000 }
+        )
+        .catch(() => undefined)
+
+      /*
+       * A real wheel, not an assignment to scrollTop.
+       *
+       * Setting scrollTop is not how anyone scrolls, and it skips the signal the app relies on to
+       * tell a reader scrolling away from content merely moving. Driving the wheel exercises the
+       * path a person actually takes.
+       */
+      await page.locator('[data-testid="chat-messages"]').hover()
+      await page.mouse.wheel(0, -700)
+      await page.waitForTimeout(400)
+
+      const jump = page.getByTestId('jump-to-latest')
+      report.check('auto-scroll', 'offers a way back once you scroll away',
+        await jump.evaluate((el) => el.classList.contains('show')).catch(() => false))
+
+      // The whole point of detaching: more tokens must not drag the reader back down.
+      const afterScrollUp = await distanceFromBottom(page, 'chat-messages')
+      await page.waitForTimeout(1500)
+      const stillUp = await distanceFromBottom(page, 'chat-messages')
+      report.check('auto-scroll', 'stays put while reading, even as the response grows',
+        stillUp >= afterScrollUp - 20, `moved from ${afterScrollUp} to ${stillUp}`)
+
+      await jump.click()
+      await page.waitForTimeout(900)
+      const afterJump = await distanceFromBottom(page, 'chat-messages')
+      report.check('auto-scroll', 'jumping to latest returns to the bottom',
+        afterJump >= 0 && afterJump <= 72, `${afterJump}px from the bottom`)
+
+      // And following resumes rather than needing another click.
+      await page.waitForTimeout(1200)
+      const afterResume = await distanceFromBottom(page, 'chat-messages')
+      report.check('auto-scroll', 'following resumes after jumping back',
+        afterResume >= 0 && afterResume <= 72, `${afterResume}px from the bottom`)
+
+      await shot(page, 'auto-scroll')
+      await stopTurn(page, 'chat-input')
+    })
+  },
+
   /** Attaching files: the picker, drag-and-drop, and what each type turns into. */
   async attachments() {
     await withApp('attachments', async ({ app, page, env }) => {
@@ -2320,13 +2474,88 @@ for (const name of names) {
     console.error(`Unknown scenario: ${name}`)
     process.exit(1)
   }
-  await scenarios[name]()
 }
+
+/*
+ * Scenarios that bind a fixed port, and so cannot have a twin running beside them.
+ *
+ * The API server's default port is 1234, from the shipped settings — every sandbox gets its own
+ * settings file but they all start from the same default, so two of these at once means one of
+ * them fails to bind and reports a defect that is entirely the test runner's fault.
+ */
+const SERIAL = new Set(['server', 'remote', 'apiSurface'])
+
+const flagValue = (name) => {
+  const hit = args.find((a) => a.startsWith(`${name}=`))
+  return hit ? hit.slice(name.length + 1) : null
+}
+
+/*
+ * Each scenario launches its own Electron against its own sandbox, so they are independent by
+ * construction and the run was only sequential by habit. The work is mostly waiting — for a
+ * window, for a mock reply, for a view to settle — so the ceiling is memory rather than CPU.
+ * Capped well below the core count because every worker is a whole browser.
+ */
+/*
+ * Deliberately modest, because each worker is a visible application window.
+ *
+ * The machine could run more — the work is mostly waiting, not computing — but this suite is run
+ * on a desktop somebody is using, and every job in flight is another app window appearing on it.
+ * Three is most of the speedup for half the intrusion. `--jobs=1` runs the old way, one window at
+ * a time, for when even that is too much; `--jobs=8` is there for an idle machine.
+ */
+const jobs = Math.max(1, Number(flagValue('--jobs') ?? Math.min(3, Math.max(1, os.cpus().length - 1))))
+
+const durations = new Map()
+
+async function runOne(name) {
+  const started = Date.now()
+  await scenarioContext.run(name, () => scenarios[name]())
+  durations.set(name, Date.now() - started)
+  report.flush(name)
+}
+
+const runStarted = Date.now()
+const parallel = names.filter((n) => !SERIAL.has(n))
+const serial = names.filter((n) => SERIAL.has(n))
+
+if (jobs > 1 && parallel.length > 1) {
+  report.capture(true)
+  console.log(
+    `\nRunning ${parallel.length} scenarios ${jobs} at a time, then ${serial.length} that need a port to themselves.` +
+      `\n${jobs} app windows will open at once — pass --jobs=1 for one at a time.`
+  )
+  const queue = [...parallel]
+  await Promise.all(
+    Array.from({ length: Math.min(jobs, queue.length) }, async () => {
+      for (let next = queue.shift(); next; next = queue.shift()) await runOne(next)
+    })
+  )
+} else {
+  for (const name of parallel) await runOne(name)
+}
+
+// Port binders, one at a time, and unbuffered so their output reads live again.
+report.capture(false)
+for (const name of serial) await runOne(name)
 
 // ---------------------------------------------------------------- report
 
 const summary = report.summary()
 console.log(`\n${'='.repeat(72)}`)
+
+/*
+ * Wall clock and the worst offenders.
+ *
+ * Printed every run rather than hidden behind a flag: when the suite gets slow again, the first
+ * question is which scenario, and answering it should not require instrumenting anything.
+ */
+const wall = (Date.now() - runStarted) / 1000
+const slowest = [...durations.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
+console.log(`${names.length} scenarios in ${wall.toFixed(1)}s wall (${jobs} at a time)`)
+if (slowest.length) {
+  console.log(`slowest: ${slowest.map(([n, ms]) => `${n} ${(ms / 1000).toFixed(1)}s`).join('  ')}`)
+}
 console.log(`${summary.passes} checks passed, ${summary.total} issue(s) found`)
 if (summary.total) {
   console.log(`by kind: ${Object.entries(summary.bySeverity).map(([k, v]) => `${k}=${v}`).join('  ')}\n`)

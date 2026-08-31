@@ -9,6 +9,7 @@
  */
 
 import { _electron as electron } from 'playwright-core'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import path from 'node:path'
 import fsp from 'node:fs/promises'
 import { envVars, ROOT } from './fixtures.mjs'
@@ -17,10 +18,47 @@ export const SHOTS_DIR = path.join(ROOT, 'scripts', 'e2e', 'screenshots')
 
 // ---------------------------------------------------------------- issue collection
 
+/**
+ * Which scenario the currently-running async work belongs to.
+ *
+ * Scenarios are ordinary async functions that await their way through a browser session, so
+ * there is no object to hang "who is running" off. AsyncLocalStorage follows the await chain,
+ * which means a `console.log` twelve frames deep inside a helper still knows which scenario it
+ * came from — without threading a label through every function that might print.
+ */
+export const scenarioContext = new AsyncLocalStorage()
+
+/** The real console.log, for printing collected blocks without re-entering the capture. */
+export const rawLog = console.log.bind(console)
+
+let sink = null
+
+/*
+ * Everything a scenario prints is captured, not just assertions.
+ *
+ * Scenarios log directly in a dozen places — measured widths, chosen paths, the "=== label ==="
+ * banner — and those lines are as much a part of a scenario's block as its checks. Capturing at
+ * the console means none of those call sites had to change.
+ */
+console.log = (...parts) => {
+  const key = sink && scenarioContext.getStore()
+  if (key) sink(key, parts.map((p) => (typeof p === 'string' ? p : String(p))).join(' '))
+  else rawLog(...parts)
+}
+
 export class Report {
   constructor() {
     this.issues = []
     this.passes = 0
+    /*
+     * Output is held per scenario and printed as a block when that scenario finishes.
+     *
+     * Scenarios run concurrently, and each one logs a line per assertion. Printed as they
+     * happened, four interleaved scenarios produce a list of results with no way to tell which
+     * belongs to which. Buffering costs nothing and keeps each block readable.
+     */
+    this.lines = new Map()
+    this.buffered = false
   }
 
   /** Record a defect. `where` is the scenario or view it was found in. */
@@ -28,19 +66,51 @@ export class Report {
     this.issues.push({ where, severity, message, detail })
   }
 
-  ok(label) {
+  /** Collect a line against a scenario without going back through the captured console. */
+  pushRaw(where, text) {
+    if (!this.lines.has(where)) this.lines.set(where, [])
+    this.lines.get(where).push(text)
+  }
+
+  line(where, text) {
+    const key = scenarioContext.getStore() ?? where
+    if (this.buffered) this.pushRaw(key, text)
+    else rawLog(text)
+  }
+
+  /** Route captured console output into this report's per-scenario buffers. */
+  capture(on) {
+    this.buffered = on
+    sink = on ? (key, text) => this.pushRaw(key, text) : null
+  }
+
+  ok(where, label) {
     this.passes++
-    console.log(`    ok   ${label}`)
+    this.line(where, `    ok   ${label}`)
   }
 
   fail(where, label, detail) {
     this.issue(where, 'bug', label, detail)
-    console.log(`    BUG  ${label}${detail ? ` — ${detail}` : ''}`)
+    this.line(where, `    BUG  ${label}${detail ? ` — ${detail}` : ''}`)
   }
 
   check(where, label, condition, detail) {
-    if (condition) this.ok(label)
+    if (condition) this.ok(where, label)
     else this.fail(where, label, detail)
+  }
+
+  /**
+   * Print everything a scenario recorded, as one block, once it is done.
+   *
+   * No header of its own: withApp already prints one, and a scenario that starts several apps
+   * gets one per app, which is the grouping that is actually useful.
+   */
+  flush(where, note) {
+    const lines = this.lines.get(where)
+    this.lines.delete(where)
+    if (!lines?.length) return
+    for (const l of lines) rawLog(l)
+    if (note) rawLog(note)
   }
 
   summary() {
@@ -131,10 +201,25 @@ export const VIEWS = [
   'Settings'
 ]
 
+/*
+ * Navigate, waiting for the view to have actually swapped rather than for a fixed duration.
+ *
+ * This is called sixty times across the suite, and every one of those was a flat 700ms whether
+ * the view took that long or not — three quarters of a minute of the run spent waiting on a
+ * number somebody guessed. The nav item marks itself active on the same render that mounts the
+ * new view, so that is the thing worth waiting for; the short settle after it is for the fetches
+ * a view kicks off on mount.
+ */
 export async function goTo(page, label) {
   await page.locator('.nav-item', { hasText: new RegExp(`^${label}$`) }).first().click()
-  // Views fetch on mount; give them a beat to settle before auditing layout.
-  await page.waitForTimeout(700)
+  await page
+    .waitForFunction(
+      (want) => document.querySelector('.nav-item.active')?.textContent?.trim() === want,
+      label,
+      { timeout: 5000 }
+    )
+    .catch(() => undefined)
+  await page.waitForTimeout(250)
 }
 
 export async function shot(page, name) {
