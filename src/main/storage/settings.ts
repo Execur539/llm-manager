@@ -63,13 +63,53 @@ function merge<T>(base: T, override: unknown): T {
   return out as T
 }
 
+/**
+ * Numeric settings that other code does arithmetic or comparisons on, with the range each is
+ * only ever allowed to hold.
+ *
+ * The settings file is plain JSON that a person can edit, and until recently the UI wrote to it
+ * on every keystroke through `Number(input.value)` — so an empty box stored 0 and a lone minus
+ * sign stored NaN, which `JSON.stringify` writes as `null`. `maxToolCallsPerTurn` is the one
+ * that bites: the agent loop is `while (calls < max)`, and both `0 < 0` and `0 < null` are
+ * false, so the agent answered nothing at all and said nothing about why.
+ *
+ * Clamped on read rather than only on write, because a file that already holds a bad value has
+ * to heal itself — a fix in the UI does nothing for the install that already broke.
+ */
+const NUMERIC_BOUNDS: { path: [keyof AppSettings, string]; min: number; max: number }[] = [
+  { path: ['autoFit', 'targetContext'], min: 512, max: 10_000_000 },
+  { path: ['autoFit', 'idealContext'], min: 512, max: 10_000_000 },
+  { path: ['autoFit', 'headroomMb'], min: 0, max: 65_536 },
+  { path: ['agent', 'maxToolCallsPerTurn'], min: 1, max: 1000 },
+  { path: ['agent', 'commandTimeoutMs'], min: 1000, max: 3_600_000 },
+  { path: ['ultra', 'samples'], min: 1, max: 8 },
+  { path: ['ultra', 'maxContinuations'], min: 0, max: 20 },
+  { path: ['server', 'port'], min: 1, max: 65_535 }
+]
+
+function clampNumerics(settings: AppSettings): AppSettings {
+  const store = settings as unknown as Record<string, Record<string, unknown>>
+  const defaults = DEFAULT_SETTINGS as unknown as Record<string, Record<string, unknown>>
+
+  for (const { path: [section, key], min, max } of NUMERIC_BOUNDS) {
+    const value = store[section as string]?.[key]
+    if (typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max) continue
+    const fallback =
+      typeof value === 'number' && Number.isFinite(value)
+        ? Math.min(max, Math.max(min, Math.round(value)))
+        : defaults[section as string][key]
+    if (store[section as string]) store[section as string][key] = fallback
+  }
+  return settings
+}
+
 let cache: AppSettings | null = null
 
 export function loadSettings(): AppSettings {
   if (cache) return cache
   try {
     const raw = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
-    cache = merge(DEFAULT_SETTINGS, raw)
+    cache = clampNumerics(merge(DEFAULT_SETTINGS, raw))
   } catch {
     cache = { ...DEFAULT_SETTINGS }
   }
@@ -85,7 +125,10 @@ export function saveSettings(next: AppSettings): void {
 }
 
 export function patchSettings(patch: Partial<AppSettings>): AppSettings {
-  const next = merge(loadSettings(), patch)
+  // Clamped on the way in as well as on the way out, so a caller that is not the settings UI —
+  // the API server, a remote session, a hand-edited file reloaded — cannot store a value the
+  // rest of the app will trip over.
+  const next = clampNumerics(merge(loadSettings(), patch))
   saveSettings(next)
   return next
 }

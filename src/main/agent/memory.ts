@@ -36,6 +36,16 @@ const toEntry = (r: Row): MemoryEntry => ({
 /** Cap what gets injected into the system prompt, newest first. */
 const MAX_INJECTED = 40
 
+/**
+ * Longest a single memory may be.
+ *
+ * The agent writes these itself through the `remember` tool, and every one of them is pasted
+ * into the system prompt on every turn thereafter. The tool asks for one sentence but nothing
+ * held it to that, so a model that decided to remember a whole file would have kept re-sending
+ * it for the life of the install.
+ */
+const MAX_MEMORY_CHARS = 2000
+
 export function readMemory(): MemoryEntry[] {
   return all<Row>('SELECT * FROM agent_memory ORDER BY updated_at DESC LIMIT ?', MAX_INJECTED).map(toEntry)
 }
@@ -45,7 +55,7 @@ export function allMemory(): MemoryEntry[] {
 }
 
 export function addMemory(text: string, source = 'agent'): MemoryEntry {
-  const trimmed = text.trim()
+  const trimmed = text.trim().slice(0, MAX_MEMORY_CHARS)
   if (!trimmed) throw new Error('Memory text cannot be empty')
 
   // Avoid piling up near-identical notes: an exact repeat just refreshes the timestamp.
@@ -74,7 +84,11 @@ export function addMemory(text: string, source = 'agent'): MemoryEntry {
 }
 
 export function updateMemory(id: string, text: string): void {
-  run('UPDATE agent_memory SET text = ?, updated_at = ? WHERE id = ?', text.trim(), Date.now(), id)
+  // Guarded like addMemory. Without this an edit could blank a memory to an empty string, which
+  // then rendered as an empty bullet in the system prompt on every subsequent turn.
+  const trimmed = text.trim().slice(0, MAX_MEMORY_CHARS)
+  if (!trimmed) throw new Error('Memory text cannot be empty')
+  run('UPDATE agent_memory SET text = ?, updated_at = ? WHERE id = ?', trimmed, Date.now(), id)
 }
 
 export function deleteMemory(id: string): void {
@@ -82,5 +96,11 @@ export function deleteMemory(id: string): void {
 }
 
 export function searchMemory(query: string): MemoryEntry[] {
-  return all<Row>('SELECT * FROM agent_memory WHERE text LIKE ? ORDER BY updated_at DESC', `%${query}%`).map(toEntry)
+  // `%` and `_` are LIKE wildcards, so an unescaped query matched more than was asked for —
+  // searching for `read_file` also found `readXfile`. Same fix as chat search.
+  const escaped = query.replace(/[\\%_]/g, (c) => `\\${c}`)
+  return all<Row>(
+    `SELECT * FROM agent_memory WHERE text LIKE ? ESCAPE '\\' ORDER BY updated_at DESC`,
+    `%${escaped}%`
+  ).map(toEntry)
 }

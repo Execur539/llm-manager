@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { invoke, on, fmtDuration } from '../lib/api'
+import NumberField from '../components/NumberField'
 
 interface ServerStatus {
   running: boolean
@@ -95,15 +96,15 @@ export default function ServerView(): JSX.Element {
         <dl className="kv">
           <dt>Port</dt>
           <dd>
-            <input
-              type="number"
-              className="narrow"
+            <NumberField
               value={port}
+              min={1}
+              max={65535}
               disabled={status.running}
-              onChange={(e) => setPort(Number(e.target.value))}
-              onBlur={async () => {
+              onCommit={async (n) => {
+                setPort(n)
                 const s = await invoke<{ server: Record<string, unknown> }>('settings:get')
-                await invoke('settings:patch', { server: { ...s.server, port } })
+                await invoke('settings:patch', { server: { ...s.server, port: n } })
               }}
             />
           </dd>

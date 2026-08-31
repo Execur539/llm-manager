@@ -5,9 +5,12 @@
  * Anything reaching it from outside the machine goes through our own authenticated layer.
  *
  * Tool calling goes through llama.cpp's native OpenAI-style `tools` parameter (enabled by
- * `--jinja`), which uses the model's own template handler where one exists and a generic
- * handler otherwise. A GBNF grammar is attached as well, so a model whose template knows
- * nothing about tools is still constrained to emit a structurally valid call.
+ * `--jinja`), which uses the model's own template handler where one exists and a generic,
+ * grammar-constrained handler otherwise — so a model whose template knows nothing about tools
+ * is still held to a structurally valid call. That constraint is llama.cpp's own; this said we
+ * attached a GBNF grammar as well, which was never true. `CompletionOptions.grammar` exists and
+ * is forwarded, but nothing in the app sets it (see agent/gbnf.ts, which is written and tested
+ * but not wired to anything).
  */
 
 import { spawn, ChildProcess } from 'node:child_process'

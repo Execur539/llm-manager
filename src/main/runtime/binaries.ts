@@ -70,11 +70,22 @@ export function runtimeBinary(name: BinaryName): string {
  */
 export function childEnv(): NodeJS.ProcessEnv {
   const ffmpeg = runtimeBinary('ffmpeg')
+  /*
+   * Only ever prepend a real, absolute directory.
+   *
+   * `runtimeBinary` falls back to a bare `ffmpeg.exe` when the vendor tree has not been fetched,
+   * and `path.dirname('ffmpeg.exe')` is `"."` — which `existsSync` happily confirms, because the
+   * working directory always exists. Every child spawned in that state therefore ran with the
+   * current directory at the *front* of its PATH, which is the oldest trick in the book for
+   * getting the wrong executable picked up. When ffmpeg is missing the right answer is to change
+   * nothing and let the tool that needs it report that it is missing.
+   */
   const dir = path.dirname(ffmpeg)
-  const sep = path.delimiter
+  if (!path.isAbsolute(dir) || !fs.existsSync(dir)) return { ...process.env }
+
   return {
     ...process.env,
-    PATH: fs.existsSync(dir) ? `${dir}${sep}${process.env.PATH ?? ''}` : process.env.PATH
+    PATH: `${dir}${path.delimiter}${process.env.PATH ?? ''}`
   }
 }
 

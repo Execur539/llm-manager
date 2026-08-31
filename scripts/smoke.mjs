@@ -196,6 +196,59 @@ section('P4 — full-context KV reserved up front')
   }
 }
 
+/*
+ * The KV preference and the KV floor are independent dropdowns whose option lists are ordered
+ * opposite ways, so "prefer q4_0, never go below q8_0" is easy to select — and contradictory.
+ * The candidate list used to come out empty for it, which meant both passes that can return a
+ * chosen plan iterated zero times: auto-fit stopped choosing anything, on any hardware, and said
+ * nothing about why.
+ */
+section('Auto-fit: a contradictory KV preference still plans')
+{
+  const roomyRig = hw([gpu('RTX 4090', 24, 23)])
+
+  const contradictory = planFit(arch, roomyRig, {
+    ...DEFAULT_CONSTRAINTS,
+    preferredKvType: 'q4_0',
+    minKvType: 'q8_0'
+  })
+  // The floor is the stronger statement, so the contradictory setting must behave exactly as if
+  // the preference had been the floor all along — not as if no KV type were acceptable at all.
+  const floorOnly = planFit(arch, roomyRig, {
+    ...DEFAULT_CONSTRAINTS,
+    preferredKvType: 'q8_0',
+    minKvType: 'q8_0'
+  })
+  check('a preference below the floor is treated as the floor',
+    !!contradictory.chosen === !!floorOnly.chosen && contradictory.chosen?.kvType === floorOnly.chosen?.kvType,
+    `contradictory=${contradictory.chosen?.kvType ?? 'none'} floorOnly=${floorOnly.chosen?.kvType ?? 'none'}`)
+  check('and the same alternatives are offered',
+    contradictory.alternatives.length === floorOnly.alternatives.length,
+    `${contradictory.alternatives.length} vs ${floorOnly.alternatives.length}`)
+  check('and it says why the preference was not honoured',
+    contradictory.notes.some((n) => /below the floor/i.test(n)), contradictory.notes.join(' | ').slice(0, 120))
+
+  // Hardware where the floor genuinely fits must still get a plan chosen for it — the bug made
+  // that impossible on any hardware, because the candidate list was empty before it was consulted.
+  const hugeRig = hw([gpu('RTX 6000 Ada', 48, 47)])
+  const huge = planFit(arch, hugeRig, { ...DEFAULT_CONSTRAINTS, preferredKvType: 'q4_0', minKvType: 'q8_0' })
+  check('roomy hardware still gets an automatic plan', !!huge.chosen, huge.chosen ? huge.chosen.label : 'none')
+  check('at the floor quality', huge.chosen?.kvType === 'q8_0', String(huge.chosen?.kvType))
+
+  // An unrecognised value — a hand-edited settings file — must not silently pick something else.
+  const garbage = planFit(arch, roomyRig, {
+    ...DEFAULT_CONSTRAINTS,
+    preferredKvType: 'q2_0',
+    minKvType: 'q4_0'
+  })
+  const normal = planFit(arch, roomyRig, DEFAULT_CONSTRAINTS)
+  check('an unknown preference falls back to the full acceptable range',
+    garbage.chosen?.kvType === normal.chosen?.kvType,
+    `garbage=${garbage.chosen?.kvType ?? 'none'} normal=${normal.chosen?.kvType ?? 'none'}`)
+  check('and the default configuration says nothing about floors',
+    !normal.notes.some((n) => /below the floor/i.test(n)))
+}
+
 section('Never degrades silently')
 {
   const cramped = planFit(arch, hw([gpu('RTX 3060', 12, 11)]), DEFAULT_CONSTRAINTS)
@@ -327,6 +380,42 @@ section('GBNF compiler')
 
   const arrayGrammar = schemaGrammar({ type: 'object', properties: { items: { type: 'array', items: { type: 'string' } } } })
   check('compiles arrays', /arr-\d+ ::= "\["/.test(arrayGrammar))
+
+  /*
+   * An object whose properties are all optional has to allow any one of them alone.
+   *
+   * The old compiler emitted `(m1)? ("," ws m2)?`, which cannot express "just m2": the comma
+   * belongs to m2's group, so emitting it alone gives `{, "m2": …}` — not JSON — while the
+   * valid `{"m2": …}` is refused. `browser_click` takes selector *or* text and requires
+   * neither, so the grammar made its text-only form unreachable.
+   */
+  const allOptional = schemaGrammar({
+    type: 'object',
+    properties: { selector: { type: 'string' }, text: { type: 'string' } },
+    required: []
+  })
+  const tail = allOptional.split('\n').find((l) => /^opt-\d+ ::=/.test(l)) ?? ''
+  const alternatives = tail.replace(/^opt-\d+ ::= /, '').split(' | ')
+
+  check('an all-optional object compiles to alternatives', alternatives.length === 2, tail)
+  check('no alternative starts with a comma',
+    alternatives.every((a) => !a.trimStart().startsWith('","')), alternatives.join('  ||  '))
+  check('each optional key can be the first thing emitted',
+    alternatives.some((a) => a.trimStart().startsWith('"\\"selector\\""')) &&
+      alternatives.some((a) => a.trimStart().startsWith('"\\"text\\""')),
+    alternatives.join('  ||  '))
+  check('and the whole group is still skippable, so {} is legal',
+    /obj-\d+ ::= "\{" ws opt-\d+\? "\}"/.test(allOptional), allOptional.split('\n').find((l) => l.startsWith('obj-')) ?? '')
+
+  // A required key ahead of them makes a leading comma correct, so that form is left alone.
+  const mixed = schemaGrammar({
+    type: 'object',
+    properties: { database: { type: 'string' }, limit: { type: 'integer' } },
+    required: ['database']
+  })
+  check('a required key keeps the simpler skippable form',
+    !/^opt-\d+ ::=/m.test(mixed) && /\("," ws "\\"limit\\"".*\)\?/.test(mixed),
+    mixed.split('\n').find((l) => l.startsWith('obj-')) ?? '')
 }
 
 // ---------------------------------------------------------------- permissions
@@ -853,6 +942,53 @@ process.env.LLMM_APPDATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-tes
     db.prepare('SELECT COUNT(*) n FROM _migrations').get().n === 0)
 
   db.close()
+}
+
+// ---------------------------------------------------------------- settings bounds
+
+/*
+ * The settings file is plain JSON a person can edit, and the UI used to write to it on every
+ * keystroke through `Number(input.value)` — so an empty box stored 0 and a lone minus sign
+ * stored NaN, which JSON writes as null. `maxToolCallsPerTurn` is the one that bites: the agent
+ * loop is `while (calls < max)`, and both `0 < 0` and `0 < null` are false, so the agent
+ * answered nothing at all, gave no error, and kept doing so after a restart.
+ */
+section('Settings: values other code does arithmetic on')
+{
+  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-settings-'))
+  process.env.LLMM_APPDATA_DIR = fresh
+  const settingsFile = path.join(fresh, 'settings.json')
+
+  const load = async (stored) => {
+    fs.writeFileSync(settingsFile, JSON.stringify(stored))
+    // Fresh module per case: loadSettings memoises, which is the behaviour we want in the app.
+    const mod = await import(`./built/settings.js?case=${encodeURIComponent(JSON.stringify(stored))}`)
+    return mod.loadSettings()
+  }
+
+  const broken = await load({ agent: { maxToolCallsPerTurn: null } })
+  check('a null tool-call ceiling is repaired, not carried',
+    broken.agent.maxToolCallsPerTurn === 50, String(broken.agent.maxToolCallsPerTurn))
+  check('and the repaired value lets the loop run at all', 0 < broken.agent.maxToolCallsPerTurn)
+
+  const zero = await load({ agent: { maxToolCallsPerTurn: 0 } })
+  check('zero is raised to the floor', zero.agent.maxToolCallsPerTurn === 1, String(zero.agent.maxToolCallsPerTurn))
+
+  const negative = await load({ autoFit: { headroomMb: -500 } })
+  check('a negative headroom is clamped to zero', negative.autoFit.headroomMb === 0, String(negative.autoFit.headroomMb))
+
+  const huge = await load({ ultra: { samples: 99 } })
+  check('an out-of-range sample count is clamped to the engine ceiling',
+    huge.ultra.samples === 8, String(huge.ultra.samples))
+
+  const text = await load({ agent: { commandTimeoutMs: 'soon' } })
+  check('a non-number falls back to the default', text.agent.commandTimeoutMs === 120000, String(text.agent.commandTimeoutMs))
+
+  const good = await load({ agent: { maxToolCallsPerTurn: 25 }, autoFit: { headroomMb: 1024 } })
+  check('a legitimate value is left alone', good.agent.maxToolCallsPerTurn === 25 && good.autoFit.headroomMb === 1024,
+    `${good.agent.maxToolCallsPerTurn} / ${good.autoFit.headroomMb}`)
+
+  fs.rmSync(fresh, { recursive: true, force: true })
 }
 
 // ---------------------------------------------------------------- transcript order

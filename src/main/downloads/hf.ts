@@ -50,6 +50,27 @@ function authHeaders(token: string | null): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {}
 }
 
+/**
+ * How long any single metadata request may take before it is abandoned.
+ *
+ * None of these calls had a timeout. They are awaited by bridge handlers, which are awaited by
+ * the renderer, so a connection that hung — a captive portal, a stalled proxy, HuggingFace
+ * having a bad day — left the Search button spinning with no error, no result and no way to
+ * cancel short of restarting the app. These are small JSON reads; twenty seconds is generous.
+ */
+const HF_TIMEOUT_MS = 20_000
+
+/**
+ * Encode a `owner/name` repository id for use in a URL path.
+ *
+ * `encodeURIComponent` on the whole thing would escape the separating slash, so each segment is
+ * encoded on its own. Interpolating it raw let a stray `?` or `#` in a repo id change which
+ * endpoint was being addressed.
+ */
+function encodeRepo(repo: string): string {
+  return repo.split('/').map(encodeURIComponent).join('/')
+}
+
 export async function searchModels(
   query: string,
   token: string | null,
@@ -57,7 +78,7 @@ export async function searchModels(
 ): Promise<HfModelSummary[]> {
   // `gguf` filter keeps results to repos that actually contain something we can run.
   const url = `${HF_API}/models?search=${encodeURIComponent(query)}&filter=gguf&sort=downloads&direction=-1&limit=${limit}&full=false`
-  const res = await fetch(url, { headers: authHeaders(token) })
+  const res = await fetch(url, { headers: authHeaders(token), signal: AbortSignal.timeout(HF_TIMEOUT_MS) })
   if (res.status === 401) throw new Error('HuggingFace rejected the token. Check it in Settings.')
   if (!res.ok) throw new Error(`HuggingFace search failed: HTTP ${res.status}`)
 
@@ -83,8 +104,9 @@ export async function searchModels(
 const QUANT_RE = /\b(IQ\d[A-Z_]*|Q\d(?:_[A-Z0-9]+)*|F16|BF16|F32)\b/i
 
 export async function listFiles(repo: string, token: string | null): Promise<HfFile[]> {
-  const res = await fetch(`${HF_API}/models/${repo}/tree/main?recursive=true`, {
-    headers: authHeaders(token)
+  const res = await fetch(`${HF_API}/models/${encodeRepo(repo)}/tree/main?recursive=true`, {
+    headers: authHeaders(token),
+    signal: AbortSignal.timeout(HF_TIMEOUT_MS)
   })
   if (res.status === 403) {
     throw new Error(`${repo} is gated. Accept its licence on huggingface.co and add a token in Settings.`)
@@ -201,9 +223,20 @@ export async function peekRemoteGguf(
 ): Promise<{ kv: Record<string, GgufValue>; partial: true } | null> {
   try {
     const res = await fetch(url, {
-      headers: { ...authHeaders(token), Range: 'bytes=0-1048575' }
+      headers: { ...authHeaders(token), Range: 'bytes=0-1048575' },
+      signal: AbortSignal.timeout(HF_TIMEOUT_MS)
     })
     if (!res.ok && res.status !== 206) return null
+    /*
+     * A server that ignores Range answers 200 with the whole file.
+     *
+     * `arrayBuffer()` would then pull an entire multi-gigabyte model into memory to read eight
+     * bytes of header — which is the opposite of what peeking is for.
+     */
+    if (res.status !== 206) {
+      await res.body?.cancel().catch(() => undefined)
+      return null
+    }
     // Full parsing needs the tensor directory too; this only confirms the magic and version,
     // which is enough to catch a mislabelled file before spending 20 GB of bandwidth.
     const buf = Buffer.from(await res.arrayBuffer())

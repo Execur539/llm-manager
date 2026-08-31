@@ -85,21 +85,39 @@ function compileNode(schema: JsonSchema, rules: string[]): string {
       const requiredKeys = keys.filter((k) => required.has(k))
       const optionalKeys = keys.filter((k) => !required.has(k))
 
-      const pieces: string[] = []
-      requiredKeys.forEach((k, i) => {
-        const valueRule = compileNode(props[k], rules)
-        const sep = i === 0 ? '' : '"," ws '
-        pieces.push(`${sep}"\\"${k}\\"" ws ":" ws ${valueRule}`)
-      })
+      // Compiled once per key: compileNode appends helper rules, so calling it twice while
+      // building two branches would emit the same helper twice under different names.
+      const member = (k: string): string => `"\\"${k}\\"" ws ":" ws ${compileNode(props[k], rules)}`
+      const requiredMembers = requiredKeys.map(member)
+      const optionalMembers = optionalKeys.map(member)
 
-      // Optional properties are emitted as independently-skippable groups. This keeps the
-      // grammar simple at the cost of fixing their order, which models handle fine.
-      optionalKeys.forEach((k, i) => {
-        const valueRule = compileNode(props[k], rules)
-        const needsComma = requiredKeys.length > 0 || i > 0
-        const sep = needsComma ? '"," ws ' : ''
-        pieces.push(`(${sep}"\\"${k}\\"" ws ":" ws ${valueRule})?`)
-      })
+      const pieces: string[] = []
+      requiredMembers.forEach((m, i) => pieces.push(i === 0 ? m : `"," ws ${m}`))
+
+      if (optionalMembers.length && requiredMembers.length) {
+        // Something mandatory precedes them, so a leading comma is always correct and each
+        // optional can be skipped independently.
+        for (const m of optionalMembers) pieces.push(`("," ws ${m})?`)
+      } else if (optionalMembers.length) {
+        /*
+         * All-optional objects need alternation, not a row of skippable groups.
+         *
+         * The old form emitted `(m1)? ("," ws m2)?`, which has no way to express "just m2": the
+         * comma belongs to m2's group, so emitting it alone produces `{, "m2": …}` — not JSON —
+         * and the valid `{"m2": …}` is refused by the grammar. Every tool whose arguments are
+         * all optional was affected, and `browser_click` most visibly: its own code offers
+         * selector *or* text, and the grammar made text-only unreachable.
+         *
+         * One alternative per starting member, each followed by the members after it as
+         * skippable comma groups. The count is the number of optional keys, which is small.
+         */
+        const alternatives = optionalMembers.map((m, i) =>
+          [m, ...optionalMembers.slice(i + 1).map((rest) => `("," ws ${rest})?`)].join(' ')
+        )
+        const tail = freshName('opt')
+        rules.push(`${tail} ::= ${alternatives.join(' | ')}`)
+        pieces.push(`${tail}?`)
+      }
 
       const name = freshName('obj')
       rules.push(`${name} ::= "{" ws ${pieces.join(' ')} "}" ws`)

@@ -231,7 +231,18 @@ async function runInterpreter(
   fs.writeFileSync(tmp, code, 'utf8')
   try {
     const bin = kind === 'python' ? runtimeBinary('python') : runtimeBinary('node')
-    const r = await runToCompletion(bin, [tmp], ctx.cwd, ctx.timeoutMs, ctx.signal)
+    /*
+     * `node` resolves to Electron's own binary, which is only Node when told to be.
+     *
+     * Without ELECTRON_RUN_AS_NODE, `electron script.mjs` treats the script as an application
+     * entry point: the code does run and its output does arrive, but the process then sits
+     * waiting for an app lifecycle that never begins and never exits. `runToCompletion` waits
+     * for `close`, so every run_node call blocked for the full command timeout — two minutes by
+     * default — and came back as "[timed out and was killed]". The agent read that as failure
+     * and retried or gave up, on a script that had worked.
+     */
+    const env = kind === 'node' ? { ELECTRON_RUN_AS_NODE: '1' } : undefined
+    const r = await runToCompletion(bin, [tmp], ctx.cwd, ctx.timeoutMs, ctx.signal, env)
     return formatRun(r)
   } finally {
     try {

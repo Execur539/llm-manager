@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { AppSettings } from '@shared/types'
 import { invoke, on } from '../lib/api'
 import ConfirmDialog from '../components/ConfirmDialog'
+import NumberField from '../components/NumberField'
 
 interface McpStatus {
   id: string
@@ -86,21 +87,23 @@ export default function Settings(): JSX.Element {
         <dl className="kv">
           <dt>Target context</dt>
           <dd>
-            <input
-              type="number"
+            <NumberField
               value={settings.autoFit.targetContext}
-              onChange={(e) => void patch({ autoFit: { ...settings.autoFit, targetContext: Number(e.target.value) } })}
+              min={512}
+              max={10_000_000}
+              hint="minimum to aim for"
+              onCommit={(n) => void patch({ autoFit: { ...settings.autoFit, targetContext: n } })}
             />
-            <span className="faint" style={{ marginLeft: 6 }}>minimum to aim for</span>
           </dd>
           <dt>Ideal context</dt>
           <dd>
-            <input
-              type="number"
+            <NumberField
               value={settings.autoFit.idealContext}
-              onChange={(e) => void patch({ autoFit: { ...settings.autoFit, idealContext: Number(e.target.value) } })}
+              min={512}
+              max={10_000_000}
+              hint="stop growing here"
+              onCommit={(n) => void patch({ autoFit: { ...settings.autoFit, idealContext: n } })}
             />
-            <span className="faint" style={{ marginLeft: 6 }}>stop growing here</span>
           </dd>
           <dt>Preferred KV</dt>
           <dd>
@@ -130,12 +133,13 @@ export default function Settings(): JSX.Element {
           </dd>
           <dt>VRAM headroom</dt>
           <dd>
-            <input
-              type="number"
+            <NumberField
               value={settings.autoFit.headroomMb}
-              onChange={(e) => void patch({ autoFit: { ...settings.autoFit, headroomMb: Number(e.target.value) } })}
+              min={0}
+              max={65_536}
+              hint="MB left free for the desktop"
+              onCommit={(n) => void patch({ autoFit: { ...settings.autoFit, headroomMb: n } })}
             />
-            <span className="faint" style={{ marginLeft: 6 }}>MB left free for the desktop</span>
           </dd>
         </dl>
       </div>
@@ -164,21 +168,23 @@ export default function Settings(): JSX.Element {
           </dd>
           <dt>Max tool calls / turn</dt>
           <dd>
-            <input
-              type="number"
+            <NumberField
               value={settings.agent.maxToolCallsPerTurn}
-              onChange={(e) => void patch({ agent: { ...settings.agent, maxToolCallsPerTurn: Number(e.target.value) } })}
+              min={1}
+              max={1000}
+              hint="runaway-loop ceiling"
+              onCommit={(n) => void patch({ agent: { ...settings.agent, maxToolCallsPerTurn: n } })}
             />
-            <span className="faint" style={{ marginLeft: 6 }}>runaway-loop ceiling</span>
           </dd>
           <dt>Command timeout</dt>
           <dd>
-            <input
-              type="number"
+            <NumberField
               value={settings.agent.commandTimeoutMs}
-              onChange={(e) => void patch({ agent: { ...settings.agent, commandTimeoutMs: Number(e.target.value) } })}
+              min={1000}
+              max={3_600_000}
+              hint="ms"
+              onCommit={(n) => void patch({ agent: { ...settings.agent, commandTimeoutMs: n } })}
             />
-            <span className="faint" style={{ marginLeft: 6 }}>ms</span>
           </dd>
           <dt>Approvals</dt>
           <dd>

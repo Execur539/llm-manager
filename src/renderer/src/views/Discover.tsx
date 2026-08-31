@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { fmtBytes, invoke, on, fmtRelative } from '../lib/api'
 import Icon from '../components/Icon'
 import { Skeleton, Spinner } from '../components/Spinner'
@@ -60,11 +60,33 @@ export default function Discover({ onDownloaded }: { onDownloaded: () => Promise
   const [downloads, setDownloads] = useState<DownloadItem[]>([])
   const [error, setError] = useState<string | null>(null)
 
+  /** Downloads already seen finished, so a completion is reacted to once rather than forever. */
+  const settled = useRef<Set<string>>(new Set())
+
   useEffect(() => {
-    void invoke<DownloadItem[]>('downloads:list').then(setDownloads).catch(() => undefined)
+    void invoke<DownloadItem[]>('downloads:list').then((list) => {
+      setDownloads(list)
+      // Anything already done when the view mounts is history, not news.
+      for (const d of list) if (d.status === 'done') settled.current.add(d.id)
+    })
+
+    /*
+     * Rescan on a download *becoming* done, not on one *being* done.
+     *
+     * The queue emits `update` about twice a second while any transfer is running, and finished
+     * rows stay in the table indefinitely — so `list.some(d => d.status === 'done')` is true
+     * forever once a single model has ever been downloaded. Every tick therefore kicked off a
+     * full library scan: a directory walk and a stat of every GGUF, twice a second, for the whole
+     * of a twenty-gigabyte download.
+     */
     const off = on<DownloadItem[]>('downloads:update', (list) => {
       setDownloads(list)
-      if (list.some((d) => d.status === 'done')) void onDownloaded()
+      const newlyDone = list.filter((d) => d.status === 'done' && !settled.current.has(d.id))
+      for (const d of list) {
+        if (d.status === 'done') settled.current.add(d.id)
+        else settled.current.delete(d.id)
+      }
+      if (newlyDone.length) void onDownloaded()
     })
     return off
   }, [onDownloaded])

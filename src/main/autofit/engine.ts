@@ -38,6 +38,17 @@ const KV_ELEMENT_BYTES: Record<KvType, number> = {
 
 const KV_ORDER: KvType[] = ['f16', 'q8_0', 'q4_0']
 
+/**
+ * Where a KV type sits in the quality order, with a fallback for one that is not in it at all.
+ *
+ * `indexOf` returns -1 for an unrecognised value, and -1 fed to `slice` counts from the end —
+ * which silently produces a plausible-looking but unrelated candidate list rather than failing.
+ */
+function clampToOrder(kv: KvType, fallback: number): number {
+  const i = KV_ORDER.indexOf(kv)
+  return i === -1 ? fallback : i
+}
+
 /** CUDA runtime + cuBLAS workspace claimed per device before any weights load. */
 const CUDA_CONTEXT_OVERHEAD = 350 * MB
 /** Graph/scratch allocations that don't scale with batch or context. */
@@ -389,12 +400,33 @@ export function planFit(
     return { chosen: plan, alternatives: [], needsUserChoice: false, hardware: hw, notes }
   }
 
-  // Candidate KV types, best-quality first, never below the configured floor.
-  const floorIndex = KV_ORDER.indexOf(constraints.minKvType)
-  const preferredIndex = KV_ORDER.indexOf(constraints.preferredKvType)
-  const kvCandidates = o.kvType
-    ? [o.kvType]
-    : KV_ORDER.slice(preferredIndex, floorIndex + 1)
+  /*
+   * Candidate KV types, best-quality first, never below the configured floor.
+   *
+   * The two settings are independent dropdowns, and their lists are ordered opposite ways, so
+   * "prefer q4_0, floor q8_0" is an easy thing to end up with — a contradiction, since q4_0 is
+   * below the floor it is supposedly preferred over. A plain `slice(preferred, floor + 1)`
+   * returns an *empty* list for that, and an empty list means both passes that can return a
+   * chosen plan iterate zero times: auto-fit quietly stops auto-fitting, every model in the
+   * library reports that it needs a manual decision, and nothing says why.
+   *
+   * An unrecognised value — a hand-edited settings.json — has the same shape of problem, with
+   * `indexOf` returning -1 and `slice(-1, …)` silently yielding the worst type regardless of
+   * what was asked for.
+   *
+   * The floor wins where the two disagree, because a floor is the stronger statement: it says
+   * what is unacceptable, where the preference only says what is nicest.
+   */
+  const floorIndex = clampToOrder(constraints.minKvType, KV_ORDER.length - 1)
+  const preferredIndex = Math.min(clampToOrder(constraints.preferredKvType, 0), floorIndex)
+  const kvCandidates = o.kvType ? [o.kvType] : KV_ORDER.slice(preferredIndex, floorIndex + 1)
+
+  if (KV_ORDER.indexOf(constraints.preferredKvType) > floorIndex) {
+    notes.push(
+      `Preferred KV (${constraints.preferredKvType}) is below the floor (${constraints.minKvType}), ` +
+        `so the floor was used. Lower the floor in Settings if you want ${constraints.preferredKvType}.`
+    )
+  }
 
   // Pass 1: everything on GPU, best KV type that reaches the ideal context.
   for (const kvType of kvCandidates) {

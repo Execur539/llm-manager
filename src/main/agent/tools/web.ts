@@ -30,6 +30,47 @@ function stripTags(html: string): string {
   return decodeEntities(html.replace(/<[^>]*>/g, '')).replace(/\s+/g, ' ').trim()
 }
 
+/** Most any single response may contribute. Well above a page, far below a problem. */
+const MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+/**
+ * Read a response body with a ceiling on how much is taken.
+ *
+ * `res.text()` reads to completion first and only then hands back a string to truncate — so
+ * pointing any of these tools at something large (a model file, a multi-gigabyte log, an
+ * endless stream) pulled the whole thing into the main process before a single character was
+ * discarded. The model only ever sees the first few tens of thousands of characters anyway.
+ *
+ * The reader is cancelled at the limit, which also closes the connection rather than leaving
+ * the rest of the transfer running.
+ */
+async function readCapped(res: Response, limit = MAX_RESPONSE_BYTES): Promise<{ text: string; truncated: boolean }> {
+  if (!res.body) return { text: await res.text(), truncated: false }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  let bytes = 0
+  let truncated = false
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      bytes += value.byteLength
+      if (bytes > limit) {
+        text += decoder.decode(value.subarray(0, Math.max(0, value.byteLength - (bytes - limit))))
+        truncated = true
+        break
+      }
+      text += decoder.decode(value, { stream: true })
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined)
+  }
+  return { text, truncated }
+}
+
 const webSearch: Tool = {
   name: 'web_search',
   description:
@@ -90,10 +131,11 @@ const fetchUrl: Tool = {
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
 
     const type = res.headers.get('content-type') ?? ''
-    const body = await res.text()
+    const { text: body, truncated } = await readCapped(res)
+    const cut = truncated ? '\n\n[response exceeded the read limit and was cut short]' : ''
 
     if (!type.includes('html')) {
-      return `[${type || 'unknown type'}] ${url}\n\n${body.slice(0, Number(args.max_chars ?? 60000))}`
+      return `[${type || 'unknown type'}] ${url}\n\n${body.slice(0, Number(args.max_chars ?? 60000))}${cut}`
     }
 
     // Strip the parts of a page that are never content, then flatten to text.
@@ -121,7 +163,7 @@ const fetchUrl: Tool = {
       .join('\n')
 
     const limit = Number(args.max_chars ?? 60000)
-    return `# ${title}\nSource: ${url}\n\n${text.slice(0, limit)}`
+    return `# ${title}\nSource: ${url}\n\n${text.slice(0, limit)}${cut}`
   }
 }
 
@@ -147,9 +189,10 @@ const httpRequest: Tool = {
       body: args.body === undefined || method === 'GET' || method === 'HEAD' ? undefined : String(args.body),
       signal: ctx.signal
     })
-    const text = await res.text()
+    const { text, truncated } = await readCapped(res)
     const headerLines = [...res.headers.entries()].map(([k, v]) => `${k}: ${v}`).join('\n')
-    return `HTTP ${res.status} ${res.statusText}\n${headerLines}\n\n${text}`
+    const cut = truncated ? '\n\n[response exceeded the read limit and was cut short]' : ''
+    return `HTTP ${res.status} ${res.statusText}\n${headerLines}\n\n${text}${cut}`
   }
 }
 
