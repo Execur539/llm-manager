@@ -15,6 +15,18 @@ import crypto from 'node:crypto'
 import type { Tool } from './base'
 import { schema, str, int } from './base'
 import { TOOL_OUTPUT_DIR } from '../../storage/paths'
+import type { ContentPart } from '../../runtime/llama'
+
+/** Scale a capture down to something a projector can actually resolve, then package it. */
+function screenPart(image: Electron.NativeImage): ContentPart {
+  const { width, height } = image.getSize()
+  const MAX_EDGE = 1568
+  const sized =
+    Math.max(width, height) > MAX_EDGE
+      ? image.resize(width >= height ? { width: MAX_EDGE } : { height: MAX_EDGE })
+      : image
+  return { type: 'image_url', image_url: { url: `data:image/png;base64,${sized.toPNG().toString('base64')}` } }
+}
 
 const exec = promisify(execFile)
 
@@ -38,11 +50,11 @@ async function powershell(script: string, timeoutMs = 20000, signal?: AbortSigna
 const takeScreenshot: Tool = {
   name: 'screenshot',
   description:
-    'Capture the screen and save it to a PNG file. Returns the path. Use read_image or attach ' +
-    'the file to look at it with a vision-capable model.',
+    'Capture the screen. On a model with vision the image is shown to you directly; the file is ' +
+    'also saved and its path returned so it can be referred to later.',
   tier: 'read',
   parameters: schema({ display: int('Display index (default 0 = primary)') }),
-  async run(args) {
+  async run(args, ctx) {
     const displayIndex = Number(args.display ?? 0)
     const displays = screen.getAllDisplays()
     const target = displays[displayIndex] ?? displays[0]
@@ -58,7 +70,12 @@ const takeScreenshot: Tool = {
     fs.mkdirSync(TOOL_OUTPUT_DIR, { recursive: true })
     const file = path.join(TOOL_OUTPUT_DIR, `screen-${crypto.randomBytes(4).toString('hex')}.png`)
     fs.writeFileSync(file, source.thumbnail.toPNG())
-    return `Screenshot saved to ${file} (${width}x${height}, display "${source.name}")`
+
+    const text = `Screenshot saved to ${file} (${width}x${height}, display "${source.name}")`
+    // Handing back the path alone was the whole problem: nothing could open it. When the model
+    // can see, show it; when it cannot, say so rather than pretending the path is useful.
+    if (!ctx.vision) return `${text}. The loaded model has no vision projector, so it cannot be shown.`
+    return { text, media: [screenPart(source.thumbnail)] }
   }
 }
 

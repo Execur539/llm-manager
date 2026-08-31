@@ -3174,3 +3174,51 @@ button.danger.subtle:hover {
 .turn-plan .ultra-plan {
   border-top: none;
 }
+
+/* ---------------------------------------------------------------- agent questions
+
+   The agent pausing to ask something. Shares the modal shell with the approval prompt, but
+   reads differently on purpose: an approval is a decision about an action and shows a resolved
+   command, while this is a conversation and shows a sentence. */
+
+.question-text {
+  margin: 0 0 14px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--fg);
+}
+
+.question-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.question-option {
+  padding: 6px 11px;
+  font-size: 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.question-option:hover {
+  border-color: var(--accent-dim);
+  background: var(--accent-wash);
+}
+
+/* The free-text answer sits below the suggestions, because typing one is always allowed. */
+.modal textarea[data-testid='question-input'] {
+  width: 100%;
+  resize: vertical;
+  min-height: 46px;
+  font: inherit;
+}
+
+/* The note explaining that the turn is blocked pushes the button to the right. */
+.modal .actions .tiny-note {
+  margin-right: auto;
+  text-align: left;
+}

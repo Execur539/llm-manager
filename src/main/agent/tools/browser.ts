@@ -17,6 +17,7 @@ import type { Browser, Page } from 'playwright-core'
 import type { Tool } from './base'
 import { schema, str, int, bool } from './base'
 import { chromiumExecutable } from '../../runtime/binaries'
+import { nativeImage } from 'electron'
 import { TOOL_OUTPUT_DIR } from '../../storage/paths'
 
 let browser: Browser | null = null
@@ -172,15 +173,33 @@ const fillField: Tool = {
 
 const screenshotPage: Tool = {
   name: 'browser_screenshot',
-  description: 'Screenshot the current page to a PNG file and return the path.',
+  description:
+    'Screenshot the current page. On a model with vision the image is shown to you directly; ' +
+    'the file is also saved and its path returned.',
   tier: 'read',
   parameters: schema({ full_page: bool('Capture the entire scrollable page') }),
-  async run(args) {
+  async run(args, ctx) {
     const p = await getPage()
     fs.mkdirSync(TOOL_OUTPUT_DIR, { recursive: true })
     const file = path.join(TOOL_OUTPUT_DIR, `page-${crypto.randomBytes(4).toString('hex')}.png`)
-    await p.screenshot({ path: file, fullPage: Boolean(args.full_page) })
-    return `Saved screenshot of ${p.url()} to ${file}`
+    const buffer = await p.screenshot({ path: file, fullPage: Boolean(args.full_page) })
+
+    const text = `Saved screenshot of ${p.url()} to ${file}`
+    if (!ctx.vision) return `${text}. The loaded model has no vision projector, so it cannot be shown.`
+
+    // Scaled the same way the desktop capture is, for the same reason: a full-page shot of a
+    // long document is enormous and no projector resolves it at full size anyway.
+    const image = nativeImage.createFromBuffer(buffer)
+    const { width, height } = image.getSize()
+    const MAX_EDGE = 1568
+    const sized =
+      Math.max(width, height) > MAX_EDGE
+        ? image.resize(width >= height ? { width: MAX_EDGE } : { height: MAX_EDGE })
+        : image
+    return {
+      text,
+      media: [{ type: 'image_url', image_url: { url: `data:image/png;base64,${sized.toPNG().toString('base64')}` } }]
+    }
   }
 }
 

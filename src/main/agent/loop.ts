@@ -21,7 +21,9 @@ import { EventEmitter } from 'node:events'
 import type {
   AgentMessage,
   AgentSessionState,
+  Backend,
   CompactionStrategy,
+  AgentQuestion,
   PermissionDecision,
   PermissionRequest,
   ToolCall,
@@ -31,13 +33,17 @@ import type {
 import { llama, estimateTokens, type ChatMessage, type ContentPart } from '../runtime/llama'
 import { reasoningRequestFields, type ReasoningChoice } from '../models/reasoning'
 import { PermissionEngine, isSecretPath, type PermissionRule } from './permissions'
-import { ToolRegistry, makeResult, type Tool, type ToolContext } from './tools/base'
+import { ToolRegistry, makeResult, splitOutput, type Tool, type ToolContext } from './tools/base'
 import { filesystemTools } from './tools/filesystem'
 import { execTools } from './tools/exec'
 import { webTools } from './tools/web'
 import { systemTools } from './tools/system'
 import { browserTools } from './tools/browser'
 import { dataTools } from './tools/data'
+import { visionTools } from './tools/vision'
+import { gitTools } from './tools/git'
+import { workflowTools, resetWaitEscalation } from './tools/workflow'
+import { desktopTools } from './tools/desktop'
 import { makeAgentTools } from './tools/agentic'
 import { checkpointFiles } from './checkpoints'
 import { mcpManager } from './mcp'
@@ -52,6 +58,8 @@ export interface AgentOptions {
   hardBlocksDisabled: boolean
   compaction: CompactionStrategy
   hfToken: string | null
+  /** Which llama.cpp build is running; the embedding server used by document search needs it. */
+  backend?: Backend
   /**
    * Effort level the user selected, as named by the loaded model's template, or 'off'.
    * null leaves the template's own default alone.
@@ -61,6 +69,8 @@ export interface AgentOptions {
   remote?: boolean
   remoteToolsEnabled?: boolean
   requestPermission: (req: PermissionRequest) => Promise<PermissionDecision>
+  /** Put a clarifying question to the user and block the turn until they answer. */
+  askUser?: (question: AgentQuestion) => Promise<string>
 }
 
 const SYSTEM_PROMPT = `You are the agent inside LLM Manager, running on the user's Windows machine.
@@ -140,10 +150,15 @@ export class Agent extends EventEmitter {
       ...systemTools,
       ...browserTools,
       ...dataTools,
+      ...visionTools,
+      ...gitTools,
+      ...workflowTools,
+      ...desktopTools,
       // Sub-agents are sequential and depth-limited, so a runaway spawn chain is impossible.
       ...makeAgentTools({
         spawnSubAgent: (prompt, cwd) => this.runSubAgent(prompt, cwd),
-        canSpawn: () => this.depth < 2
+        canSpawn: () => this.depth < 2,
+        askUser: (question, options) => this.ask(question, options)
       })
     ])
     this.permissions = new PermissionEngine({
@@ -174,6 +189,24 @@ export class Agent extends EventEmitter {
 
   stop(): void {
     this.abort?.abort()
+  }
+
+  /**
+   * Put a question to the user, or explain why it cannot be asked.
+   *
+   * A sub-agent has no surface of its own and a planning sample is a discarded draft, so neither
+   * may block a real person on an answer. Both are told plainly rather than left hanging, so the
+   * model can decide for itself instead of waiting on a promise nothing will settle.
+   */
+  private async ask(question: string, options: string[]): Promise<string> {
+    if (this.sampling) {
+      return '(cannot ask during planning — decide for yourself and note the assumption in the plan)'
+    }
+    if (this.depth > 0) {
+      return '(a sub-agent cannot ask the user; make a reasonable assumption and report it in your result)'
+    }
+    if (!this.opts.askUser) return '(asking the user is not available here)'
+    return this.opts.askUser({ id: crypto.randomBytes(6).toString('hex'), question, options })
   }
 
   /**
@@ -222,41 +255,57 @@ Platform: Windows (PowerShell)${memoryBlock}`
     return null
   }
 
-  private async executeCall(call: ToolCall, sessionId: string): Promise<ToolResult> {
+  /**
+   * Run one authorised call.
+   *
+   * Returns the media a tool produced separately from its result. Media never goes into the
+   * `tool` message — that field is a string by spec, and a base64 image in the transcript would
+   * be both invalid and enormous — so the loop appends it as its own user turn instead.
+   */
+  private async executeCall(call: ToolCall, sessionId: string): Promise<{ result: ToolResult; media: ContentPart[] }> {
     const started = Date.now()
     const tool = this.resolveTool(call.name)
     if (!tool) {
       const available = this.availableTools().map((t) => t.name).join(', ')
-      return makeResult(
-        call.id,
-        `No such tool: ${call.name}. Available tools: ${available}`,
-        call.name,
-        started,
-        false,
-        'unknown tool'
-      )
+      return {
+        result: makeResult(
+          call.id,
+          `No such tool: ${call.name}. Available tools: ${available}`,
+          call.name,
+          started,
+          false,
+          'unknown tool'
+        ),
+        media: []
+      }
     }
 
     if (this.opts.planMode && tool.tier !== 'read') {
-      return makeResult(
-        call.id,
-        `Plan mode is active, so ${call.name} (${tool.tier}) is unavailable. Finish investigating and present a plan.`,
-        call.name,
-        started,
-        false,
-        'blocked by plan mode'
-      )
+      return {
+        result: makeResult(
+          call.id,
+          `Plan mode is active, so ${call.name} (${tool.tier}) is unavailable. Finish investigating and present a plan.`,
+          call.name,
+          started,
+          false,
+          'blocked by plan mode'
+        ),
+        media: []
+      }
     }
 
     if (this.opts.remote && !this.opts.remoteToolsEnabled && tool.tier !== 'read') {
-      return makeResult(
-        call.id,
-        `This is a remote session and remote tool use is disabled, so ${call.name} is unavailable.`,
-        call.name,
-        started,
-        false,
-        'blocked for remote session'
-      )
+      return {
+        result: makeResult(
+          call.id,
+          `This is a remote session and remote tool use is disabled, so ${call.name} is unavailable.`,
+          call.name,
+          started,
+          false,
+          'blocked for remote session'
+        ),
+        media: []
+      }
     }
 
     /*
@@ -271,19 +320,22 @@ Platform: Windows (PowerShell)${memoryBlock}`
      */
     const secret = collectPaths(call.args, this.opts.cwd).find((p) => isSecretPath(p, APPDATA_DIR))
     if (secret) {
-      return makeResult(
-        call.id,
-        `${secret} holds this application's own credentials and is not readable or writable by tools.`,
-        call.name,
-        started,
-        false,
-        'app secrets are off limits'
-      )
+      return {
+        result: makeResult(
+          call.id,
+          `${secret} holds this application's own credentials and is not readable or writable by tools.`,
+          call.name,
+          started,
+          false,
+          'app secrets are off limits'
+        ),
+        media: []
+      }
     }
 
     const auth = await this.permissions.authorise(tool.name, tool.tier, call.args, this.opts.cwd)
     if (!auth.allowed) {
-      return makeResult(call.id, auth.reason ?? 'Denied.', call.name, started, false, auth.reason)
+      return { result: makeResult(call.id, auth.reason ?? 'Denied.', call.name, started, false, auth.reason), media: [] }
     }
 
     if (tool.tier === 'write') {
@@ -295,17 +347,28 @@ Platform: Windows (PowerShell)${memoryBlock}`
       sessionId,
       signal: this.abort?.signal ?? new AbortController().signal,
       timeoutMs: this.opts.commandTimeoutMs,
+      backend: this.opts.backend ?? 'cpu',
+      // Read from the loaded model rather than remembered, so swapping models mid-session
+      // cannot leave a tool believing it can hand back a picture nothing will look at.
+      vision: !!llama.loaded?.model.caps.vision,
       settings: { hfToken: this.opts.hfToken }
     }
 
+    /*
+     * Any tool that is not `wait` means the agent has stopped holding and started doing, so the
+     * wait ceiling drops back to its shortest. Done here rather than inside the tool because a
+     * tool cannot see what else ran.
+     */
+    if (tool.name !== 'wait') resetWaitEscalation(sessionId)
+
     try {
-      const output = await tool.run(call.args, ctx)
-      return makeResult(call.id, output, call.name, started)
+      const { text, media } = splitOutput(await tool.run(call.args, ctx))
+      return { result: makeResult(call.id, text, call.name, started), media }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       // Errors go back into the conversation so the model can react — the deliberate
       // substitute for a dedicated repair loop.
-      return makeResult(call.id, `Error: ${message}`, call.name, started, false, message)
+      return { result: makeResult(call.id, `Error: ${message}`, call.name, started, false, message), media: [] }
     }
   }
 
@@ -643,7 +706,7 @@ Platform: Windows (PowerShell)${memoryBlock}`
           calls++
           this.emit('toolCall', call)
 
-          const result = await this.executeCall(call, session.id)
+          const { result, media } = await this.executeCall(call, session.id)
           this.emit('toolResult', result)
 
           const toolMsg: AgentMessage = {
@@ -663,6 +726,22 @@ Platform: Windows (PowerShell)${memoryBlock}`
             tool_call_id: call.id,
             name: call.name
           })
+
+          /*
+           * Anything the model has to *look* at arrives as its own user turn.
+           *
+           * A `tool` message's content is a string by spec, so an image cannot ride along in the
+           * result — and would not survive the transcript, which stores text. Appending a user
+           * turn carrying the parts is the arrangement llama.cpp accepts, and it keeps the
+           * persisted history readable: the transcript records that an image was returned, while
+           * the pixels live only in the rolling window for this session.
+           */
+          if (media.length) {
+            this.history.push({
+              role: 'user',
+              content: [...media, { type: 'text', text: `[image returned by ${call.name}]` }]
+            })
+          }
         }
 
         for (const call of toolCalls) {

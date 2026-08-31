@@ -287,6 +287,21 @@ export interface PermissionRequest {
   blockReason?: string
 }
 
+/**
+ * A clarifying question the agent has paused to ask.
+ *
+ * Distinct from a PermissionRequest: that one asks whether an action may happen, and its only
+ * answers are approve or deny. This asks what the user actually wants, and the turn is blocked
+ * until they say — which is the point. Without it an agent that hit an ambiguity had two bad
+ * options: guess, or abandon the turn and ask in its final reply.
+ */
+export interface AgentQuestion {
+  id: string
+  question: string
+  /** Suggested answers. The user may always type their own instead. */
+  options: string[]
+}
+
 export interface AgentMessage {
   id: string
   role: 'user' | 'assistant' | 'tool' | 'system'

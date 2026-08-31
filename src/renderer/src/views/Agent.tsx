@@ -9,6 +9,7 @@ import {
   useStream,
   clearFor,
   clearNotice,
+  clearQuestions,
   setReasoning,
   adoptReasoning,
   DRAFT_AGENT
@@ -278,7 +279,12 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             Compact
           </button>
           {running && (
-            <button className="danger" onClick={() => void invoke('agent:stop')} data-testid="agent-stop">
+            <button className="danger" onClick={() => {
+                // The main process settles any outstanding question when the turn is drained;
+                // clearing here takes the dialog off screen at the same moment.
+                clearQuestions()
+                void invoke('agent:stop')
+              }} data-testid="agent-stop">
               Stop
             </button>
           )}
@@ -424,7 +430,11 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             {/* Same treatment as chat: the button stops the turn it started. */}
             <button
               className={`send-button${running ? ' stopping' : ''}`}
-              onClick={() => (running ? void invoke('agent:stop') : void send())}
+              onClick={() => {
+                if (!running) return void send()
+                clearQuestions()
+                void invoke('agent:stop')
+              }}
               disabled={!loaded || (!running && !input.trim() && !attachments.items.length)}
               title={running ? 'Stop the agent' : 'Send  (Enter)'}
               aria-label={running ? 'Stop' : 'Send'}

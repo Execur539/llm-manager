@@ -944,6 +944,104 @@ process.env.LLMM_APPDATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-tes
   db.close()
 }
 
+// ---------------------------------------------------------------- new agent tools
+
+section('multi_edit: all of them, or none')
+{
+  const { workflowTools } = await import('./built/workflow.js')
+  const multiEdit = workflowTools.find((t) => t.name === 'multi_edit')
+  const ctx = { cwd: os.tmpdir(), sessionId: 's', signal: new AbortController().signal, timeoutMs: 5000 }
+
+  const write = (body) => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-edit-')), 'f.txt')
+    fs.writeFileSync(file, body)
+    return file
+  }
+
+  const file = write('alpha\nbeta\ngamma\n')
+  await multiEdit.run({ path: file, edits: [
+    { old_string: 'alpha', new_string: 'ALPHA' },
+    { old_string: 'gamma', new_string: 'GAMMA' }
+  ] }, ctx)
+  check('applies every edit in one write', fs.readFileSync(file, 'utf8') === 'ALPHA\nbeta\nGAMMA\n', fs.readFileSync(file, 'utf8'))
+
+  // The point of the tool: a bad edit late in the list must not leave the earlier ones on disk.
+  const atomic = write('alpha\nbeta\ngamma\n')
+  let threw = false
+  try {
+    await multiEdit.run({ path: atomic, edits: [
+      { old_string: 'alpha', new_string: 'ALPHA' },
+      { old_string: 'nowhere', new_string: 'x' }
+    ] }, ctx)
+  } catch {
+    threw = true
+  }
+  check('a failing edit reports rather than half-applying', threw)
+  check('and the file is untouched', fs.readFileSync(atomic, 'utf8') === 'alpha\nbeta\ngamma\n', fs.readFileSync(atomic, 'utf8'))
+
+  // Ambiguity is refused rather than guessed at, as edit_file does.
+  const ambiguous = write('x\nx\n')
+  let refused = false
+  try {
+    await multiEdit.run({ path: ambiguous, edits: [{ old_string: 'x', new_string: 'y' }] }, ctx)
+  } catch {
+    refused = true
+  }
+  check('an ambiguous match is refused', refused)
+  check('unless replace_all is set',
+    (await multiEdit.run({ path: ambiguous, edits: [{ old_string: 'x', new_string: 'y', replace_all: true }] }, ctx)) &&
+      fs.readFileSync(ambiguous, 'utf8') === 'y\ny\n')
+}
+
+/*
+ * A model cannot know how long a build or a server start takes, and guesses badly in the
+ * expensive direction. The ceiling starts short and climbs only while it keeps waiting, so a
+ * first guess of "sleep a minute" costs five seconds and a check instead.
+ */
+section('wait: short first, longer only if it keeps waiting')
+{
+  const { workflowTools, resetWaitEscalation } = await import('./built/workflow.js')
+  const wait = workflowTools.find((t) => t.name === 'wait')
+  const ctx = { cwd: os.tmpdir(), sessionId: 'escalation', signal: new AbortController().signal, timeoutMs: 5000 }
+
+  resetWaitEscalation('escalation')
+
+  // Asking for the maximum on the first wait is capped hard, and says so.
+  const started = Date.now()
+  const first = await wait.run({ seconds: 60 }, ctx)
+  const elapsed = Date.now() - started
+  check('a 60s first wait is capped to 5s', elapsed >= 4500 && elapsed < 8000, `${elapsed}ms`)
+  check('and explains that it was capped', /cap at this point/.test(first), first)
+  check('and names the next ceiling', /up to 10s/.test(first), first)
+
+  // The ceiling climbs while it is still waiting.
+  resetWaitEscalation('ceilings')
+  const ceilings = []
+  for (let i = 0; i < 4; i++) {
+    const out = await wait.run({ seconds: 1 }, { ...ctx, sessionId: 'ceilings' })
+    ceilings.push(out.match(/up to (\d+)s/)?.[1])
+  }
+  check('the ceiling doubles across consecutive waits', ceilings.join(',') === '10,20,40,60', ceilings.join(','))
+
+  // Doing anything else means it is no longer holding, so the ceiling drops back.
+  resetWaitEscalation('ceilings')
+  const afterReset = await wait.run({ seconds: 1 }, { ...ctx, sessionId: 'ceilings' })
+  check('and resets once the agent does something else', /up to 10s/.test(afterReset), afterReset)
+
+  // A short wait under the ceiling is honoured exactly, with no complaint.
+  resetWaitEscalation('honest')
+  const short = await wait.run({ seconds: 2 }, { ...ctx, sessionId: 'honest' })
+  check('a sensible short wait is honoured as asked', /Waited 2s/.test(short) && !/cap at this point/.test(short), short)
+
+  // Stop must not have to sit through it.
+  const aborter = new AbortController()
+  resetWaitEscalation('abort')
+  setTimeout(() => aborter.abort(), 100)
+  const abortStart = Date.now()
+  await wait.run({ seconds: 5 }, { ...ctx, sessionId: 'abort', signal: aborter.signal })
+  check('an aborted wait returns immediately', Date.now() - abortStart < 1500, `${Date.now() - abortStart}ms`)
+}
+
 // ---------------------------------------------------------------- settings bounds
 
 /*

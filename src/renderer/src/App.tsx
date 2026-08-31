@@ -12,6 +12,7 @@ import RemoteView from './views/Remote'
 import Settings from './views/Settings'
 import Icon, { type IconName } from './components/Icon'
 import PermissionPrompt from './components/PermissionPrompt'
+import QuestionPrompt from './components/QuestionPrompt'
 import Toasts from './components/Toasts'
 
 export type View =
@@ -176,6 +177,7 @@ export default function App(): JSX.Element {
       </main>
 
       <PermissionPrompt />
+      <QuestionPrompt />
       <Toasts />
     </div>
   )

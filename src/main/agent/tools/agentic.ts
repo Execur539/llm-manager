@@ -14,6 +14,8 @@ import { all, run } from '../../storage/db'
 export interface AgentToolDeps {
   spawnSubAgent: (prompt: string, cwd?: string) => Promise<string>
   canSpawn: () => boolean
+  /** Put a question to the user and block until they answer. */
+  askUser: (question: string, options: string[]) => Promise<string>
 }
 
 interface TaskRow {
@@ -164,5 +166,40 @@ export function makeAgentTools(deps: AgentToolDeps): Tool[] {
     }
   }
 
-  return [delegate, addTask, completeTask, listTasks, remember, recall, forget]
+  /**
+   * Ask the user something, mid-turn.
+   *
+   * Read tier: asking changes nothing. The turn blocks on the answer, which is the whole value —
+   * an agent that hits a genuine ambiguity previously had to either guess and possibly do the
+   * wrong work, or stop and raise it in its final reply, which ends the turn and loses all its
+   * context. Deliberately narrow in its description, because a model that asks about everything
+   * is worse than one that asks about nothing.
+   */
+  const ask: Tool = {
+    name: 'ask_user',
+    description:
+      'Ask the user a question and wait for their answer. Use this only when you genuinely cannot ' +
+      'proceed without knowing — a choice between real alternatives, a missing detail only they ' +
+      'have, or an ambiguous instruction where the readings lead to different work. Do not use it ' +
+      'to confirm something you can determine yourself, to ask permission (writes and commands ' +
+      'already prompt), or to narrate progress. Offer options when the choice is between a few ' +
+      'known alternatives; they can always type something else.',
+    tier: 'read',
+    parameters: schema(
+      {
+        question: str('The question, in one or two plain sentences'),
+        options: { type: 'array', items: { type: 'string' }, description: 'Suggested answers, if the choice is between a few' }
+      },
+      ['question']
+    ),
+    async run(args) {
+      const question = String(args.question ?? '').trim()
+      if (!question) throw new Error('A question is required.')
+      const options = ((args.options as string[] | undefined) ?? []).map(String).filter(Boolean).slice(0, 6)
+      const answer = await deps.askUser(question, options)
+      return `The user answered: ${answer}`
+    }
+  }
+
+  return [delegate, addTask, completeTask, listTasks, remember, recall, forget, ask]
 }

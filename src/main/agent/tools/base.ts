@@ -10,7 +10,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import type { ToolDefinition, ToolResult, ToolTier } from '@shared/types'
+import type { Backend, ToolDefinition, ToolResult, ToolTier } from '@shared/types'
+import type { ContentPart } from '../../runtime/llama'
 import { TOOL_OUTPUT_DIR } from '../../storage/paths'
 import { log } from '../../log'
 
@@ -20,13 +21,35 @@ export interface ToolContext {
   /** honoured by long-running tools */
   signal: AbortSignal
   timeoutMs: number
+  /** Which llama.cpp build is in use; the embedding server needs it to start. */
+  backend: Backend
+  /** Whether the loaded model can actually be shown an image. */
+  vision: boolean
   settings: {
     hfToken: string | null
   }
 }
 
+/**
+ * What a tool hands back.
+ *
+ * Text for almost everything. A tool that produces something the model must *look* at rather
+ * than read — a screenshot, an image on disk, the clipboard — returns media parts alongside a
+ * text summary, and the loop feeds those to the model as image content.
+ *
+ * This is why `screenshot` used to be a dead end: it saved a PNG and returned a path, and there
+ * was no way for anything in the tool set to turn that path into something the model could see.
+ * Its own description told the model to "use read_image", a tool that did not exist.
+ */
+export type ToolOutput = string | { text: string; media: ContentPart[] }
+
 export interface Tool extends ToolDefinition {
-  run(args: Record<string, unknown>, ctx: ToolContext): Promise<string>
+  run(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolOutput>
+}
+
+/** Split a tool's return value into the text that goes in the transcript and the parts that do not. */
+export function splitOutput(out: ToolOutput): { text: string; media: ContentPart[] } {
+  return typeof out === 'string' ? { text: out, media: [] } : { text: out.text, media: out.media }
 }
 
 /** Head/tail truncation budget for tool output entering context. */

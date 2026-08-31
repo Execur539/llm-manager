@@ -27,6 +27,8 @@ const EVENT_CHANNELS = [
   'agent:tool-result',
   'agent:sub-tool-call',
   'agent:permission-request',
+  // The agent pausing to ask the user something, as distinct from asking permission.
+  'agent:question',
   'agent:compacted',
   'agent:done',
   'agent:error',

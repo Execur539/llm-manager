@@ -18,6 +18,7 @@ await build({
     db: path.join(ROOT, 'src/main/storage/db.ts'),
     settings: path.join(ROOT, 'src/main/storage/settings.ts'),
     repo: path.join(ROOT, 'src/main/chat/repo.ts'),
+    workflow: path.join(ROOT, 'src/main/agent/tools/workflow.ts'),
     ultra: path.join(ROOT, 'src/main/ultra/index.ts'),
     markdown: path.join(ROOT, 'src/renderer/src/lib/markdown.ts')
   },

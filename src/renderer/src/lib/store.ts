@@ -11,7 +11,7 @@
  */
 
 import { useSyncExternalStore } from 'react'
-import type { AgentMessage, PermissionRequest, ToolCall, ToolResult } from '@shared/types'
+import type { AgentMessage, AgentQuestion, PermissionRequest, ToolCall, ToolResult } from '@shared/types'
 import { on } from './api'
 
 /** One of Ultra's independent attempts, as it appears in the transcript. */
@@ -47,6 +47,8 @@ export interface StreamState {
   notices: Record<string, string | null>
   /** permission prompts are global — only one agent runs at a time */
   permissionQueue: PermissionRequest[]
+  /** clarifying questions the agent is blocked on; same reasoning as the permission queue */
+  questionQueue: AgentQuestion[]
   /** tool calls seen this turn, so a remount can still render them in order */
   toolCalls: Record<string, { call: ToolCall; result?: ToolResult }[]>
   /**
@@ -138,6 +140,7 @@ const state: StreamState = {
   errors: {},
   notices: {},
   permissionQueue: [],
+  questionQueue: [],
   toolCalls: {},
   ultra: {},
   ultraSynthesising: {},
@@ -165,6 +168,7 @@ function emitChange(): void {
     errors: { ...state.errors },
     notices: { ...state.notices },
     permissionQueue: [...state.permissionQueue],
+    questionQueue: [...state.questionQueue],
     toolCalls: { ...state.toolCalls },
     ultra: { ...state.ultra },
     ultraSynthesising: { ...state.ultraSynthesising },
@@ -216,6 +220,12 @@ export function takePending(id: string): AgentMessage[] {
   return messages
 }
 
+export function clearQuestions(): void {
+  if (!state.questionQueue.length) return
+  state.questionQueue = []
+  emitChange()
+}
+
 export function clearFor(id: string): void {
   if (state.selection.chat === id) state.selection.chat = null
   if (state.selection.agent === id) state.selection.agent = null
@@ -236,6 +246,11 @@ export function clearFor(id: string): void {
 
 export function dismissPermission(requestId: string): void {
   state.permissionQueue = state.permissionQueue.filter((r) => r.id !== requestId)
+  emitChange()
+}
+
+export function dismissQuestion(questionId: string): void {
+  state.questionQueue = state.questionQueue.filter((q) => q.id !== questionId)
   emitChange()
 }
 
@@ -543,6 +558,11 @@ function wire(): void {
 
   on<PermissionRequest>('agent:permission-request', (req) => {
     state.permissionQueue = [...state.permissionQueue, req]
+    emitChange()
+  })
+
+  on<AgentQuestion>('agent:question', (q) => {
+    state.questionQueue = [...state.questionQueue, q]
     emitChange()
   })
 }

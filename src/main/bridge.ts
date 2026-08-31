@@ -18,6 +18,7 @@ import type {
   FitResult,
   HardwareSnapshot,
   ModelRecord,
+  AgentQuestion,
   PermissionDecision,
   PermissionRequest,
   AttachmentInfo
@@ -80,6 +81,15 @@ let agent: Agent | null = null
 const pendingPermissions = new Map<string, (d: PermissionDecision) => void>()
 
 /**
+ * Clarifying questions the agent is blocked on.
+ *
+ * Separate from `pendingPermissions` because the two settle differently: an unanswered approval
+ * is safely denied, while an unanswered question has no safe default — the honest resolution is
+ * to tell the model nobody answered so it can proceed on its own judgement.
+ */
+const pendingQuestions = new Map<string, (answer: string) => void>()
+
+/**
  * Chat turns currently streaming, so they can be stopped.
  *
  * Keyed by conversation rather than held as a single controller: the API server and a remote
@@ -112,6 +122,12 @@ function drainPendingPermissions(): void {
   for (const [id, resolve] of pendingPermissions) {
     pendingPermissions.delete(id)
     resolve('deny')
+  }
+  // A question left hanging would block the turn for the life of the process. There is no safe
+  // default answer, so the model is told plainly that none came.
+  for (const [id, resolve] of pendingQuestions) {
+    pendingQuestions.delete(id)
+    resolve('(no answer — the user did not respond; proceed on your own judgement and say what you assumed)')
   }
 }
 
@@ -175,6 +191,11 @@ function getAgent(): Agent {
         new Promise<PermissionDecision>((resolve) => {
           pendingPermissions.set(req.id, resolve)
           emit('agent:permission-request', req)
+        }),
+      askUser: (question: AgentQuestion) =>
+        new Promise<string>((resolve) => {
+          pendingQuestions.set(question.id, resolve)
+          emit('agent:question', question)
         })
     })
 
@@ -215,6 +236,7 @@ function syncAgentOptions(): void {
     hardBlocksDisabled: s.agent.hardBlocksDisabled,
     compaction: s.agent.compaction,
     remoteToolsEnabled: s.agent.remoteToolsEnabled,
+    backend: hardware?.backend,
     hfToken: getHfToken()
   })
 }
@@ -1049,6 +1071,14 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     getAgent().updateOptions({ cwd: dir })
     if (sessionId) chats.setChatCwd(sessionId, dir)
     return dir
+  },
+  'agent:answer': (id: string, answer: string) => {
+    const resolve = pendingQuestions.get(id)
+    if (resolve) {
+      pendingQuestions.delete(id)
+      resolve(String(answer ?? '').trim() || '(the user gave an empty answer)')
+    }
+    return true
   },
   'agent:permission-response': (id: string, decision: PermissionDecision) => {
     const resolve = pendingPermissions.get(id)
