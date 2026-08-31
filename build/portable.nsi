@@ -1,4 +1,4 @@
-; Extract-once portable launcher.
+﻿; Extract-once portable launcher.
 ;
 ; electron-builder's own `portable` target re-extracts the entire payload to TEMP on every
 ; launch and deletes it on exit — measured at ~24s per launch with this app's payload.
