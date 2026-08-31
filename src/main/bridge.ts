@@ -666,7 +666,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         filename: path.basename(file.filename),
         url: file.url,
         dest: path.join(dir, path.basename(file.filename)),
-        bytesTotal: file.bytes
+        bytesTotal: file.bytes,
+        sha256: file.sha256
       })
     ]
 
@@ -679,7 +680,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
           filename: path.basename(mmproj.filename),
           url: mmproj.url,
           dest: path.join(dir, path.basename(mmproj.filename)),
-          bytesTotal: mmproj.bytes
+          bytesTotal: mmproj.bytes,
+          sha256: mmproj.sha256
         })
       )
     }

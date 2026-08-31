@@ -247,6 +247,14 @@ export const MIGRATIONS: { id: number; sql: string }[] = [
     -- it belongs to the turn without pretending to be something the user typed.
     ALTER TABLE messages ADD COLUMN plan TEXT;
     `
+  },
+  {
+    id: 6,
+    sql: `
+    -- HuggingFace publishes a SHA-256 for every LFS file and nothing checked it, so a download
+    -- corrupted in transit was indistinguishable from a good one until a model failed to load.
+    ALTER TABLE downloads ADD COLUMN sha256 TEXT;
+    `
   }
 ]
 

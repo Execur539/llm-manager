@@ -16,7 +16,15 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { all, get, run } from '../storage/db'
 
-export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'done' | 'failed' | 'cancelled'
+export type DownloadStatus =
+  | 'queued'
+  | 'downloading'
+  /** Hashing a completed file against the checksum HuggingFace published for it. */
+  | 'verifying'
+  | 'paused'
+  | 'done'
+  | 'failed'
+  | 'cancelled'
 
 export interface DownloadItem {
   id: string
@@ -30,6 +38,8 @@ export interface DownloadItem {
   error: string | null
   /** bytes per second over the last sample window */
   speed: number
+  /** Expected SHA-256, when the source published one. */
+  sha256: string | null
 }
 
 interface Row {
@@ -42,6 +52,7 @@ interface Row {
   bytes_done: number
   status: string
   error: string | null
+  sha256: string | null
 }
 
 const toItem = (r: Row): DownloadItem => ({
@@ -54,7 +65,8 @@ const toItem = (r: Row): DownloadItem => ({
   bytesDone: r.bytes_done,
   status: r.status as DownloadStatus,
   error: r.error,
-  speed: 0
+  speed: 0,
+  sha256: r.sha256
 })
 
 /** How many files transfer at once. More than a couple just splits the same bandwidth. */
@@ -132,11 +144,18 @@ class DownloadQueue extends EventEmitter {
     }))
   }
 
-  enqueue(opts: { repo: string | null; filename: string; url: string; dest: string; bytesTotal: number }): DownloadItem {
+  enqueue(opts: {
+    repo: string | null
+    filename: string
+    url: string
+    dest: string
+    bytesTotal: number
+    sha256?: string | null
+  }): DownloadItem {
     const id = crypto.randomBytes(6).toString('hex')
     const now = Date.now()
     run(
-      'INSERT INTO downloads (id, repo, filename, url, dest, bytes_total, bytes_done, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)',
+      'INSERT INTO downloads (id, repo, filename, url, dest, bytes_total, bytes_done, status, sha256, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)',
       id,
       opts.repo,
       opts.filename,
@@ -144,6 +163,7 @@ class DownloadQueue extends EventEmitter {
       opts.dest,
       opts.bytesTotal,
       'queued',
+      opts.sha256 ?? null,
       now,
       now
     )
@@ -159,7 +179,8 @@ class DownloadQueue extends EventEmitter {
       bytesDone: 0,
       status: 'queued',
       error: null,
-      speed: 0
+      speed: 0,
+      sha256: opts.sha256 ?? null
     }
   }
 
@@ -276,6 +297,9 @@ class DownloadQueue extends EventEmitter {
       const plan = await this.planTransfer(item, partial, partsFile, headers, controller.signal)
 
       if (plan.alreadyComplete) {
+        // A resume that finds everything already on disk still has to be checked — this is the
+        // path a download interrupted during verification comes back through.
+        await this.verify(item, partial, controller.signal)
         await this.finalise(item, partial, partsFile)
         return { settled: true, error: '' }
       }
@@ -300,6 +324,10 @@ class DownloadQueue extends EventEmitter {
         throw new Error(`stopped at ${done} of ${plan.total} bytes`)
       }
 
+      // Checked before it takes the model's real name, so a corrupt file never appears in the
+      // library looking like a good one.
+      await this.verify(item, partial, controller.signal)
+
       await this.finalise(item, partial, partsFile)
       return { settled: true, error: '' }
     } catch (err) {
@@ -316,6 +344,15 @@ class DownloadQueue extends EventEmitter {
 
       // A refusal will be refused again. Only conditions that might pass on a second look are
       // worth retrying; anything else parks immediately so the user sees the real reason.
+      if (/Checksum mismatch/.test(message)) {
+        // Worth exactly one clean re-download, not five: if the source is serving bad bytes,
+        // hammering it will not change that, and the user should be told rather than left
+        // watching the same twenty gigabytes arrive repeatedly.
+        this.setStatus(item.id, 'failed', message)
+        void this.pump()
+        return { settled: true, error: message }
+      }
+
       if (/HTTP (4[0-9]{2})/.test(message) && !/HTTP (408|425|429)/.test(message)) {
         this.setStatus(item.id, 'failed', message)
         void this.pump()
@@ -522,6 +559,59 @@ class DownloadQueue extends EventEmitter {
     return done
   }
 
+  /**
+   * Hash the finished file against the checksum the source published for it.
+   *
+   * The length check catches a transfer that stopped early. It cannot catch one that arrived
+   * complete and wrong — a flipped bit from a bad cable, a proxy that mangled a range, a part
+   * written at the wrong offset. A twenty-gigabyte model with one bad byte looks entirely normal
+   * until llama.cpp refuses to load it, days later, with an error about the file rather than
+   * about the download.
+   *
+   * Reads at the speed of the disk, so a minute or so for a large model — worth it once, against
+   * downloading it twice.
+   */
+  private async verify(item: DownloadItem, file: string, signal: AbortSignal): Promise<void> {
+    if (!item.sha256) return
+
+    this.setStatus(item.id, 'verifying')
+    const hash = crypto.createHash('sha256')
+    const stream = fs.createReadStream(file, { highWaterMark: WRITE_CHUNK })
+
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        stream.destroy(new Error('cancelled'))
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      stream.on('data', (chunk) => hash.update(chunk))
+      stream.on('error', (err) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(err)
+      })
+      stream.on('end', () => {
+        signal.removeEventListener('abort', onAbort)
+        resolve()
+      })
+    })
+
+    const actual = hash.digest('hex')
+    if (actual === item.sha256) return
+
+    /*
+     * A mismatch is not resumable.
+     *
+     * Resuming appends to what is there, and what is there is wrong somewhere unknown — so the
+     * next attempt would download the remainder, hash the same corrupt bytes and fail again,
+     * forever. The partial goes, and the next attempt starts clean.
+     */
+    await fsp.rm(file, { force: true }).catch(() => undefined)
+    throw new Error(
+      `Checksum mismatch — the file downloaded completely but its contents are wrong ` +
+        `(expected ${item.sha256.slice(0, 12)}…, got ${actual.slice(0, 12)}…). ` +
+        `The corrupt file was discarded; downloading again will start fresh.`
+    )
+  }
+
   private async finalise(item: DownloadItem, partial: string, partsFile?: string): Promise<void> {
     await fsp.rename(partial, item.dest)
     // The resume record only describes a transfer in progress; a finished file must not leave
@@ -536,7 +626,9 @@ class DownloadQueue extends EventEmitter {
 
   /** On launch, mark anything that was mid-flight as paused so it can be resumed deliberately. */
   recoverOnStart(): void {
-    run("UPDATE downloads SET status = 'paused' WHERE status = 'downloading'")
+    // A download interrupted while verifying has all its bytes; resuming goes straight back to
+    // the hash rather than fetching anything again.
+    run("UPDATE downloads SET status = 'paused' WHERE status IN ('downloading', 'verifying')")
   }
 
   /** Delete orphaned .partial files with no matching queue entry. */

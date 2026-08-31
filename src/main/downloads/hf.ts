@@ -30,6 +30,13 @@ export interface HfModelSummary {
 export interface HfFile {
   filename: string
   bytes: number
+  /**
+   * SHA-256 of the file contents, when HuggingFace publishes one.
+   *
+   * From `lfs.oid`, not the sibling `oid` — that one is the git blob SHA-1 and would never match.
+   * Absent for anything not stored in LFS, which in practice means anything that is not a model.
+   */
+  sha256: string | null
   /** parsed from the filename, e.g. "Q4_K_M" */
   quant: string | null
   url: string
@@ -113,7 +120,12 @@ export async function listFiles(repo: string, token: string | null): Promise<HfF
   }
   if (!res.ok) throw new Error(`Could not list ${repo}: HTTP ${res.status}`)
 
-  const tree = (await res.json()) as { path: string; size?: number; type: string; lfs?: { size: number } }[]
+  const tree = (await res.json()) as {
+    path: string
+    size?: number
+    type: string
+    lfs?: { size: number; oid?: string }
+  }[]
 
   return tree
     .filter((f) => f.type === 'file' && f.path.toLowerCase().endsWith('.gguf'))
@@ -121,9 +133,15 @@ export async function listFiles(repo: string, token: string | null): Promise<HfF
       const filename = f.path
       const base = filename.split('/').pop() ?? filename
       const shardMatch = base.match(/-(\d{5})-of-(\d{5})\.gguf$/i)
+      // Checked for shape rather than trusted: a checksum that is not one would fail every
+      // download with a mismatch, which is a worse outcome than not verifying at all.
+      const oid = f.lfs?.oid
+      const sha256 = typeof oid === 'string' && /^[0-9a-f]{64}$/i.test(oid) ? oid.toLowerCase() : null
+
       return {
         filename,
         bytes: f.lfs?.size ?? f.size ?? 0,
+        sha256,
         quant: base.match(QUANT_RE)?.[0]?.toUpperCase() ?? null,
         url: `${HF_BASE}/${repo}/resolve/main/${encodeURI(filename)}`,
         isMmproj: /mmproj/i.test(base),

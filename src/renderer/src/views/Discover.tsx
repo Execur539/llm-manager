@@ -130,7 +130,9 @@ export default function Discover({ onDownloaded }: { onDownloaded: () => Promise
     }
   }
 
-  const active = downloads.filter((d) => ['queued', 'downloading', 'paused'].includes(d.status))
+  // 'verifying' belongs here too: the bytes have arrived but the download is not finished, and
+  // dropping the row off the list mid-hash looks like it silently vanished.
+  const active = downloads.filter((d) => ['queued', 'downloading', 'verifying', 'paused'].includes(d.status))
   const shownFiles = showAll ? files : files.filter((f) => !f.isMmproj && (!f.shard || f.shard.index === 1))
 
   return (

@@ -1063,6 +1063,53 @@ section('Downloads: parallel parts, byte-exact and resumable')
   check('and is not split across connections', rangeRequests === 0, `${rangeRequests} range requests`)
   smallServer.close()
 
+  /*
+   * A checksum turns "arrived complete" into "arrived correct".
+   *
+   * The length check catches a transfer that stopped early. It cannot catch one that arrived
+   * whole and wrong — a flipped bit, a mangled range, a part written at the wrong offset. That
+   * file looks entirely normal until llama.cpp refuses it days later, complaining about the file
+   * rather than the download.
+   */
+  downloadQueue.setConnections(4)
+  const destE = path.join(dir, 'e.gguf')
+  const e = downloadQueue.enqueue({
+    repo: null,
+    filename: 'e.gguf',
+    url: `${base}/e`,
+    dest: destE,
+    bytesTotal: TOTAL,
+    sha256: EXPECTED
+  })
+  const rowE = await finished(e.id)
+  check('a download matching its checksum completes', rowE.status === 'done', `${rowE.status} ${rowE.error ?? ''}`)
+  check('and lands in the library', fs.existsSync(destE) && sha(destE) === EXPECTED)
+
+  // The same bytes, declared to be something else: complete, correct length, wrong contents.
+  const destF = path.join(dir, 'f.gguf')
+  const wrong = 'f'.repeat(64)
+  const f = downloadQueue.enqueue({
+    repo: null,
+    filename: 'f.gguf',
+    url: `${base}/f`,
+    dest: destF,
+    bytesTotal: TOTAL,
+    sha256: wrong
+  })
+  const rowF = await finished(f.id)
+  check('a corrupt download is caught rather than accepted', rowF.status === 'failed', rowF.status)
+  check('and says what was wrong', /Checksum mismatch/.test(rowF.error ?? ''), rowF.error ?? '')
+  check('and never appears in the library', !fs.existsSync(destF))
+  check('and the corrupt partial is discarded, not left to resume',
+    !fs.existsSync(path.join(dir, '.partial', 'f.gguf.part')))
+
+  // A source with no published checksum must still work; most files are not LFS.
+  const destG = path.join(dir, 'g.gguf')
+  const g = downloadQueue.enqueue({ repo: null, filename: 'g.gguf', url: `${base}/g`, dest: destG, bytesTotal: TOTAL })
+  const rowG = await finished(g.id)
+  check('a download without a checksum is not blocked', rowG.status === 'done', `${rowG.status} ${rowG.error ?? ''}`)
+  check('and still arrives intact', fs.existsSync(destG) && sha(destG) === EXPECTED)
+
   server.close()
   fs.rmSync(dir, { recursive: true, force: true })
   downloadQueue.setConnections(4)
