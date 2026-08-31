@@ -20,7 +20,8 @@ import { fileURLToPath } from 'node:url'
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
 const VERSION = pkg.version
-const EXE = path.join(ROOT, 'release', `LLM-Manager-${VERSION}-portable.exe`)
+// Unversioned, matching make-portable.mjs — see the comment on OUTFILE there for why.
+const EXE = path.join(ROOT, 'release', 'LLM-Manager-portable.exe')
 const RUNTIME = path.join(process.env.LOCALAPPDATA ?? '', 'LLMManager', `runtime-${VERSION}`)
 
 /** A sample across every vendored component, plus the Python stdlib that a filter once ate. */

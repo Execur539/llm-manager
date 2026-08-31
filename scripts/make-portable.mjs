@@ -31,7 +31,20 @@ const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
 
 const VERSION = pkg.version
 const PRODUCT = pkg.build?.productName ?? 'LLM Manager'
-const OUTFILE = path.join(RELEASE, `${PRODUCT.replace(/\s+/g, '-')}-${VERSION}-portable.exe`)
+/*
+ * Deliberately not versioned.
+ *
+ * The in-app updater overwrites the running exe at its own path, so it never renames anything —
+ * but someone who updates by downloading from the releases page instead gets a *second* file
+ * beside the first. Their desktop and taskbar shortcuts still point at the old exe, which still
+ * launches the old version, and nothing about that looks wrong: the app opens, it just is not
+ * the one they downloaded.
+ *
+ * A stable name makes the manual path behave like the automatic one — the download replaces the
+ * file the shortcuts already point at. The version is still recoverable from the exe's Properties
+ * tab, from Settings, and from the release it was downloaded from.
+ */
+const OUTFILE = path.join(RELEASE, `${PRODUCT.replace(/\s+/g, '-')}-portable.exe`)
 const ICON = path.join(ROOT, 'build', 'icon.ico')
 /*
  * NSIS's VIProductVersion demands exactly four numeric parts.
