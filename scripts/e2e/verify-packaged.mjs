@@ -49,7 +49,10 @@ const app = await electron.launch({
     ...process.env,
     LLMM_APPDATA_DIR: path.join(appData, 'LLMManager'),
     LLMM_MODELS_DIR: modelsDir,
-    LLMM_PORTABLE_DIR: base
+    LLMM_PORTABLE_DIR: base,
+    // This runs in the middle of a build, on a machine somebody is working at. The window still
+    // has to open — it is what is being verified — but it does not have to seize the keyboard.
+    LLMM_E2E: '1'
   },
   timeout: 90000
 })
