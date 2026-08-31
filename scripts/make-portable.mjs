@@ -41,6 +41,7 @@ const ICON = path.join(ROOT, 'build', 'icon.ico')
  * string handling is possible, rather than in the script, where it is not.
  */
 const VERSION4 = [...VERSION.split('-')[0].split('.'), '0', '0', '0', '0'].slice(0, 4).join('.')
+const COPYRIGHT = `Copyright © ${new Date().getFullYear()} ${pkg.author || PRODUCT}`
 
 /**
  * The payload ships as two archives.
@@ -299,6 +300,7 @@ async function main() {
       '/V2',
       `/DVERSION=${VERSION}`,
       `/DVERSION4=${VERSION4}`,
+      `/DCOPYRIGHT=${COPYRIGHT}`,
       `/DAPP_ARCHIVE=${APP_ARCHIVE}`,
       `/DVENDOR_ARCHIVE=${VENDOR_ARCHIVE}`,
       `/DEXTRACTOR=${sevenZip}`,

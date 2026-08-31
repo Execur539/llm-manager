@@ -114,8 +114,7 @@ streaming, tool-call accumulation, prediction verification, and unload.
 payload        1.9 GB unpacked (vendor/.cache excluded — it held the archives the
                vendor files were extracted from, nearly doubling the exe)
 compressed     0.86 GB, 45% of payload
-first run      51.1s  (extracts to %LOCALAPPDATA%\LLMManager
-untime-0.1.0, marker written)
+first run      51.1s  (extracts to %LOCALAPPDATA%\LLMManager\runtime-0.1.0, marker written)
 second run      1.9s
 third run       1.9s   -> 27x speedup, extraction genuinely skipped
 on exit        runtime dir survives (electron-builder's portable target deletes it)
@@ -134,9 +133,7 @@ added so this cannot hide again: the resolved root is logged on every launch, an
 Verified from the portable exe's own log:
 
 ```
-[vendor] root=...
-untime-0.1.0
-esourcesendor exists=true
+[vendor] root=...\runtime-0.1.0\resources\vendor exists=true
          present: llama.cpp, ffmpeg, python, cloudflared, rg, chromium, models
          missing: []
 ```
@@ -144,8 +141,7 @@ esourcesendor exists=true
 **A data-loss bug found by actually running the portable build.** `exeDir()` returned
 `path.dirname(app.getPath('exe'))`, which for a portable build is the *extraction cache*, not the
 folder holding the exe the user launched. So "models live beside the exe" resolved to
-`%LOCALAPPDATA%\LLMManager
-untime-0.1.0\LLMManagerModels`, and the relocation feature
+`%LOCALAPPDATA%\LLMManager\runtime-0.1.0\LLMManagerModels`, and the relocation feature
 faithfully moved an 18 GB library into it — filling the C: drive to 99%. Worse, the launcher's
 upgrade cleanup deletes old `runtime-*` directories, so the next version bump would have taken
 the models with it.

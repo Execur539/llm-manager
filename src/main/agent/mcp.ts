@@ -17,6 +17,7 @@ import { spawn, ChildProcess } from 'node:child_process'
 import crypto from 'node:crypto'
 import type { ToolDefinition, ToolTier } from '@shared/types'
 import type { Tool, ToolContext } from './tools/base'
+import { app } from 'electron'
 import { all, run } from '../storage/db'
 
 const PROTOCOL_VERSION = '2025-06-18'
@@ -69,7 +70,9 @@ class McpConnection {
       await this.request('initialize', {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: {},
-        clientInfo: { name: 'LLM Manager', version: '0.1.0' }
+        // Read rather than written down: the literal here said 0.1.0 and would have kept saying
+        // it, telling every MCP server the wrong thing about who it was talking to.
+        clientInfo: { name: 'LLM Manager', version: app.getVersion() }
       })
       await this.notify('notifications/initialized', {})
 

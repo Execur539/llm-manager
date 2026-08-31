@@ -1,9 +1,9 @@
 {
   "name": "llm-manager",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "LLM Manager",
   "main": "./out/main/index.js",
-  "author": "",
+  "author": "Aidan Stafford",
   "license": "UNLICENSED",
   "private": true,
   "scripts": {

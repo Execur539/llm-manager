@@ -64,6 +64,9 @@ SetCompressorDictSize 8
 !ifndef VERSION4
   !define VERSION4 "0.0.0.0"
 !endif
+!ifndef COPYRIGHT
+  !define COPYRIGHT "LLM Manager"
+!endif
 
 Name "LLM Manager ${VERSION}"
 OutFile "${OUTFILE}"
@@ -84,7 +87,10 @@ VIAddVersionKey "ProductName" "LLM Manager"
 VIAddVersionKey "FileDescription" "LLM Manager"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
-VIAddVersionKey "LegalCopyright" "LLM Manager"
+VIAddVersionKey "CompanyName" "Aidan Stafford"
+; Worded as electron-builder words it for the inner exe, so the two halves of the same product
+; do not disagree in their Properties tab. Passed in because NSIS cannot read the clock.
+VIAddVersionKey "LegalCopyright" "${COPYRIGHT}"
 
 Var RuntimeDir
 Var Marker
