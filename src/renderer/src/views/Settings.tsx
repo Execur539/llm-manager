@@ -25,7 +25,7 @@ export default function Settings(): JSX.Element {
   const [mcp, setMcp] = useState<McpStatus[]>([])
   const [memory, setMemory] = useState<MemoryEntry[]>([])
   const [hfToken, setHfToken] = useState('')
-  const [update, setUpdate] = useState<{ available: boolean; latestVersion: string | null; notes: string | null; downloadUrl: string | null; error?: string } | null>(null)
+  const [update, setUpdate] = useState<{ available: boolean; latestVersion: string | null; notes: string | null; downloadUrl: string | null; error?: string; previousFailure?: string } | null>(null)
   const [version, setVersion] = useState('')
   const [info, setInfo] = useState<string | null>(null)
   const [confirmHardBlocks, setConfirmHardBlocks] = useState(false)
@@ -336,6 +336,24 @@ export default function Settings(): JSX.Element {
             Copy diagnostics
           </button>
         </div>
+
+        {/*
+          * Shown above the offer, not folded into `error`.
+          *
+          * `error` describes this check and is only rendered when nothing is available. A swap
+          * that failed last time needs saying precisely when an update *is* on offer, because
+          * that offer looks identical to the one that already failed once — and without this the
+          * app would simply be repeating a claim it did not honour.
+          */}
+        {update?.previousFailure && (
+          <div className="card" style={{ marginTop: 12, borderColor: '#5c2626' }}>
+            <div className="card-title">
+              The last update did not finish
+              <span className="badge bad">not applied</span>
+            </div>
+            <div className="dim">{update.previousFailure}</div>
+          </div>
+        )}
 
         {update?.available && (
           <div className="card" style={{ marginTop: 12, borderColor: 'var(--accent-dim)' }}>
