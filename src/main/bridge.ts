@@ -423,6 +423,9 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const next = patchSettings(patch)
     // Apply straight away so the agent never operates under superseded settings.
     syncAgentOptions()
+    // Takes effect on the next file rather than mid-transfer, which is the only sane moment to
+    // change how many connections a download is using.
+    downloadQueue.setConnections(next.downloads.connections)
     return next
   },
   'settings:set-password': (password: string) => {

@@ -375,6 +375,14 @@ export interface AppSettings {
     /** Give up forcing after this many continuations, however short the thinking still is. */
     maxContinuations: number
   }
+  downloads: {
+    /**
+     * Connections used per file. One is the classic single stream; more splits the file into
+     * ranges fetched at once, which helps only when a single connection is not already saturating
+     * the line.
+     */
+    connections: number
+  }
   server: {
     enabled: boolean
     port: number

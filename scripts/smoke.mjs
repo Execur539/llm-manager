@@ -944,6 +944,130 @@ process.env.LLMM_APPDATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-tes
   db.close()
 }
 
+// ---------------------------------------------------------------- downloads
+
+/*
+ * Models are tens of gigabytes, so the download path has two properties worth guarding: the
+ * bytes must be exactly right, and an interruption must not cost the whole transfer.
+ *
+ * The correctness half matters more than the speed half. A parallel download that writes one
+ * part at the wrong offset produces a corrupt file that passes every length check and only fails
+ * much later, when something tries to load it — by which time the download is long forgotten.
+ * Run against a local server so ranges, failures and comparisons are all exact.
+ */
+section('Downloads: parallel parts, byte-exact and resumable')
+{
+  const http = await import('node:http')
+  const crypto = await import('node:crypto')
+  const { downloadQueue } = await import('./built/queue.js')
+
+  // Above MIN_PART_BYTES * 2, so the planner actually splits it. A smaller file is checked
+  // separately below, because declining to split a small file is deliberate behaviour.
+  const TOTAL = 24 * 1024 * 1024
+  const BODY = Buffer.alloc(TOTAL)
+  // Structured rather than random, so a misplaced part is a mismatch instead of noise.
+  for (let i = 0; i < TOTAL; i += 4) BODY.writeUInt32BE(i, i)
+  const EXPECTED = crypto.createHash('sha256').update(BODY).digest('hex')
+
+  let dropNext = false
+  let rangeRequests = 0
+
+  const server = http.createServer((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': String(TOTAL), 'accept-ranges': 'bytes' })
+      return res.end()
+    }
+    const m = /bytes=(\d+)-(\d*)/.exec(req.headers.range ?? '')
+    if (m) rangeRequests++
+    const start = m ? Number(m[1]) : 0
+    const end = m && m[2] ? Number(m[2]) : TOTAL - 1
+    const slice = BODY.subarray(start, end + 1)
+    res.writeHead(m ? 206 : 200, {
+      'content-length': String(slice.length),
+      'accept-ranges': 'bytes',
+      ...(m ? { 'content-range': `bytes ${start}-${end}/${TOTAL}` } : {})
+    })
+    if (dropNext) {
+      dropNext = false
+      res.write(slice.subarray(0, Math.floor(slice.length / 3)))
+      return res.destroy()
+    }
+    res.end(slice)
+  })
+
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  const base = `http://127.0.0.1:${server.address().port}`
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-dl-'))
+
+  const finished = (id) =>
+    new Promise((resolve) => {
+      const tick = () => {
+        const row = downloadQueue.list().find((d) => d.id === id)
+        if (row && (row.status === 'done' || row.status === 'failed' || row.status === 'cancelled')) resolve(row)
+        else setTimeout(tick, 50)
+      }
+      tick()
+    })
+
+  const sha = (f) => crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex')
+
+  // ---- several connections, clean run
+  downloadQueue.setConnections(4)
+  const destA = path.join(dir, 'a.gguf')
+  const a = downloadQueue.enqueue({ repo: null, filename: 'a.gguf', url: `${base}/a`, dest: destA, bytesTotal: TOTAL })
+  const rowA = await finished(a.id)
+  check('a parallel download completes', rowA.status === 'done', `${rowA.status} ${rowA.error ?? ''}`)
+  check('and the file is byte-identical', fs.existsSync(destA) && sha(destA) === EXPECTED)
+  check('and it really did split into ranges', rangeRequests > 1, `${rangeRequests} range requests`)
+  check('and no resume sidecar is left behind', !fs.existsSync(`${destA}.parts`) &&
+    !fs.existsSync(path.join(dir, '.partial', 'a.gguf.part.parts')))
+
+  // ---- a dropped connection must be retried automatically, not parked as failed
+  dropNext = true
+  const destB = path.join(dir, 'b.gguf')
+  const b = downloadQueue.enqueue({ repo: null, filename: 'b.gguf', url: `${base}/b`, dest: destB, bytesTotal: TOTAL })
+  const rowB = await finished(b.id)
+  check('a dropped connection recovers without the user intervening', rowB.status === 'done', `${rowB.status} ${rowB.error ?? ''}`)
+  check('and still produces the right bytes', fs.existsSync(destB) && sha(destB) === EXPECTED)
+
+  // ---- one connection, the fallback path for servers without ranges
+  downloadQueue.setConnections(1)
+  const destC = path.join(dir, 'c.gguf')
+  const c = downloadQueue.enqueue({ repo: null, filename: 'c.gguf', url: `${base}/c`, dest: destC, bytesTotal: TOTAL })
+  const rowC = await finished(c.id)
+  check('a single-connection download still works', rowC.status === 'done', `${rowC.status} ${rowC.error ?? ''}`)
+  check('and matches too', fs.existsSync(destC) && sha(destC) === EXPECTED)
+
+  /*
+   * A file too small to be worth splitting must quietly use one connection. Eight requests,
+   * eight TLS handshakes and eight slow-starts to move a couple of megabytes each is slower than
+   * simply asking once.
+   */
+  downloadQueue.setConnections(8)
+  rangeRequests = 0
+  const smallServer = http.createServer((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'content-length': '1048576', 'accept-ranges': 'bytes' })
+      return res.end()
+    }
+    if (req.headers.range) rangeRequests++
+    res.writeHead(200, { 'content-length': '1048576', 'accept-ranges': 'bytes' })
+    res.end(Buffer.alloc(1024 * 1024))
+  })
+  await new Promise((r) => smallServer.listen(0, '127.0.0.1', r))
+  const smallBase = `http://127.0.0.1:${smallServer.address().port}`
+  const destD = path.join(dir, 'd.gguf')
+  const d = downloadQueue.enqueue({ repo: null, filename: 'd.gguf', url: `${smallBase}/d`, dest: destD, bytesTotal: 1024 * 1024 })
+  const rowD = await finished(d.id)
+  check('a small file completes', rowD.status === 'done', `${rowD.status} ${rowD.error ?? ''}`)
+  check('and is not split across connections', rangeRequests === 0, `${rangeRequests} range requests`)
+  smallServer.close()
+
+  server.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+  downloadQueue.setConnections(4)
+}
+
 // ---------------------------------------------------------------- new agent tools
 
 section('multi_edit: all of them, or none')

@@ -253,6 +253,7 @@ app.whenReady().then(async () => {
   createTray()
 
   downloadQueue.setToken(getHfToken())
+  downloadQueue.setConnections(loadSettings().downloads.connections)
   downloadQueue.recoverOnStart()
   // Sweep .partial files with no queue entry behind them. recoverOnStart has just marked
   // everything resumable as paused, so whatever is left is unreachable garbage — a cancelled

@@ -35,6 +35,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
     thinkingFactor: 2.5,
     maxContinuations: 4
   },
+  downloads: {
+    connections: 4
+  },
   server: {
     enabled: false,
     port: 1234,
@@ -84,7 +87,8 @@ const NUMERIC_BOUNDS: { path: [keyof AppSettings, string]; min: number; max: num
   { path: ['agent', 'commandTimeoutMs'], min: 1000, max: 3_600_000 },
   { path: ['ultra', 'samples'], min: 1, max: 8 },
   { path: ['ultra', 'maxContinuations'], min: 0, max: 20 },
-  { path: ['server', 'port'], min: 1, max: 65_535 }
+  { path: ['server', 'port'], min: 1, max: 65_535 },
+  { path: ['downloads', 'connections'], min: 1, max: 16 }
 ]
 
 function clampNumerics(settings: AppSettings): AppSettings {
