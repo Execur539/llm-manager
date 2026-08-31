@@ -329,6 +329,14 @@ export interface AgentSessionState {
   taskList: { id: string; text: string; done: boolean }[]
   createdAt: number
   updatedAt: number
+  /**
+   * Context tokens this conversation was last measured to occupy, if it has ever run a turn.
+   *
+   * Restores the reading when a conversation is reopened, so it is not blank until the next
+   * message. Counted by whichever model was loaded at the time, so it is approximate under a
+   * different one until that model reports for itself.
+   */
+  contextUsed?: number
 }
 
 // ---------------------------------------------------------------- settings

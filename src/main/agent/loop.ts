@@ -411,6 +411,7 @@ Platform: Windows (PowerShell)${memoryBlock}`
     if (!older.length) return
 
     if (this.opts.compaction === 'sliding-window') {
+      this.emit('compacting', { strategy: 'sliding-window', automatic: true })
       while (total > budget && this.history.length > keepRecent + 1) {
         const dropped = this.history.splice(1, 1)[0]
         total -= cost(dropped)
@@ -423,6 +424,16 @@ Platform: Windows (PowerShell)${memoryBlock}`
       .map((m) => `${m.role}: ${typeof m.content === 'string' ? m.content : '[structured]'}`)
       .join('\n')
       .slice(-40000)
+
+    /*
+     * Announced before the summarising call, not after it.
+     *
+     * Auto-compaction is a whole model call over the older half of the session — on a long one
+     * that is many seconds during which the app looked as though it had stopped mid-turn, with
+     * nothing to say that work was happening or that it would end. The turn cannot proceed until
+     * it finishes, so the interface needs to know it has started, not merely that it happened.
+     */
+    this.emit('compacting', { strategy: 'auto-compact', automatic: true })
 
     let summary = ''
     try {
@@ -470,19 +481,32 @@ Platform: Windows (PowerShell)${memoryBlock}`
         .map((m) => `${m.role}: ${typeof m.content === 'string' ? m.content : '[structured]'}`)
         .join('\n')
         .slice(-40000)
-      const summary = await llama
-        .complete({
-          messages: [
-            { role: 'system', content: 'Summarise this agent transcript densely and factually. No preamble.' },
-            { role: 'user', content: transcript }
-          ],
-          temperature: 0.2,
-          maxTokens: 1024,
-          signal: this.abort?.signal
-        })
-        .catch(() => '(compaction failed)')
-      this.history = [system, { role: 'user', content: `[Summary of earlier work]\n${summary}` }, ...recent]
-      this.emit('compacted', { strategy: 'manual', summary })
+
+      this.emit('compacting', { strategy: 'manual', automatic: false })
+      let summary = ''
+      try {
+        summary = await llama
+          .complete({
+            messages: [
+              { role: 'system', content: 'Summarise this agent transcript densely and factually. No preamble.' },
+              { role: 'user', content: transcript }
+            ],
+            temperature: 0.2,
+            maxTokens: 1024,
+            signal: this.abort?.signal
+          })
+          .catch(() => '(compaction failed)')
+        this.history = [system, { role: 'user', content: `[Summary of earlier work]\n${summary}` }, ...recent]
+      } finally {
+        /*
+         * Emitted exactly once, and from `finally` because it is what releases the interface.
+         *
+         * `compacted` is the signal that clears the in-progress state and re-enables sending, so
+         * a path that skips it leaves the app showing a compaction that never ends. The
+         * summarising call swallows its own failures, but an abort mid-turn throws past that.
+         */
+        this.emit('compacted', { strategy: 'manual', summary })
+      }
     }
     this.opts.compaction = saved
   }
@@ -643,6 +667,17 @@ Platform: Windows (PowerShell)${memoryBlock}`
               total: ev.total,
               cached: ev.cached
             })
+          }
+          /*
+           * Reported per step, which is what keeps it honest here.
+           *
+           * An agent turn is many requests, and the prompt grows by the whole of each tool's
+           * output before the next one. Every step re-reads that prompt and reports its size, so
+           * the reading tracks the real cost of the work rather than only changing when the user
+           * says something.
+           */
+          if (ev.type === 'context') {
+            this.emit('contextUsed', { used: ev.used, max: ev.max })
           }
           if (ev.type === 'reasoning') {
             thinking += ev.text

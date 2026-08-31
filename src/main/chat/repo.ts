@@ -34,6 +34,7 @@ interface ChatRow {
   cwd: string | null
   created_at: number
   updated_at: number
+  context_used: number | null
 }
 
 interface MessageRow {
@@ -210,8 +211,21 @@ export function loadSession(chatId: string): AgentSessionState | null {
       chatId
     ).map((t) => ({ id: t.id, text: t.text, done: !!t.done })),
     createdAt: row.created_at,
-    updatedAt: row.updated_at
+    updatedAt: row.updated_at,
+    contextUsed: row.context_used ?? undefined
   }
+}
+
+/**
+ * Remember how much context this conversation was last measured to occupy.
+ *
+ * Written per turn rather than per update: the live figure changes several times a second while
+ * a response streams, and persisting that would be a database write per frame to record a number
+ * that is superseded immediately. What matters across a restart is where the conversation ended
+ * up, not every step it took getting there.
+ */
+export function setContextUsed(chatId: string, tokens: number): void {
+  run('UPDATE chats SET context_used = ? WHERE id = ?', Math.max(0, Math.round(tokens)), chatId)
 }
 
 /** The most recent unfinished agent session, offered for resume on launch. */

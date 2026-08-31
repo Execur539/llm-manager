@@ -255,6 +255,21 @@ export const MIGRATIONS: { id: number; sql: string }[] = [
     -- corrupted in transit was indistinguishable from a good one until a model failed to load.
     ALTER TABLE downloads ADD COLUMN sha256 TEXT;
     `
+  },
+  {
+    id: 7,
+    sql: `
+    -- How much context a conversation was last measured to occupy, as reported by the server.
+    --
+    -- Held so the reading survives a restart. Without it, reopening the app showed nothing at
+    -- all against a conversation until the next turn had begun — the number was known, and
+    -- thrown away every time the process ended.
+    --
+    -- The tokens are the previous model's count. A conversation reopened under a different
+    -- model is approximate until its next turn reports afresh, which is a better answer than
+    -- a blank.
+    ALTER TABLE chats ADD COLUMN context_used INTEGER;
+    `
   }
 ]
 

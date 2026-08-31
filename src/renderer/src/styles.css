@@ -904,6 +904,58 @@ pre {
   max-width: var(--measure);
   margin: 6px auto 0;
   padding-top: 10px;
+  /* Anchors the jump-to-latest button above it — see .jump-latest. */
+  position: relative;
+}
+
+/*
+ * The way back to the bottom of a transcript that is still growing.
+ *
+ * Anchored to the composer rather than to the scroll container, because the composer is the one
+ * element whose top edge is always exactly where the transcript ends, no matter how tall the
+ * textarea has grown or whether an attachment bar is showing.
+ *
+ * Absolutely positioned so appearing and disappearing moves nothing: it never occupies space in
+ * the composer, and the line of text under it does not shift when a response starts arriving.
+ */
+.jump-latest {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 8px;
+  padding: 5px 11px 5px 9px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  box-shadow: var(--shadow-lg);
+  cursor: pointer;
+  opacity: 0;
+  /* Not reachable while hidden; the component drops it out of the tab order to match. */
+  pointer-events: none;
+  transform: translateX(-50%) translateY(5px);
+  transition:
+    opacity 130ms ease,
+    transform 160ms cubic-bezier(0.2, 0, 0.2, 1),
+    background 120ms ease;
+}
+
+.jump-latest.show {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0);
+}
+
+.jump-latest:hover {
+  background: var(--surface-1);
+  border-color: var(--accent-dim);
 }
 
 /*
@@ -2836,6 +2888,85 @@ button.danger.subtle:hover {
   margin: 7px 2px 0;
   font-size: 10.5px;
   color: var(--text-faint);
+}
+
+/*
+ * The banner shown while a session's history is being summarised.
+ *
+ * Sits directly above the composer it is disabling, so the reason the input has gone dead is in
+ * the same glance as the dead input. Amber rather than red: nothing is wrong, the session is
+ * simply making room for itself to continue.
+ */
+.compacting-notice {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 8px;
+  padding: 7px 11px;
+  border-radius: var(--r-md);
+  border: 1px solid #5a4515;
+  background: rgba(232, 184, 75, 0.08);
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+.compacting-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.compacting-elapsed {
+  flex-shrink: 0;
+  color: var(--warn);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * How full the context window is, sat in the composer's meta row.
+ *
+ * Quiet by default and quiet at three quarters, because filling a context window is what using
+ * one looks like — it is not a fault and should not be dressed as one. The colour changes only
+ * where the information becomes actionable: amber where there is still room to finish a thought,
+ * red where the next turn is likely to force a compaction.
+ */
+.context-meter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: default;
+  /* Pinned to the end of the row so it does not shuffle sideways as the hint text changes. */
+  margin-left: auto;
+}
+
+.context-bar {
+  display: block;
+  width: 46px;
+  height: 4px;
+  flex-shrink: 0;
+  border-radius: var(--r-pill);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.context-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--accent-dim);
+  transition: width 300ms ease, background 200ms ease;
+}
+
+.context-meter.filling .context-bar > span {
+  background: var(--warn);
+}
+
+.context-meter.full .context-bar > span {
+  background: var(--bad);
+}
+
+.context-meter.full .context-text {
+  color: var(--bad);
 }
 
 .composer-meta .composer-hint {

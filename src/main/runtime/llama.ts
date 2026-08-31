@@ -131,6 +131,18 @@ export type StreamEvent =
    * zero — that prefix really is already done.
    */
   | { type: 'prompt_progress'; processed: number; total: number; cached: number; percent: number }
+  /**
+   * How much of the context window this conversation is currently occupying.
+   *
+   * Both numbers come from the server rather than being estimated here. The prompt total arrives
+   * with the first progress frame, well before any output, and generated tokens are added to it
+   * as they stream — so the figure is live during a response rather than a number that jumps
+   * once the turn is over.
+   *
+   * Reasoning counts. It occupies the window exactly as answer text does, and on a thinking
+   * model it is frequently the larger half.
+   */
+  | { type: 'context'; used: number; max: number }
 
 export interface Timings {
   ttftMs: number | null
@@ -384,6 +396,20 @@ export class LlamaRuntime extends EventEmitter {
     let completionTokens = 0
     let promptTokens = 0
 
+    /*
+     * Context accounting, kept apart from the timing counters above.
+     *
+     * `generatedTokens` includes reasoning, which `completionTokens` deliberately does not —
+     * that one feeds tokens-per-second and time-to-first-token, where mixing in thinking would
+     * change what those numbers mean. Context does not care why a token exists, only that it is
+     * taking up room.
+     */
+    const maxContext = loaded.plan.contextLength
+    let generatedTokens = 0
+    let contextSentAt = 0
+    /** At most twice a second: often enough to look live, rarely enough not to flood the bridge. */
+    const CONTEXT_INTERVAL_MS = 500
+
     const res = await fetch(`http://127.0.0.1:${loaded.port}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -470,6 +496,16 @@ export class LlamaRuntime extends EventEmitter {
               cached: pp.cache ?? 0,
               percent: Math.round((processed / pp.total) * 100)
             }
+            /*
+             * The prompt total is the context this turn starts from, and it is known here —
+             * before a single token has been generated. Reporting it now means the reading is
+             * right from the beginning of a turn rather than catching up at the end of one.
+             */
+            if (pp.total !== promptTokens) {
+              promptTokens = pp.total
+              contextSentAt = Date.now()
+              yield { type: 'context', used: promptTokens + generatedTokens, max: maxContext }
+            }
           }
 
           const choice = json.choices?.[0]
@@ -479,13 +515,24 @@ export class LlamaRuntime extends EventEmitter {
             // Thinking counts towards time-to-first-token: it is the model working, and a
             // reasoning model can spend a long time here before any answer appears.
             if (ttft === null) ttft = Date.now() - startedAt
+            generatedTokens += estimateTokens(delta.reasoning_content)
             yield { type: 'reasoning', text: delta.reasoning_content }
+            if (Date.now() - contextSentAt >= CONTEXT_INTERVAL_MS) {
+              contextSentAt = Date.now()
+              yield { type: 'context', used: promptTokens + generatedTokens, max: maxContext }
+            }
           }
 
           if (delta?.content) {
             if (ttft === null) ttft = Date.now() - startedAt
-            completionTokens += estimateTokens(delta.content)
+            const n = estimateTokens(delta.content)
+            completionTokens += n
+            generatedTokens += n
             yield { type: 'text', text: delta.content }
+            if (Date.now() - contextSentAt >= CONTEXT_INTERVAL_MS) {
+              contextSentAt = Date.now()
+              yield { type: 'context', used: promptTokens + generatedTokens, max: maxContext }
+            }
           }
 
           if (delta?.tool_calls) {
@@ -501,11 +548,14 @@ export class LlamaRuntime extends EventEmitter {
 
           if (json.usage) {
             promptTokens = json.usage.prompt_tokens ?? promptTokens
+            generatedTokens = json.usage.completion_tokens ?? generatedTokens
             yield {
               type: 'usage',
               promptTokens,
               completionTokens: json.usage.completion_tokens ?? completionTokens
             }
+            contextSentAt = Date.now()
+            yield { type: 'context', used: promptTokens + generatedTokens, max: maxContext }
           }
 
           if (choice?.finish_reason) {

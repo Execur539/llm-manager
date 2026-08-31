@@ -20,7 +20,7 @@ import { apiServer } from './api/server'
 import { remoteWeb } from './remote/web'
 import { llama } from './runtime/llama'
 import { vendorDiagnostics } from './runtime/binaries'
-import { handlers, invokeBridge, setEmitter, setLibrary, shutdown, modelsDir } from './bridge'
+import { handlers, invokeBridge, setEmitter, setLibrary, shutdown, modelsDir, startHardwareRefresh, stopHardwareRefresh } from './bridge'
 import { installCrashHandlers, logger } from './log'
 
 let mainWindow: BrowserWindow | null = null
@@ -69,7 +69,17 @@ function createWindow(): void {
     }
   })
 
-  mainWindow.on('ready-to-show', () => mainWindow?.show())
+  /*
+   * Under test, appear without taking focus.
+   *
+   * The end-to-end suite runs several app instances at once, and `show()` pulls focus to each as
+   * it opens — six windows grabbing the keyboard in turn, off whatever the person at the machine
+   * was actually doing. Playwright drives the page over the debugging protocol rather than
+   * through the OS, so nothing it does needs the window focused.
+   */
+  mainWindow.on('ready-to-show', () =>
+    process.env.LLMM_E2E ? mainWindow?.showInactive() : mainWindow?.show()
+  )
 
   // Round 11: ask on first close, then remember the answer.
   mainWindow.on('close', (event) => {
@@ -295,6 +305,8 @@ app.whenReady().then(async () => {
         missing: vendor.missing
       })
       emitToSurfaces('hardware:update', hw)
+      // From here the volatile figures — free VRAM, GPU load, free RAM — keep themselves current.
+      startHardwareRefresh()
     })
     .catch((err) => logger.warn('hardware', 'detection failed', String(err)))
 
@@ -334,6 +346,7 @@ app.on('before-quit', async (event) => {
   userChoseQuit = true
   event.preventDefault()
   logger.info('app', 'shutting down')
+  stopHardwareRefresh()
   await shutdown()
   app.exit(0)
 })

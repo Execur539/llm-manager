@@ -159,6 +159,9 @@ function offerReveal(file: string): string {
  */
 let activeAgentSessionId = ''
 
+/** Most recent context measurement for the agent turn in flight, persisted when it ends. */
+let lastAgentContext = 0
+
 type Emitter = (channel: string, payload: unknown) => void
 let emit: Emitter = () => undefined
 
@@ -173,6 +176,42 @@ export function modelsDir(): string {
 async function getHardware(refresh = false): Promise<HardwareSnapshot> {
   if (!hardware || refresh) hardware = await detectHardware()
   return hardware
+}
+
+/**
+ * How often the moving parts of the hardware snapshot are re-measured.
+ *
+ * Everything the dashboard shows about the machine — free VRAM per adapter, GPU utilisation,
+ * free RAM — was detected once at startup and then never again. The figures were not slow to
+ * update, they were frozen: a card could fill up and empty again without the number moving.
+ *
+ * Only the volatile fields are refreshed. Re-running full detection would re-enumerate adapters
+ * and re-read model metadata to learn what has not changed since launch.
+ */
+const HARDWARE_REFRESH_MS = 8_000
+
+let hardwareTimer: NodeJS.Timeout | null = null
+
+export function startHardwareRefresh(): void {
+  if (hardwareTimer) return
+  hardwareTimer = setInterval(() => {
+    void (async () => {
+      if (!hardware) return
+      try {
+        hardware = await refreshFreeVram(hardware)
+        emit('hardware:update', hardware)
+      } catch {
+        // A transient failure to read the GPU is not worth reporting; the next tick will do.
+      }
+    })()
+  }, HARDWARE_REFRESH_MS)
+  // Must not be the reason the process stays alive at quit.
+  hardwareTimer.unref()
+}
+
+export function stopHardwareRefresh(): void {
+  if (hardwareTimer) clearInterval(hardwareTimer)
+  hardwareTimer = null
 }
 
 function getAgent(): Agent {
@@ -205,12 +244,30 @@ function getAgent(): Agent {
     agent.on('promptProgress', (p: { percent: number; processed: number; total: number; cached: number }) =>
       emit('agent:prompt-progress', { sessionId: sid(), ...p })
     )
+    agent.on('contextUsed', (c: { used: number; max: number }) => {
+      emit('agent:context', { sessionId: sid(), ...c })
+      setContextUsed(c.used)
+      // Kept for the end of the turn rather than written on every update — see the persist below.
+      lastAgentContext = c.used
+    })
     agent.on('message', (m) => emit('agent:message', { sessionId: sid(), message: m }))
     agent.on('toolCall', (c) => emit('agent:tool-call', { sessionId: sid(), call: c }))
     agent.on('toolResult', (r) => emit('agent:tool-result', { sessionId: sid(), result: r }))
     agent.on('subToolCall', (c) => emit('agent:sub-tool-call', { sessionId: sid(), call: c }))
+    agent.on('compacting', (info) => emit('agent:compacting', { sessionId: sid(), ...(info as object) }))
     agent.on('compacted', (info) => emit('agent:compacted', { sessionId: sid(), ...(info as object) }))
-    agent.on('done', (reason) => emit('agent:done', { sessionId: sid(), reason }))
+    agent.on('done', (reason) => {
+      /*
+       * Persisted once the turn is over, not while it runs.
+       *
+       * The live figure changes twice a second during a response; writing each one would be a
+       * database round trip per update to record a number superseded immediately. Where the
+       * conversation ended up is the only part that has to survive a restart.
+       */
+      const id = sid()
+      if (id && lastAgentContext > 0) chats.setContextUsed(id, lastAgentContext)
+      emit('agent:done', { sessionId: id, reason })
+    })
     agent.on('error', (e) => emit('agent:error', { sessionId: sid(), message: e }))
 
     // Remembered approvals are per folder and survive restarts.
@@ -873,6 +930,12 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
             cached: ev.cached
           })
         }
+        if (ev.type === 'context') {
+          emit('chat:context', { chatId, used: ev.used, max: ev.max })
+          // The dashboard's meter reads the same number, so it is no longer a separate estimate
+          // that can disagree with what the conversation is showing.
+          setContextUsed(ev.used)
+        }
       }
     } catch (err) {
       /*
@@ -909,7 +972,17 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const t = llama.timings
     if (t) {
       recordGeneration(loaded.model.filename, t.completionTokens, (Date.now() - started) / 1000)
-      setContextUsed(messages.reduce((a, m) => a + Math.ceil(m.content.length / 4), 0) + t.completionTokens)
+      /*
+       * The server's own count, not a guess from character lengths.
+       *
+       * This used to divide the total length of every message by four, which is a rule of thumb
+       * for English prose and wrong for everything else — code, punctuation-heavy text and any
+       * non-Latin script tokenise nothing like that. It also ignored the system prompt, the chat
+       * template's own markup and any attachments, all of which occupy the window. The stream
+       * reports the real prompt total, so the meter now agrees with what the model actually sees.
+       */
+      setContextUsed(t.promptTokens + t.completionTokens)
+      chats.setContextUsed(chatId, t.promptTokens + t.completionTokens)
     }
     return assistantMsg
   },

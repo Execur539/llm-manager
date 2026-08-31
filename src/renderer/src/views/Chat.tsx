@@ -11,6 +11,7 @@ import {
   toast,
   setReasoning,
   adoptReasoning,
+  seedContext,
   DRAFT_CHAT
 } from '../lib/store'
 import type { LoadedModel } from '../App'
@@ -25,6 +26,9 @@ import ReasoningControl, { sendableChoice } from '../components/ReasoningControl
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
 import { Spinner } from '../components/Spinner'
 import PromptProgress from '../components/PromptProgress'
+import ContextMeter from '../components/ContextMeter'
+import JumpToLatest from '../components/JumpToLatest'
+import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
 
 interface Collection {
@@ -40,7 +44,6 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   const [collections, setCollections] = useState<Collection[]>([])
   const [collectionId, setCollectionId] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const endRef = useRef<HTMLDivElement>(null)
   const attachments = useAttachments()
 
   // Streaming and selection both live in the store, so leaving this page mid-response no longer
@@ -51,11 +54,15 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   const reasoning = activeId ? (stream.reasoningPartial[activeId] ?? '') : ''
   const busy = activeId ? !!stream.running[activeId] : false
   const progress = activeId ? (stream.promptProgress[activeId] ?? null) : null
+  const ctx = activeId ? (stream.context[activeId] ?? null) : null
   // Usable before the first message: the choice is held against a draft key and adopted by
   // whatever conversation the message goes on to create.
   const effortId = activeId ?? DRAFT_CHAT
   const ultra = activeId ? (stream.ultra[activeId] ?? []) : []
   const synthesising = activeId ? !!stream.ultraSynthesising[activeId] : false
+
+  // Keyed on the conversation, so switching to another one opens at its latest message.
+  const { scrollRef, contentRef, detached, jumpToLatest } = useStickToBottom(activeId)
 
   /*
    * Ultra's attempt count, mirrored from settings.
@@ -97,15 +104,20 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
     }
     let cancelled = false
     void (async () => {
-      const session = await invoke<{ messages: AgentMessage[] } | null>('chat:load', activeId)
+      const session = await invoke<{ messages: AgentMessage[]; contextUsed?: number } | null>(
+        'chat:load',
+        activeId
+      )
       if (cancelled) return
       setMessages(session?.messages ?? [])
+      // So the meter reads correctly on reopening rather than staying blank until the next turn.
+      seedContext(activeId, session?.contextUsed, loaded?.plan.contextLength ?? 0)
       dropPending(activeId)
     })()
     return () => {
       cancelled = true
     }
-  }, [activeId])
+  }, [activeId, loaded?.plan.contextLength])
 
   // Absorb anything that arrived while this view was unmounted. A repeated id replaces the copy
   // already on screen rather than being dropped, so a message that is revised after it was first
@@ -121,10 +133,6 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
       })
     }
   }, [activeId, stream.pending])
-
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, partial])
 
   const openChat = (id: string): void => {
     setError(null)
@@ -247,7 +255,8 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
           </div>
         )}
 
-        <div className="messages" data-testid="chat-messages">
+        <div className="messages" data-testid="chat-messages" ref={scrollRef}>
+          <div className="messages-content" ref={contentRef}>
           {!messages.length && !partial && (
             <EmptyState
               icon="chat"
@@ -302,10 +311,18 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               )}
             </MessageRow>
           )}
-          <div ref={endRef} />
+          </div>
         </div>
 
+        {/*
+          * Inside the composer, floated above it.
+          *
+          * The composer changes height as the textarea grows and as attachments appear, so
+          * anchoring the button to the top of that element keeps it clear of the writing area
+          * without anyone having to know how tall it currently is.
+          */}
         <div className="composer">
+          <JumpToLatest show={detached} onClick={jumpToLatest} />
           <AttachmentBar items={attachments.items} onRemove={attachments.remove} disabled={busy} />
           <div className="composer-shell">
             <button
@@ -349,6 +366,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
             </button>
           </div>
           <div className="composer-meta">
+            {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
             <div className="composer-hint">Enter to send · Shift+Enter for a newline</div>
             <ReasoningControl
               support={loaded?.caps?.reasoning}

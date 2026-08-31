@@ -46,6 +46,26 @@ export interface StreamState {
    * no way to tell a slow prompt from a hung one.
    */
   promptProgress: Record<string, { percent: number; processed: number; total: number; cached: number }>
+  /**
+   * How much of the model's context window a conversation is occupying, and how big it is.
+   *
+   * Unlike everything else here this is not per-turn state and is deliberately not cleared when
+   * one starts or ends — the tokens stay in the window between turns, so a reading that vanished
+   * the moment a response finished would be describing something that had not changed. It goes
+   * when the conversation does.
+   */
+  context: Record<string, { used: number; max: number }>
+  /**
+   * A compaction in progress, and when it began.
+   *
+   * Auto-compaction is a whole model call over the older half of a session, which on a long one
+   * runs for many seconds. It used to happen in complete silence between iterations of a turn,
+   * so the app appeared to have stopped, and a message sent during it would be appended to a
+   * history that was about to be rewritten underneath it. The start time is here rather than the
+   * elapsed seconds because a ticking number belongs to whatever is rendering it, not to state
+   * every subscriber re-renders for.
+   */
+  compacting: Record<string, { since: number; strategy: string; automatic: boolean }>
   /** ids with a turn currently in flight */
   running: Record<string, boolean>
   /** messages that arrived while the view was unmounted, keyed by id */
@@ -144,6 +164,8 @@ function saveSelection(selection: { chat: string | null; agent: string | null })
 const state: StreamState = {
   partial: {},
   promptProgress: {},
+  context: {},
+  compacting: {},
   reasoningPartial: {},
   running: {},
   pending: {},
@@ -173,6 +195,8 @@ function emitChange(): void {
   snapshot = {
     partial: { ...state.partial },
     promptProgress: { ...state.promptProgress },
+    context: { ...state.context },
+    compacting: { ...state.compacting },
     reasoningPartial: { ...state.reasoningPartial },
     running: { ...state.running },
     pending: { ...state.pending },
@@ -214,6 +238,8 @@ export function setRunning(id: string, running: boolean): void {
     delete state.ultraPlan[id]
     // Last turn's figure would otherwise flash before the first frame of this one arrives.
     delete state.promptProgress[id]
+  delete state.context[id]
+  delete state.compacting[id]
   } else {
     // The samples were scaffolding for an answer that now exists on its own.
     delete state.ultra[id]
@@ -223,6 +249,20 @@ export function setRunning(id: string, running: boolean): void {
     // progress bar sitting at whatever it had reached.
     delete state.promptProgress[id]
   }
+  emitChange()
+}
+
+/**
+ * Restore a conversation's context reading from what was stored with it.
+ *
+ * Only fills a gap: a live figure from a turn in flight is always closer to the truth than a
+ * number written at the end of the last one, so it is never overwritten. The stored tokens were
+ * counted by whichever model was loaded then, while the maximum comes from the model loaded now
+ * — reopening under a different model is approximate until its first turn reports for itself.
+ */
+export function seedContext(id: string, used: number | undefined, max: number): void {
+  if (!id || !used || !max || state.context[id]) return
+  state.context[id] = { used, max }
   emitChange()
 }
 
@@ -395,6 +435,18 @@ function wire(): void {
       emitChange()
     }
   )
+
+  on<{ chatId?: string; used: number; max: number }>('chat:context', (d) => {
+    const id = d.chatId || activeId
+    state.context[id] = { used: d.used, max: d.max }
+    emitChange()
+  })
+
+  on<{ sessionId?: string; used: number; max: number }>('agent:context', (d) => {
+    const id = d.sessionId || activeId
+    state.context[id] = { used: d.used, max: d.max }
+    emitChange()
+  })
 
   on<{ chatId: string; text: string }>('chat:delta', (d) => {
     const id = d.chatId || activeId
@@ -595,8 +647,20 @@ function wire(): void {
     emitChange()
   })
 
+  on<{ sessionId?: string; strategy: string; automatic?: boolean }>('agent:compacting', (info) => {
+    const id = info.sessionId || activeId
+    state.compacting[id] = {
+      since: Date.now(),
+      strategy: info.strategy,
+      automatic: info.automatic !== false
+    }
+    emitChange()
+  })
+
   on<{ sessionId?: string; strategy: string }>('agent:compacted', (info) => {
     const id = info.sessionId || activeId
+    // Whatever happened, the compaction is over — this is what releases the composer.
+    delete state.compacting[id]
     state.notices[id] = `Context compacted (${info.strategy}) to keep the session going.`
     emitChange()
   })

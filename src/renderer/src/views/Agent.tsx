@@ -12,6 +12,7 @@ import {
   clearQuestions,
   setReasoning,
   adoptReasoning,
+  seedContext,
   DRAFT_AGENT
 } from '../lib/store'
 import type { LoadedModel } from '../App'
@@ -26,6 +27,10 @@ import ReasoningControl, { sendableChoice } from '../components/ReasoningControl
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
 import { Spinner } from '../components/Spinner'
 import PromptProgress from '../components/PromptProgress'
+import ContextMeter from '../components/ContextMeter'
+import CompactingNotice from '../components/CompactingNotice'
+import JumpToLatest from '../components/JumpToLatest'
+import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
 
 /** Collapsed by default; one line of summary, expanding to arguments and full output. */
@@ -73,7 +78,6 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   const [cwd, setCwd] = useState('')
   const [planMode, setPlanMode] = useState(false)
   const [showTools, setShowTools] = useState(false)
-  const endRef = useRef<HTMLDivElement>(null)
   const attachments = useAttachments()
 
   const stream = useStream()
@@ -83,6 +87,20 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   const reasoning = activeId ? (stream.reasoningPartial[activeId] ?? '') : ''
   const running = activeId ? !!stream.running[activeId] : false
   const progress = activeId ? (stream.promptProgress[activeId] ?? null) : null
+  const ctx = activeId ? (stream.context[activeId] ?? null) : null
+  const compacting = activeId ? (stream.compacting[activeId] ?? null) : null
+  /*
+   * Sending is blocked while the history is being rewritten.
+   *
+   * A message accepted mid-compaction is appended to a history that is about to be replaced by a
+   * summary of itself, so it is either summarised away before the model ever reads it or lands
+   * after turns it was meant to follow. Treated exactly like a turn in flight, because from the
+   * composer's point of view that is what it is: the session is busy and not accepting input.
+   */
+  const busy = running || !!compacting
+
+  // Keyed on the session, so switching to another one opens at its latest message.
+  const { scrollRef, contentRef, detached, jumpToLatest } = useStickToBottom(activeId)
   const error = activeId ? stream.errors[activeId] : null
   const notice = activeId ? stream.notices[activeId] : null
   const liveToolCalls = activeId ? (stream.toolCalls[activeId] ?? []) : []
@@ -137,16 +155,20 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
       const session = await invoke<{
         messages: AgentMessage[]
         cwd: string
+        contextUsed?: number
       } | null>('chat:load', activeId)
       if (cancelled) return
       setMessages(session?.messages ?? [])
       setCwd(session?.cwd ?? '')
+      // So the meter reads correctly on reopening rather than staying blank until the next turn.
+      seedContext(activeId, session?.contextUsed, loaded?.plan.contextLength ?? 0)
       dropPending(activeId)
     })()
     return () => {
       cancelled = true
     }
-  }, [activeId])
+    // Re-seeded when a model loads, since the window's size comes from the model, not the session.
+  }, [activeId, loaded?.plan.contextLength])
 
   /*
    * Absorb anything that streamed in while this view was unmounted.
@@ -170,10 +192,6 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
     }
   }, [activeId, stream.pending])
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, partial, liveToolCalls.length])
-
   const openSession = (id: string): void => {
     select('agent', id)
   }
@@ -196,7 +214,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   }
 
   const send = async (): Promise<void> => {
-    if ((!input.trim() && !attachments.items.length) || running || !loaded) return
+    if ((!input.trim() && !attachments.items.length) || busy || !loaded) return
 
     let sessionId = activeId
     if (!sessionId) {
@@ -258,7 +276,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
         onRename={(id, title) => void invoke('chat:rename', id, title).then(refreshSessions)}
       />
 
-      <DropZone onFiles={(f) => void attachments.addFiles(f)} disabled={running}>
+      <DropZone onFiles={(f) => void attachments.addFiles(f)} disabled={busy}>
       <div className="chat">
         <div className="row head chat-head">
           <RailToggle />
@@ -332,7 +350,8 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
           </div>
         )}
 
-        <div className="messages" data-testid="agent-messages">
+        <div className="messages" data-testid="agent-messages" ref={scrollRef}>
+          <div className="messages-content" ref={contentRef}>
           {!messages.length && !partial && !unsavedCalls.length && (
             <EmptyState
               icon="agent"
@@ -411,16 +430,18 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
               )}
             </MessageRow>
           )}
-          <div ref={endRef} />
+          </div>
         </div>
 
         <div className="composer">
-          <AttachmentBar items={attachments.items} onRemove={attachments.remove} disabled={running} />
+          <JumpToLatest show={detached} onClick={jumpToLatest} />
+          {compacting && <CompactingNotice since={compacting.since} automatic={compacting.automatic} />}
+          <AttachmentBar items={attachments.items} onRemove={attachments.remove} disabled={busy} />
           <div className="composer-shell">
             <button
               className="attach-button"
               onClick={() => void attachments.pick()}
-              disabled={running || attachments.busy}
+              disabled={busy || attachments.busy}
               title="Attach images, video, audio, or text files"
               aria-label="Attach files"
               data-testid="attach-button"
@@ -437,7 +458,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                 }
               }}
               placeholder={loaded ? 'Ask the agent to do something…' : 'Load a model first'}
-              disabled={!loaded || running}
+              disabled={!loaded || busy}
               rows={1}
               data-testid="agent-input"
             />
@@ -449,7 +470,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                 clearQuestions()
                 void invoke('agent:stop')
               }}
-              disabled={!loaded || (!running && !input.trim() && !attachments.items.length)}
+              disabled={!loaded || (!running && (!!compacting || (!input.trim() && !attachments.items.length)))}
               title={running ? 'Stop the agent' : 'Send  (Enter)'}
               aria-label={running ? 'Stop' : 'Send'}
               data-testid="agent-send"
@@ -458,6 +479,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             </button>
           </div>
           <div className="composer-meta">
+            {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
             <div className="composer-hint">Enter to send · Shift+Enter for a newline</div>
             <ReasoningControl
               support={loaded?.caps?.reasoning}

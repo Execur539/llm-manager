@@ -33,19 +33,41 @@ export default function Dashboard({
   const [history, setHistory] = useState<History | null>(null)
   const [vendor, setVendor] = useState<{ root: string; rootExists: boolean; missing: string[]; present: string[] } | null>(null)
 
+  /*
+   * Two cadences, because the numbers here move at two different speeds.
+   *
+   * Everything except the live meters used to be fetched once, on mount, and then left — so
+   * totals, per-model averages and the setup diagnostics were accurate as of whenever the view
+   * happened to be opened, with nothing to suggest otherwise. Opening the dashboard and watching
+   * it was indistinguishable from a machine doing nothing at all.
+   *
+   * The live meters keep their faster tick: tokens per second and time-to-first-token describe
+   * a response in progress, and at eight seconds a short answer would begin and end between two
+   * samples. The hardware figures behind them are refreshed by the main process on the same
+   * eight-second beat, so they arrive here without this view having to ask.
+   */
   useEffect(() => {
-    const tick = async (): Promise<void> => {
+    const live = async (): Promise<void> => {
       try {
         setLive(await invoke<LiveStats>('stats:live'))
       } catch {
         /* transient */
       }
     }
-    void tick()
-    void invoke<History>('stats:history').then(setHistory).catch(() => undefined)
-    void invoke<typeof vendor>('runtime:vendor-diagnostics').then(setVendor).catch(() => undefined)
-    const timer = setInterval(tick, 2000)
-    return () => clearInterval(timer)
+    const totals = async (): Promise<void> => {
+      await Promise.all([
+        invoke<History>('stats:history').then(setHistory).catch(() => undefined),
+        invoke<typeof vendor>('runtime:vendor-diagnostics').then(setVendor).catch(() => undefined)
+      ])
+    }
+    void live()
+    void totals()
+    const fast = setInterval(live, 2000)
+    const slow = setInterval(totals, 8000)
+    return () => {
+      clearInterval(fast)
+      clearInterval(slow)
+    }
   }, [])
 
   return (
