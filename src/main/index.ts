@@ -221,9 +221,19 @@ async function firstRunChecks(): Promise<void> {
     defaultId: 0,
     title: 'Models folder found elsewhere',
     message: 'Your models are not beside the app.',
+    /*
+     * Three distinct paths, each labelled as what it actually is.
+     *
+     * This printed the destination *models folder* under "The app now lives at", so the dialog
+     * claimed the application was inside a folder called LLMManagerModels — a folder which, in
+     * the report that found this, did not exist at all. Being asked to approve moving seventeen
+     * gigabytes on the strength of a path that is not what it says it is is not a decision
+     * anyone can make correctly.
+     */
     detail:
       `Found ${proposal.fileCount} files (${gb} GB) at:\n${proposal.from}\n\n` +
-      `The app now lives at:\n${proposal.to}\n\n` +
+      `The app is now at:\n${proposal.appDir}\n\n` +
+      `Moving them puts them at:\n${proposal.to}\n\n` +
       (proposal.sameVolume
         ? 'Both are on the same drive, so moving is instant.'
         : 'These are on different drives, so moving means a real copy and will take a while.')

@@ -14,13 +14,29 @@
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
-import { defaultModelsDir, isInsideRuntimeCache, readBreadcrumb, writeBreadcrumb } from '../storage/paths'
+import {
+  defaultModelsDir,
+  exeDir,
+  exeLocationUnknown,
+  isInsideRuntimeCache,
+  readBreadcrumb,
+  writeBreadcrumb
+} from '../storage/paths'
+import { loadSettings } from '../storage/settings'
+import { logger } from '../log'
 
 export interface RelocationProposal {
   /** where the models are now */
   from: string
   /** where they would go (beside the current exe) */
   to: string
+  /**
+   * The folder the app itself is in.
+   *
+   * Carried separately because `to` is a models folder, not the application's location, and a
+   * dialog that shows one while claiming the other is worse than showing neither.
+   */
+  appDir: string
   totalBytes: number
   fileCount: number
   /** true when the move is a same-volume rename and therefore effectively instant */
@@ -72,6 +88,37 @@ async function dirStats(dir: string): Promise<{ bytes: number; files: number }> 
  * Returns null when nothing needs to happen (first run, or models already beside the exe).
  */
 export async function checkRelocation(): Promise<RelocationProposal | null> {
+  /*
+   * Nothing to propose if we do not reliably know where the app is.
+   *
+   * Running the unpacked copy directly — which is what a taskbar pin does, since Windows
+   * resolves the pin to the executable it sees rather than to the launcher — leaves
+   * `exeDir()` pointing at the extraction cache and `defaultModelsDir()` falling back to
+   * Documents. Comparing a real library against that fallback concluded the models were
+   * misplaced and offered to copy them, which in the case that found this was seventeen
+   * gigabytes moved off a drive they were already correctly on.
+   */
+  if (exeLocationUnknown()) {
+    logger.warn(
+      'relocation',
+      'running from the extraction cache with no portable directory — skipping the models-location check',
+      { hint: 'launch the portable exe rather than the unpacked copy' }
+    )
+    return null
+  }
+
+  /*
+   * An explicitly chosen models folder settles the question.
+   *
+   * Relocation asks "are the models beside the app", but that is only the right question when
+   * nobody has answered it already. Someone who has set a folder in Settings — or answered
+   * "Keep them there" once — has stated where their library belongs, and moving the exe does
+   * not revoke that. This checked the computed default against the breadcrumb and never looked
+   * at the setting, so it proposed moving libraries that were exactly where they had been put.
+   */
+  const configured = loadSettings().modelsDir
+  if (configured && fs.existsSync(configured)) return null
+
   const target = defaultModelsDir()
 
   // Never propose moving a library into the portable extraction cache. That directory is
@@ -105,6 +152,7 @@ export async function checkRelocation(): Promise<RelocationProposal | null> {
   return {
     from,
     to: target,
+    appDir: exeDir(),
     totalBytes: bytes,
     fileCount: files,
     sameVolume: volumeOf(from) === volumeOf(target)

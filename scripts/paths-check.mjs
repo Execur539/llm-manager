@@ -32,6 +32,11 @@ function exeDir(exePath, portableEnv, isPackaged, appPath) {
   return appPath
 }
 
+// Mirrors exeLocationUnknown from src/main/storage/paths.ts.
+function exeLocationUnknown(exePath, portableEnv) {
+  return runtimeCacheDir(exePath) !== null && !portableEnv
+}
+
 let pass = 0
 let fail = 0
 const check = (name, cond, extra = '') => {
@@ -82,6 +87,29 @@ const installedExe = String.raw`C:\Program Files\LLM Manager\LLM Manager.exe`
 const installedModels = path.win32.join(exeDir(installedExe, undefined, true, ''), 'LLMManagerModels')
 check('installer build still puts models beside the exe', installedModels === String.raw`C:\Program Files\LLM Manager\LLMManagerModels`)
 check('and is never treated as a cache', !isInsideRuntimeCache(installedExe, installedModels))
+
+/*
+ * Running the unpacked copy directly, which is what a taskbar pin does.
+ *
+ * Windows resolves a pin to the executable it can see, and for a portable build that is the
+ * copy inside the extraction cache — so the launcher never runs and LLMM_PORTABLE_DIR is never
+ * set. Every earlier case here assumed the variable was present, so nothing covered the state
+ * a user reaches simply by pinning the app they are running.
+ *
+ * The app cannot know where it really lives in that state, and must say so rather than guess.
+ * Guessing is what produced an offer to copy a 17 GB library off the drive it was already on.
+ */
+console.log('\nLaunched from the extraction cache, with no launcher to say where the exe is')
+check('the exe location is known to be unknowable', exeLocationUnknown(CACHE_EXE, undefined))
+check(
+  'a portable launch is not affected — the launcher passes the real folder',
+  !exeLocationUnknown(CACHE_EXE, REAL_DIR)
+)
+check('nor is an installed build, which is never in a cache', !exeLocationUnknown(installedExe, undefined))
+check(
+  'and without the launcher, the exe dir really is the cache — which is why it must not be trusted',
+  exeDir(CACHE_EXE, undefined, true, '') === CACHE_DIR
+)
 
 console.log(`\n${pass} passed, ${fail} failed\n`)
 process.exit(fail ? 1 : 0)

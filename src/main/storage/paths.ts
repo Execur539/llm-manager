@@ -60,6 +60,23 @@ export function runtimeCacheDir(): string | null {
   return /[\\/]LLMManager[\\/]runtime-[^\\/]+$/i.test(exe) ? exe : null
 }
 
+/**
+ * True when this process cannot know where the user's copy of the app actually is.
+ *
+ * The portable launcher unpacks to a cache directory and passes the real location through in
+ * LLMM_PORTABLE_DIR. Run the unpacked copy directly — which is what happens if someone pins the
+ * running app to the taskbar, since Windows resolves the pin to the executable it sees — and the
+ * launcher never runs, the variable is never set, and `exeDir()` answers with the cache.
+ *
+ * Everything derived from that is then a guess: `defaultModelsDir()` falls back to Documents,
+ * and anything comparing against it concludes the user's library is in the wrong place. A guess
+ * is fine for choosing where to put a new folder. It is not fine as grounds for proposing to
+ * move tens of gigabytes, so callers that would act on the exe's location check this first.
+ */
+export function exeLocationUnknown(): boolean {
+  return runtimeCacheDir() !== null && !process.env.LLMM_PORTABLE_DIR
+}
+
 /** Would this path place user data inside the disposable extraction cache? */
 export function isInsideRuntimeCache(target: string): boolean {
   const cache = runtimeCacheDir()
