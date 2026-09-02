@@ -1274,9 +1274,94 @@ const scenarios = {
         body: JSON.stringify({ model: 'local', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] })
       }).then((r) => r.json()).catch((e) => ({ error: String(e) }))
       report.check('api-surface', 'Anthropic messages returns a content block',
-        Array.isArray(an?.content) && an.content[0]?.type === 'text', JSON.stringify(an).slice(0, 200))
+        Array.isArray(an?.content) && an.content.some((b) => b.type === 'text'),
+        JSON.stringify(an).slice(0, 200))
       report.check('api-surface', 'Anthropic response uses input/output token names',
         typeof an?.usage?.input_tokens === 'number', JSON.stringify(an?.usage))
+
+      /*
+       * Thinking has to reach HTTP clients, not just the desktop window.
+       *
+       * llama.cpp separates the chain of thought from the answer, and the app renders it in its
+       * own block — but every HTTP path dropped it on the floor, so a client could ask a
+       * reasoning model to think, wait through it, and receive no sign it had happened. Each
+       * surface is checked separately because each one discarded it in its own way.
+       *
+       * The second half of every check matters as much as the first: thinking must arrive in
+       * its own field and must NOT be folded into the answer. Merging the two would technically
+       * "deliver" it while destroying the separation the server exists to provide.
+       */
+      const THINK = 'the constraint changes things'
+
+      const oaThinkStream = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'local',
+          messages: [{ role: 'user', content: '[[mock:think]] why?' }],
+          stream: true
+        })
+      }).then((r) => r.text()).catch((e) => String(e))
+
+      const deltas = oaThinkStream
+        .split(/\r?\n/)
+        .filter((l) => l.startsWith('data:') && !l.includes('[DONE]'))
+        .map((l) => { try { return JSON.parse(l.slice(5).trim()) } catch { return null } })
+        .filter(Boolean)
+        .map((f) => f.choices?.[0]?.delta ?? {})
+
+      const streamedThinking = deltas.map((d) => d.reasoning_content ?? '').join('')
+      const streamedContent = deltas.map((d) => d.content ?? '').join('')
+      report.check('api-surface', 'OpenAI stream carries thinking as reasoning_content',
+        streamedThinking.includes(THINK), `${streamedThinking.length} chars of reasoning`)
+      report.check('api-surface', 'and does not fold thinking into the answer',
+        !streamedContent.includes(THINK), streamedContent.slice(0, 120))
+
+      const oaThink = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'local',
+          messages: [{ role: 'user', content: '[[mock:think]] why?' }],
+          stream: false
+        })
+      }).then((r) => r.json()).catch((e) => ({ error: String(e) }))
+      const msg = oaThink?.choices?.[0]?.message ?? {}
+      report.check('api-surface', 'non-streaming OpenAI reports thinking too',
+        typeof msg.reasoning_content === 'string' && msg.reasoning_content.includes(THINK),
+        JSON.stringify(msg).slice(0, 160))
+      report.check('api-surface', 'and keeps it out of the answer there as well',
+        typeof msg.content === 'string' && !msg.content.includes(THINK), String(msg.content).slice(0, 120))
+
+      const anThinkStream = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(key ? { 'x-api-key': key } : {}) },
+        body: JSON.stringify({
+          model: 'local',
+          max_tokens: 256,
+          stream: true,
+          messages: [{ role: 'user', content: '[[mock:think]] why?' }]
+        })
+      }).then((r) => r.text()).catch((e) => String(e))
+      report.check('api-surface', 'Anthropic stream opens a thinking block',
+        anThinkStream.includes('"type":"thinking"'), anThinkStream.slice(0, 160))
+      report.check('api-surface', 'Anthropic stream sends thinking_delta',
+        anThinkStream.includes('thinking_delta'), '')
+
+      const anThink = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(key ? { 'x-api-key': key } : {}) },
+        body: JSON.stringify({
+          model: 'local',
+          max_tokens: 256,
+          messages: [{ role: 'user', content: '[[mock:think]] why?' }]
+        })
+      }).then((r) => r.json()).catch((e) => ({ error: String(e) }))
+      const blocks = Array.isArray(anThink?.content) ? anThink.content : []
+      report.check('api-surface', 'non-streaming Anthropic returns a thinking block before the text',
+        blocks[0]?.type === 'thinking' && String(blocks[0].thinking).includes(THINK) &&
+          blocks.some((b) => b.type === 'text'),
+        JSON.stringify(blocks.map((b) => b.type)))
 
       // Streaming must be a well-formed SSE body ending in [DONE].
       const streamed = await fetch(`${base}/v1/chat/completions`, {

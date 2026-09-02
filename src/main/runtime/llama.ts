@@ -591,19 +591,29 @@ export class LlamaRuntime extends EventEmitter {
   }
 
   /**
-   * Like `complete`, but also surfaces tool calls instead of discarding them.
+   * Like `complete`, but also surfaces tool calls and thinking instead of discarding them.
    *
    * `complete`/`stream` exist for plain-chat callers that only want text; API clients that pass
    * `tools` need the calls themselves, which only `streamEvents` carries.
+   *
+   * Reasoning is accumulated separately rather than folded into `text`. llama.cpp runs with
+   * `--reasoning-format deepseek`, which strips thinking out of the answer and returns it as
+   * `reasoning_content` — so appending it to the text would put the model's working inside its
+   * reply, which is exactly what that flag exists to prevent. Callers that do not want it can
+   * ignore the field; the one that dropped it had no way to offer it at all.
    */
-  async completeFull(opts: CompletionOptions): Promise<{ text: string; toolCalls: StreamedToolCall[] }> {
+  async completeFull(
+    opts: CompletionOptions
+  ): Promise<{ text: string; reasoning: string; toolCalls: StreamedToolCall[] }> {
     let text = ''
+    let reasoning = ''
     const toolCalls: StreamedToolCall[] = []
     for await (const ev of this.streamEvents(opts)) {
       if (ev.type === 'text') text += ev.text
+      else if (ev.type === 'reasoning') reasoning += ev.text
       else if (ev.type === 'tool_call') toolCalls.push(ev.call)
     }
-    return { text, toolCalls }
+    return { text, reasoning, toolCalls }
   }
 
   /** Embeddings via the same server; used by RAG when the embedding model is loaded. */

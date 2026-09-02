@@ -502,6 +502,16 @@ export class ApiServer {
             message: {
               role: 'assistant',
               content: result.text,
+              /*
+               * Present only when the model actually thought.
+               *
+               * Emitted for the same reason as the streaming branch, so that `stream:false`
+               * clients are not told less than streaming ones — the two paths reporting
+               * different things about the same turn is its own bug. Omitted entirely rather
+               * than sent empty, so a non-reasoning model's response keeps the exact shape it
+               * had before.
+               */
+              ...(result.reasoning ? { reasoning_content: result.reasoning } : {}),
               ...(result.toolCalls.length
                 ? {
                     tool_calls: result.toolCalls.map((c) => ({
@@ -540,6 +550,30 @@ export class ApiServer {
               created: Math.floor(Date.now() / 1000),
               model: llama.loaded?.model.filename,
               choices: [{ index: 0, delta: { content: ev.text }, finish_reason: null }]
+            })}\n\n`
+          )
+        } else if (ev.type === 'reasoning') {
+          /*
+           * Thinking, in the field DeepSeek-style servers put it in.
+           *
+           * llama.cpp runs with `--reasoning-format deepseek`, which separates the chain of
+           * thought from the answer and returns it as `reasoning_content`. The desktop UI reads
+           * that and renders a thinking block; this loop handled text and tool calls and silently
+           * dropped everything else, so an HTTP client had no way to see the model was reasoning
+           * at all — and no way to tell a long think from a hung request.
+           *
+           * It stays in its own delta field rather than being merged into `content`. A client
+           * that does not know the field ignores it and receives exactly the answer it did
+           * before; one that does can render the thinking apart from the reply, which is the
+           * whole point of the server having separated them.
+           */
+          res.write(
+            `data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: llama.loaded?.model.filename,
+              choices: [{ index: 0, delta: { reasoning_content: ev.text }, finish_reason: null }]
             })}\n\n`
           )
         } else if (ev.type === 'tool_call') {
@@ -647,7 +681,15 @@ export class ApiServer {
     const id = `msg_${crypto.randomBytes(10).toString('hex')}`
 
     if (!body.stream) {
-      const text = await requestQueue.enqueue(priority, () => llama.complete(opts))
+      /*
+       * `completeFull`, because `complete` returns text alone.
+       *
+       * This endpoint accepts a thinking budget and then threw away everything the model
+       * produced under it — a client could ask for reasoning, pay for the tokens, and receive
+       * no trace of them. A thinking block precedes the text, which is the order Anthropic's
+       * own responses use, and is omitted when the model did not think.
+       */
+      const result = await requestQueue.enqueue(priority, () => llama.completeFull(opts))
       const t = llama.timings
       logRequest('/v1/messages', llama.loaded.model.filename, 0, t?.completionTokens ?? 0, Date.now() - started, client, ip, 200)
       json(res, 200, {
@@ -655,7 +697,10 @@ export class ApiServer {
         type: 'message',
         role: 'assistant',
         model: llama.loaded.model.filename,
-        content: [{ type: 'text', text }],
+        content: [
+          ...(result.reasoning ? [{ type: 'thinking', thinking: result.reasoning }] : []),
+          { type: 'text', text: result.text }
+        ],
         stop_reason: 'end_turn',
         usage: anthropicUsage(t)
       })
@@ -678,18 +723,76 @@ export class ApiServer {
         type: 'message_start',
         message: { id, type: 'message', role: 'assistant', model: llama.loaded?.model.filename, content: [], usage: { input_tokens: 0, output_tokens: 0 } }
       })
-      sse('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
+      /*
+       * Blocks are opened as content arrives, rather than a text block up front.
+       *
+       * Anthropic carries thinking as its own content block ahead of the answer, each with its
+       * own index — so which blocks exist cannot be decided before seeing what the model
+       * produces. Opening a text block at index 0 unconditionally, as this did, left nowhere
+       * for thinking to go, and `if (ev.type !== 'text') continue` then discarded it.
+       *
+       * Reasoning that somehow arrived after the answer had begun is dropped rather than
+       * reopening a closed block or interleaving two open ones, either of which would produce a
+       * stream no client could reassemble. llama.cpp does not do this, but the loop should not
+       * depend on that to stay well-formed.
+       */
+      let nextIndex = 0
+      let thinkingIndex = -1
+      let textIndex = -1
 
       for await (const ev of llama.streamEvents(opts)) {
-        if (ev.type !== 'text') continue
-        sse('content_block_delta', {
-          type: 'content_block_delta',
-          index: 0,
-          delta: { type: 'text_delta', text: ev.text }
-        })
+        if (ev.type === 'reasoning') {
+          if (textIndex !== -1) continue
+          if (thinkingIndex === -1) {
+            thinkingIndex = nextIndex++
+            sse('content_block_start', {
+              type: 'content_block_start',
+              index: thinkingIndex,
+              content_block: { type: 'thinking', thinking: '' }
+            })
+          }
+          sse('content_block_delta', {
+            type: 'content_block_delta',
+            index: thinkingIndex,
+            delta: { type: 'thinking_delta', thinking: ev.text }
+          })
+        } else if (ev.type === 'text') {
+          if (thinkingIndex !== -1 && textIndex === -1) {
+            sse('content_block_stop', { type: 'content_block_stop', index: thinkingIndex })
+          }
+          if (textIndex === -1) {
+            textIndex = nextIndex++
+            sse('content_block_start', {
+              type: 'content_block_start',
+              index: textIndex,
+              content_block: { type: 'text', text: '' }
+            })
+          }
+          sse('content_block_delta', {
+            type: 'content_block_delta',
+            index: textIndex,
+            delta: { type: 'text_delta', text: ev.text }
+          })
+        }
       }
 
-      sse('content_block_stop', { type: 'content_block_stop', index: 0 })
+      /*
+       * A turn that produced nothing still gets an empty text block.
+       *
+       * An immediate abort or a refusal can end a stream before any event arrives, and a message
+       * with no content blocks at all is a shape clients are not obliged to handle. This is what
+       * the previous version emitted in that case, so nothing downstream sees a change.
+       */
+      if (textIndex === -1 && thinkingIndex === -1) {
+        sse('content_block_start', {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'text', text: '' }
+        })
+        textIndex = 0
+      }
+      // Whichever block is still open — thinking only if the model never got as far as answering.
+      sse('content_block_stop', { type: 'content_block_stop', index: textIndex !== -1 ? textIndex : thinkingIndex })
       sse('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: 'end_turn' },
