@@ -48,6 +48,15 @@ export interface LoadedModel {
   plan: FitPlan
   port: number
   startedAt: number
+  /**
+   * Set when the vision projector could not get the VRAM it asked for at load time.
+   *
+   * llama.cpp treats that allocation failure as non-fatal: it logs the error, carries on, and
+   * reports the model loaded. The model then works perfectly for text and segfaults the first
+   * time an image or a video reaches it, taking the conversation and the loaded weights with it.
+   * Recorded here so media can be refused with an explanation instead.
+   */
+  visionUnavailable?: string
 }
 
 export interface ContentPart {
@@ -366,7 +375,27 @@ export class LlamaRuntime extends EventEmitter {
       throw err
     }
 
-    const loaded: LoadedModel = { model, plan, port, startedAt: Date.now() }
+    /*
+     * A projector that failed to allocate is worse than one that failed to load.
+     *
+     * These messages appear during startup and are not fatal to llama.cpp, so the health check
+     * passes and everything looks correct. The first image is what finds out — by which point
+     * the failure is an access violation rather than an error anyone can act on.
+     */
+    const allocationFailure = /cudaMalloc failed: out of memory|failed to allocate .*buffer/i.exec(stderr)
+    const visionUnavailable =
+      model.caps.mmprojPath && allocationFailure
+        ? 'The vision projector could not reserve the memory it needs at this context length, so images and video would crash the model. Load with a smaller context to use them.'
+        : undefined
+    if (visionUnavailable) {
+      logger.warn('model', 'vision projector failed to allocate; media will be refused', {
+        model: model.filename,
+        contextLength: plan.contextLength,
+        detail: allocationFailure?.[0]
+      })
+    }
+
+    const loaded: LoadedModel = { model, plan, port, startedAt: Date.now(), visionUnavailable }
     this.current = loaded
     this.modalityCache = null
     this.emit('status', { phase: 'ready', model: model.filename, port })

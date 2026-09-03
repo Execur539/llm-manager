@@ -467,7 +467,8 @@ async function videoContext(): Promise<VideoContext> {
     contextLength: llama.loaded?.plan.contextLength ?? 8192,
     share: s.video.contextShare,
     detail: s.video.detail,
-    serverTakesVideo: modalities.video
+    serverTakesVideo: modalities.video,
+    visionUnavailable: llama.loaded?.visionUnavailable
   }
 }
 

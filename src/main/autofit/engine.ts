@@ -70,7 +70,19 @@ const SSM_STATE_SAFETY = 2.5
  * The projector's runtime footprint exceeds its file size: it allocates image-tile buffers
  * on top of its weights. Measured against Qwen3.8-27B's 0.59 GB Q8_0 projector.
  */
-const MMPROJ_OVERHEAD = 1.8
+/*
+ * What to reserve for a vision projector, as a multiple of its file size.
+ *
+ * The weights are only part of it: the encoder also needs a compute buffer, and that is what
+ * actually ran out. Raised from 1.8 after a load where 1.8x left device 0 unable to find the
+ * 248 MiB the projector asked for — llama.cpp logged the failure, reported the model loaded
+ * anyway, and then segfaulted on the first video. An over-reservation costs some context; an
+ * under-reservation costs the model.
+ */
+const MMPROJ_OVERHEAD = 2.4
+
+/** Floor for the projector's compute buffer, independent of how small the projector itself is. */
+const MMPROJ_MIN_COMPUTE = 512 * 1024 * 1024
 
 export const DEFAULT_CONSTRAINTS: FitConstraints = {
   minKvType: 'q4_0',
@@ -339,7 +351,7 @@ export function planFit(
   // buffers, so charge it there with margin rather than splitting it across devices.
   const companion = constraints.companionBytes ?? 0
   if (companion > 0 && budgets.length > 0) {
-    const charged = companion * MMPROJ_OVERHEAD
+    const charged = Math.max(companion * MMPROJ_OVERHEAD, companion + MMPROJ_MIN_COMPUTE)
     budgets[0] = Math.max(0, budgets[0] - charged)
     notes.push(
       `Reserving ${fmtBytes(charged)} on ${usableGpus[0].name} for the vision projector and its image buffers.`

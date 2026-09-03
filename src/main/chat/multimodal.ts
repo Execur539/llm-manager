@@ -337,6 +337,8 @@ export interface VideoContext {
   detail: VideoDetail
   /** True when the running server reports it can decode video, not merely that the model was trained on it. */
   serverTakesVideo: boolean
+  /** Set when the projector failed to allocate at load, so media would crash the server. */
+  visionUnavailable?: string
 }
 
 const DEFAULT_VIDEO: VideoContext = {
@@ -360,6 +362,18 @@ export async function buildContent(
 
   for (const file of attachments) {
     const kind = classifyAttachment(file)
+
+    /*
+     * Refused rather than sent, when the projector never got its memory at load time.
+     *
+     * Sending this would not give a poor answer, it would segfault the server and take the
+     * loaded model and the conversation down with it. Checked before the branches rather than
+     * inside each of them, so an image and a video cannot drift apart on it.
+     */
+    if ((kind === 'image' || kind === 'video') && video.visionUnavailable) {
+      notes.push(`${path.basename(file)} skipped: ${video.visionUnavailable}`)
+      continue
+    }
 
     if (kind === 'image') {
       if (!caps.vision) {
