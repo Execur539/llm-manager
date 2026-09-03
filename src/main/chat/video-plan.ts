@@ -28,10 +28,29 @@ const PIXELS_PER_TOKEN_EDGE = 28
  */
 const VIDEO_COST_FACTOR = 0.9
 
-/** Frame widths for each preference. Heights follow the source aspect ratio. */
-const DETAIL_WIDTHS = { motion: 448, balanced: 640, detail: 896 } as const
+/**
+ * Pixels per frame for each preference, rather than a width.
+ *
+ * Budgeting by width overcharges anything that is not 16:9. A vertical phone video at a fixed
+ * 640px wide is 640x1138 — nearly three times the area of the landscape frame the width implies,
+ * and nearly three times the tokens, for a frame that carries no more information. Qwen's own
+ * preprocessing budgets by total pixels for exactly this reason; these are the areas the old
+ * widths worked out to at 16:9, so a landscape video is unchanged and everything else stops
+ * being penalised for its shape.
+ */
+const DETAIL_PIXELS = { motion: 448 * 252, balanced: 640 * 360, detail: 896 * 504 } as const
 
-export type VideoDetail = keyof typeof DETAIL_WIDTHS
+/**
+ * Bounds the encoder enforces on a single frame, in tokens.
+ *
+ * Below the floor a frame is scaled back up and the saving is imaginary; above the ceiling it is
+ * scaled down and the extra pixels are discarded. Either way the budget would be spent on
+ * something that does not happen.
+ */
+const MIN_TOKENS_PER_FRAME = 128
+const MAX_TOKENS_PER_FRAME = 768
+
+export type VideoDetail = keyof typeof DETAIL_PIXELS
 
 export interface VideoPlan {
   /** How many frames to sample. */
@@ -59,10 +78,21 @@ export function planVideo(opts: {
   aspect: number
   temporalPairing: boolean
 }): VideoPlan {
-  const width = DETAIL_WIDTHS[opts.detail] ?? DETAIL_WIDTHS.balanced
-  const height = Math.max(1, Math.round(width / (opts.aspect || 16 / 9)))
-  const perFrame =
-    Math.ceil(width / PIXELS_PER_TOKEN_EDGE) * Math.ceil(height / PIXELS_PER_TOKEN_EDGE)
+  /*
+   * Derive the frame's shape from an area budget and its aspect ratio, then round to the 28px
+   * grid the encoder works in — a frame that is not a multiple of 28 is padded up to one, so
+   * asking for 641 pixels of width costs exactly what 644 does.
+   */
+  const aspect = opts.aspect || 16 / 9
+  const area = DETAIL_PIXELS[opts.detail] ?? DETAIL_PIXELS.balanced
+  const grid = PIXELS_PER_TOKEN_EDGE
+  const width = Math.max(grid, Math.round(Math.sqrt(area * aspect) / grid) * grid)
+  const height = Math.max(grid, Math.round(width / aspect / grid) * grid)
+
+  const perFrame = Math.min(
+    MAX_TOKENS_PER_FRAME,
+    Math.max(MIN_TOKENS_PER_FRAME, (width / grid) * (height / grid))
+  )
   const costPerFrame = Math.max(1, Math.ceil(perFrame * (opts.temporalPairing ? VIDEO_COST_FACTOR : 1)))
 
   const budget = Math.max(0, Math.floor(opts.contextLength * opts.share))
@@ -77,9 +107,20 @@ export function planVideo(opts: {
    * of ffmpeg seeks.
    */
   const MAX_FPS = 4
-  const MAX_FRAMES = 2048
+  // Qwen's own preprocessing stops at 768 frames; beyond its tested range is not a good place
+  // to be inventing behaviour.
+  const MAX_FRAMES = 768
   if (opts.durationSeconds > 0) count = Math.min(count, Math.ceil(opts.durationSeconds * MAX_FPS))
   count = Math.max(1, Math.min(count, MAX_FRAMES))
+
+  /*
+   * An even number of frames, because they are consumed in pairs.
+   *
+   * The 3D convolution groups consecutive frames two at a time, so an odd count leaves the last
+   * one unpaired and padded — it is charged for and contributes nothing. Rounding down rather
+   * than up keeps the plan inside its budget.
+   */
+  if (count > 1) count -= count % 2
 
   return {
     count,

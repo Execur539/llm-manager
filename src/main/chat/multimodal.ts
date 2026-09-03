@@ -107,6 +107,21 @@ function runTool(exe: string, args: string[], timeoutMs: number): Promise<{ stdo
   })
 }
 
+/**
+ * Drop frames that are near-copies of the one before them.
+ *
+ * The single biggest saving available, because the cost of a frame has nothing to do with how
+ * much it tells you. A screen recording or a talking head holds still for long stretches, and
+ * those frames are charged in full for repeating what the previous one already said — a two
+ * minute capture spent fifty thousand tokens largely on frames that were nearly identical.
+ *
+ * Applied after sampling, so it compares the frames actually being sent rather than the source's
+ * own. The thresholds are ffmpeg's defaults: they drop what is visually indistinguishable and
+ * keep anything with real movement in it, which is the behaviour wanted here — a video that
+ * genuinely changes throughout loses nothing at all.
+ */
+const MPDECIMATE = 'mpdecimate=hi=64*12:lo=64*5:frac=0.33'
+
 /** Duration, frame rate and shape, in one metadata read. */
 async function probeVideo(file: string): Promise<VideoProbe | null> {
   const exe = ffprobePath()
@@ -196,9 +211,15 @@ async function extractAt(file: string, times: number[], width: number): Promise<
     [
       '-hide_banner',
       '-i', file,
-      '-vf', `select='${expr}',scale='min(${width},iw)':-2`,
-      // Keep every selected frame; the default would re-time them to a constant rate and drop some.
-      '-vsync', '0',
+      '-vf', `select='${expr}',${MPDECIMATE},scale='min(${width},iw)':-2`,
+      /*
+       * Keep every selected frame rather than re-timing them to a constant rate.
+       *
+       * `-fps_mode passthrough`, not `-vsync 0`: ffmpeg 9 removed `-vsync`, and an unrecognised
+       * option is not a warning — the whole command fails and produces no frames at all. This
+       * path only runs when the sample is sparse, which is why it went unnoticed.
+       */
+      '-fps_mode', 'passthrough',
       '-q:v', '3',
       path.join(dir, 'frame-%04d.jpg')
     ],
@@ -219,8 +240,11 @@ async function extractUniform(file: string, count: number, duration: number, wid
     [
       '-hide_banner',
       '-i', file,
-      '-vf', `fps=${fps.toFixed(5)},scale='min(${width},iw)':-2`,
-      '-frames:v', String(count),
+      '-vf', `fps=${fps.toFixed(5)},${MPDECIMATE},scale='min(${width},iw)':-2`,
+      // No -frames:v ceiling: decimation decides how many survive, and capping here would cut
+      // the tail of the video rather than its redundancy. `-fps_mode` because ffmpeg 9 removed
+      // `-vsync`, and an unrecognised option fails the command outright.
+      '-fps_mode', 'passthrough',
       '-q:v', '3',
       path.join(dir, 'frame-%04d.jpg')
     ],
@@ -295,15 +319,40 @@ export async function sampleVideo(
   let frames: string[]
   let how: string
 
+  /*
+   * Sample beyond the budget and let decimation bring it back.
+   *
+   * Asking for exactly the budget and then dropping duplicates would simply spend less, which is
+   * half the point. Oversampling first means the frames that survive are spread more finely over
+   * the parts of the video that actually change, so the saving is turned into temporal
+   * resolution where it is useful rather than banked everywhere.
+   */
+  const OVERSAMPLE = 1.8
+  const target = Math.min(plan.count * OVERSAMPLE, duration > 0 ? duration * 4 : plan.count * OVERSAMPLE)
+
   if (dense || duration <= 0) {
-    frames = await extractUniform(file, plan.count, duration, plan.width)
+    frames = await extractUniform(file, Math.ceil(target), duration, plan.width)
     how = 'evenly spaced'
   } else {
     const scenes = await detectScenes(file)
-    const times = chooseTimestamps(scenes, duration, plan.count)
-    frames = times.length ? await extractAt(file, times, plan.width) : await extractUniform(file, plan.count, duration, plan.width)
+    const times = chooseTimestamps(scenes, duration, Math.ceil(target))
+    frames = times.length ? await extractAt(file, times, plan.width) : await extractUniform(file, Math.ceil(target), duration, plan.width)
     how = scenes.length ? `${scenes.length} scene changes, then the widest gaps` : 'evenly spaced'
   }
+
+  /*
+   * Whatever survived decimation, trimmed to what the budget can pay for.
+   *
+   * Dropped evenly rather than from the end, so a video that is busy throughout keeps its
+   * coverage instead of stopping partway through.
+   */
+  const survived = frames.length
+  if (frames.length > plan.count) {
+    const step = frames.length / plan.count
+    frames = Array.from({ length: plan.count }, (_, i) => frames[Math.floor(i * step)])
+  }
+  // Consumed in pairs, so an odd frame at the end is charged for and contributes nothing.
+  if (frames.length > 1 && frames.length % 2 === 1) frames = frames.slice(0, -1)
 
   let condensed: string | null = null
   if (opts.temporalPairing && frames.length) {
@@ -312,10 +361,14 @@ export async function sampleVideo(
 
   const mins = Math.floor(duration / 60)
   const secs = Math.round(duration % 60)
+  const perFrame = plan.count > 0 ? plan.estimatedTokens / plan.count : 0
+  const actualFps = duration > 0 ? frames.length / duration : 0
+  const dropped = Math.max(0, Math.ceil(target) - survived)
   const note =
     `sampled ${frames.length} frames from ${mins}m ${secs}s ` +
-    `(${plan.effectiveFps.toFixed(2)} fps at ${plan.width}px, ${how}; ` +
-    `about ${plan.estimatedTokens.toLocaleString()} tokens)`
+    `(${actualFps.toFixed(2)} fps at ${plan.width}px, ${how}` +
+    (dropped > 0 ? `; ${dropped} near-duplicate frames dropped` : '') +
+    `; about ${Math.round(frames.length * perFrame).toLocaleString()} tokens)`
 
   return { frames, condensed, note }
 }

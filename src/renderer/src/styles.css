@@ -1018,6 +1018,18 @@ pre {
   transform: translateX(-50%) translateY(0);
 }
 
+/*
+ * The press effect has to re-state the centring.
+ *
+ * `button:active` sets `transform: translateY(1px)`, and transform is one property rather than a
+ * list — so the global rule replaced the `translateX(-50%)` holding this button in the middle,
+ * and pressing it made it jump right by half its own width. Anything centred by transform needs
+ * its own active state for the same reason.
+ */
+.jump-latest:active:not(:disabled) {
+  transform: translateX(-50%) translateY(1px);
+}
+
 .jump-latest:hover {
   background: var(--surface-1);
   border-color: var(--accent-dim);
