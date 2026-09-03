@@ -122,6 +122,23 @@ function runTool(exe: string, args: string[], timeoutMs: number): Promise<{ stdo
  */
 const MPDECIMATE = 'mpdecimate=hi=64*12:lo=64*5:frac=0.33'
 
+/** The encoder's patch grid; frame dimensions are rounded to it, so choosing off it is waste. */
+const PATCH_GRID = 28
+
+/** Share of a video's budget spent on full-resolution stills rather than on the video itself. */
+const KEYFRAME_SHARE = 0.3
+
+/** However many cuts a video has, past this the stills stop earning their tokens. */
+const MAX_KEYFRAMES = 24
+
+/** Take `n` items spread across a list, rather than the first `n`. */
+function pickSpread(items: number[], n: number): number[] {
+  if (n <= 0 || !items.length) return []
+  if (items.length <= n) return items
+  const step = items.length / n
+  return Array.from({ length: n }, (_, i) => items[Math.floor(i * step)])
+}
+
 /** Duration, frame rate and shape, in one metadata read. */
 async function probeVideo(file: string): Promise<VideoProbe | null> {
   const exe = ffprobePath()
@@ -296,7 +313,7 @@ async function encodeCondensed(frames: string[], dir: string): Promise<string | 
 export async function sampleVideo(
   file: string,
   opts: { contextLength: number; share: number; detail: VideoDetail; temporalPairing: boolean }
-): Promise<{ frames: string[]; condensed: string | null; note: string }> {
+): Promise<{ frames: string[]; condensed: string | null; keyframes: string[]; note: string }> {
   const probe = await probeVideo(file)
   const duration = probe?.duration ?? 0
   const plan = planVideo({
@@ -315,9 +332,26 @@ export async function sampleVideo(
    * full decode of the video to prove it is pure overhead. Below that, the cuts are exactly what
    * a uniform sample misses.
    */
+  /*
+   * Detail is not spread evenly, because information is not.
+   *
+   * Frames at a cut carry something new; the frames between them mostly carry continuity, and
+   * paying full resolution for continuity is where the budget goes. So the video is sent at half
+   * width — a quarter of the pixels, a quarter of the tokens — to hold motion, order and
+   * timestamps, and a handful of full-resolution stills are sent alongside it for the moments
+   * that actually changed. Twenty per cent of frames at full size and eighty at a quarter costs
+   * forty per cent of sending everything at full size.
+   *
+   * Only when the server can take video: as separate images there is no cheap carrier for the
+   * motion, and the split would just be a worse sample.
+   */
+  const hybrid = opts.temporalPairing
+  const videoWidth = hybrid ? Math.max(PATCH_GRID, Math.round((plan.width * 0.5) / PATCH_GRID) * PATCH_GRID) : plan.width
+
   const dense = duration > 0 && plan.count / duration >= 1
   let frames: string[]
   let how: string
+  let keyframes: string[] = []
 
   /*
    * Sample beyond the budget and let decimation bring it back.
@@ -331,12 +365,12 @@ export async function sampleVideo(
   const target = Math.min(plan.count * OVERSAMPLE, duration > 0 ? duration * 4 : plan.count * OVERSAMPLE)
 
   if (dense || duration <= 0) {
-    frames = await extractUniform(file, Math.ceil(target), duration, plan.width)
+    frames = await extractUniform(file, Math.ceil(target), duration, videoWidth)
     how = 'evenly spaced'
   } else {
     const scenes = await detectScenes(file)
     const times = chooseTimestamps(scenes, duration, Math.ceil(target))
-    frames = times.length ? await extractAt(file, times, plan.width) : await extractUniform(file, Math.ceil(target), duration, plan.width)
+    frames = times.length ? await extractAt(file, times, videoWidth) : await extractUniform(file, Math.ceil(target), duration, videoWidth)
     how = scenes.length ? `${scenes.length} scene changes, then the widest gaps` : 'evenly spaced'
   }
 
@@ -359,6 +393,23 @@ export async function sampleVideo(
     condensed = await encodeCondensed(frames, path.dirname(frames[0]))
   }
 
+  /*
+   * Full-resolution stills for the moments that changed.
+   *
+   * Bounded by what the reduced video freed up rather than by a fixed count, so the pair always
+   * costs less than sending everything at full size. Spread across the cuts rather than taking
+   * the first few, because the last minute of a video matters as much as the first.
+   */
+  if (hybrid && condensed && duration > 0) {
+    const stillCost = Math.max(1, Math.round(plan.estimatedTokens / Math.max(1, plan.count)))
+    const affordable = Math.floor((plan.estimatedTokens * KEYFRAME_SHARE) / stillCost)
+    if (affordable >= 1) {
+      const cuts = await detectScenes(file)
+      const chosen = pickSpread(cuts.filter((t) => t > 0 && t < duration), Math.min(affordable, MAX_KEYFRAMES))
+      if (chosen.length) keyframes = await extractAt(file, chosen, plan.width)
+    }
+  }
+
   const mins = Math.floor(duration / 60)
   const secs = Math.round(duration % 60)
   const perFrame = plan.count > 0 ? plan.estimatedTokens / plan.count : 0
@@ -368,9 +419,10 @@ export async function sampleVideo(
     `sampled ${frames.length} frames from ${mins}m ${secs}s ` +
     `(${actualFps.toFixed(2)} fps at ${plan.width}px, ${how}` +
     (dropped > 0 ? `; ${dropped} near-duplicate frames dropped` : '') +
-    `; about ${Math.round(frames.length * perFrame).toLocaleString()} tokens)`
+    (keyframes.length ? `; plus ${keyframes.length} full-resolution stills at scene changes` : '') +
+    `; about ${Math.round(frames.length * perFrame * (hybrid ? 0.25 : 1) + keyframes.length * perFrame).toLocaleString()} tokens)`
 
-  return { frames, condensed, note }
+  return { frames, condensed, keyframes, note }
 }
 
 /**
@@ -477,6 +529,18 @@ export async function buildContent(
           const data = await fsp.readFile(sampled.condensed)
           parts.push({ type: 'input_video', input_video: { data: data.toString('base64') } })
           extractedFrames.push(sampled.condensed)
+
+          /*
+           * The stills follow the video, so the model reads them as detail on what it just saw.
+           *
+           * The video is at reduced resolution and carries motion, order and timing; these carry
+           * what the moments actually looked like. Sent after rather than before, because a
+           * still ahead of the clip reads as a separate subject instead of a close-up of it.
+           */
+          for (const still of sampled.keyframes) {
+            parts.push({ type: 'image_url', image_url: { url: await toDataUrl(still) } })
+          }
+          extractedFrames.push(...sampled.keyframes)
           notes.push(`${path.basename(file)}: ${sampled.note}, sent as video so the model can follow the order.`)
         } else {
           for (const frame of sampled.frames) {
