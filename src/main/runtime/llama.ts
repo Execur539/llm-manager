@@ -20,6 +20,7 @@ import type { Backend, FitPlan, ModelRecord, ToolDefinition } from '@shared/type
 import path from 'node:path'
 import { app } from 'electron'
 import { childEnv, llamaServerPath } from './binaries'
+import { logger } from '../log'
 
 /** Location of the stand-in server used when LLMM_MOCK_LLAMA=1. */
 function mockServerPath(): string {
@@ -321,11 +322,38 @@ export class LlamaRuntime extends EventEmitter {
       spawnFailure = err
       stderr += `\nspawn error: ${err.message}`
     })
-    child.on('exit', (code) => {
-      this.emit('status', { phase: 'exited', code })
-      if (this.current?.port === port) this.current = null
-    this.modalityCache = null
+    child.on('exit', (code, signal) => {
+      /*
+       * Cleared before the event, not after.
+       *
+       * The listener on this is synchronous and asks `llama.loaded` whether a model is still up
+       * before telling the interface it is gone. Emitting first meant it was still set, the
+       * condition never held, and the window kept showing a loaded model with an Unload button
+       * for a server that no longer existed — the app and the machine disagreeing about whether
+       * anything was running.
+       */
+      const wasLoaded = this.current?.port === port
+      if (wasLoaded) this.current = null
+      this.modalityCache = null
       this.child = null
+
+      /*
+       * A server that dies leaves a record.
+       *
+       * Loads were logged and exits were not, so a crash left no trace whatsoever — the log
+       * showed a model loading four times and never once stopping, and there was no way to find
+       * out afterwards what had happened. The tail of stderr is where llama.cpp puts the reason,
+       * an allocation failure above all.
+       */
+      if (wasLoaded || code !== 0) {
+        logger.warn('model', `llama-server exited (code ${code}, signal ${signal ?? 'none'})`, {
+          model: model.filename,
+          contextLength: plan.contextLength,
+          stderr: stderr.slice(-4000)
+        })
+      }
+
+      this.emit('status', { phase: 'exited', code })
     })
 
     try {

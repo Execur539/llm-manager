@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { AppSettings } from '@shared/types'
-import { invoke, on } from '../lib/api'
+import { invoke, on, fmtBytes } from '../lib/api'
 import ConfirmDialog from '../components/ConfirmDialog'
 import NumberField from '../components/NumberField'
 
@@ -25,10 +25,21 @@ export default function Settings(): JSX.Element {
   const [mcp, setMcp] = useState<McpStatus[]>([])
   const [memory, setMemory] = useState<MemoryEntry[]>([])
   const [hfToken, setHfToken] = useState('')
-  const [update, setUpdate] = useState<{ available: boolean; latestVersion: string | null; notes: string | null; downloadUrl: string | null; error?: string; previousFailure?: string } | null>(null)
+  const [update, setUpdate] = useState<{ available: boolean; latestVersion: string | null; notes: string | null; downloadUrl: string | null; bytes?: number; error?: string; previousFailure?: string } | null>(null)
   const [version, setVersion] = useState('')
   const [info, setInfo] = useState<string | null>(null)
   const [confirmHardBlocks, setConfirmHardBlocks] = useState(false)
+  /** Bytes of the update fetched so far, or null when no download is running. */
+  const [downloading, setDownloading] = useState<{ done: number; total: number } | null>(null)
+
+  /*
+   * The download reports progress; until now nobody listened.
+   *
+   * Subscribed for the life of the view rather than only while a download runs, so returning to
+   * Settings mid-download picks the progress back up instead of showing an idle button for a
+   * transfer that is still going.
+   */
+  useEffect(() => on<{ done: number; total: number }>('update:progress', setDownloading), [])
 
   // New MCP server form
   const [mcpName, setMcpName] = useState('')
@@ -382,9 +393,47 @@ export default function Settings(): JSX.Element {
           <div className="card" style={{ marginTop: 12, borderColor: 'var(--accent-dim)' }}>
             <div className="card-title">Version {update.latestVersion} is available</div>
             <pre style={{ maxHeight: 160 }}>{update.notes}</pre>
-            <button className="primary" onClick={() => void invoke('update:apply', update.downloadUrl)}>
-              Download and install
-            </button>
+            {/*
+              * Nine hundred megabytes with nothing on screen is indistinguishable from a dead
+              * button. The main process was already reporting progress and the channel was
+              * already allowed through — nothing here had ever subscribed to it, so every byte
+              * of it was computed, sent across the bridge and dropped. The first sign the click
+              * had worked was the app restarting itself minutes later.
+              */}
+            {downloading ? (
+              <div data-testid="update-progress">
+                <div className="row" style={{ justifyContent: 'space-between', fontSize: 12 }}>
+                  <span>Downloading version {update.latestVersion}…</span>
+                  <span className="mono">
+                    {downloading.total > 0 ? `${Math.round((downloading.done / downloading.total) * 100)}%` : fmtBytes(downloading.done)}
+                  </span>
+                </div>
+                <div className="meter" style={{ marginTop: 6 }}>
+                  <span style={{ width: downloading.total > 0 ? `${(downloading.done / downloading.total) * 100}%` : '100%' }} />
+                </div>
+                <div className="faint" style={{ fontSize: 11, marginTop: 6 }}>
+                  {fmtBytes(downloading.done)}
+                  {downloading.total > 0 && ` of ${fmtBytes(downloading.total)}`} · the app will restart itself to finish
+                </div>
+              </div>
+            ) : (
+              <button
+                className="primary"
+                onClick={async () => {
+                  // Set before awaiting: the first progress frame can be a second or more away
+                  // on a slow link, and the button must stop looking clickable immediately.
+                  setDownloading({ done: 0, total: update.bytes ?? 0 })
+                  const r = await invoke<{ ok: boolean; message: string }>('update:apply', update.downloadUrl)
+                  if (!r?.ok) {
+                    setDownloading(null)
+                    setInfo(r?.message ?? 'The update could not be applied.')
+                  }
+                }}
+                data-testid="update-apply"
+              >
+                Download and install
+              </button>
+            )}
           </div>
         )}
       </div>

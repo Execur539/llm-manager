@@ -390,6 +390,26 @@ body {
   min-height: 0;
 }
 
+/*
+ * Breathing room at the end of a scrolled page.
+ *
+ * `.main` sets a 26px bottom padding that does nothing, and moving it to `.page` does nothing
+ * either — `.page` has `min-height: 0` so flex shrinks it, and its children overflow the box
+ * rather than sitting inside it. Padding on a box the content has already escaped cannot hold
+ * anything back, which is why the last card finished flush against the window edge: measured at
+ * exactly zero pixels.
+ *
+ * A trailing box is in the overflow itself, where the space is actually needed. Doing it this
+ * way rather than by making `.page` size to its content, because several views depend on it
+ * shrinking — the chat transcript scrolls inside it and would otherwise grow the whole page.
+ */
+.page::after {
+  content: '';
+  display: block;
+  flex-shrink: 0;
+  height: 26px;
+}
+
 .main > .app-banner {
   width: 100%;
   max-width: var(--page);

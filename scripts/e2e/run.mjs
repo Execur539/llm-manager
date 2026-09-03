@@ -129,6 +129,31 @@ const scenarios = {
           console.log(`      ${p.kind}: ${p.element} — ${p.detail}`)
         }
       }
+
+      /*
+       * A scrolled page must not end flush against the window edge.
+       *
+       * The audit above looks for elements that overflow or overlap, and this is neither — the
+       * last card ended exactly at the bottom of the viewport, which is legal and looks wrong.
+       * `.main` carries a 26px bottom padding that a flex scroll container does not apply to its
+       * overflow, and `.page` shrinks under flex so its children escape its box too, so both of
+       * the obvious places to put the space were doing nothing at all.
+       */
+      await goTo(page, 'Settings')
+      await page.evaluate(() => {
+        const m = document.querySelector('.main')
+        if (m) m.scrollTop = m.scrollHeight
+      })
+      await page.waitForTimeout(400)
+      const gap = await page.evaluate(() => {
+        const main = document.querySelector('.main')
+        const cards = [...document.querySelectorAll('.main .card')]
+        const last = cards[cards.length - 1]
+        if (!main || !last) return -1
+        return Math.round(main.getBoundingClientRect().bottom - last.getBoundingClientRect().bottom)
+      })
+      report.check('layout', 'a fully scrolled page leaves room below its last card',
+        gap >= 16, `${gap}px below the last card`)
     })
   },
 
