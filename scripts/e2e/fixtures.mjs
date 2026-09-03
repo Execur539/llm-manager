@@ -143,7 +143,36 @@ export async function createEnv(label = 'e2e') {
     JSON.stringify({ modelsDir, exeDir: base, updatedAt: Date.now() }, null, 2)
   )
 
-  return { base, userData, appData, modelsDir }
+  /*
+   * Its own API port, rather than the shipped default of 1234.
+   *
+   * Every sandbox shared that default, so the scenarios that start a server could not run beside
+   * each other — and, more awkwardly, could not run at all while the developer had their own copy
+   * of the app open, because the real app was already holding the port. That produced three
+   * failures describing a server that would not start, none of which were about the code.
+   *
+   * Port 0 asks the OS for a free one, which is what everything else here already does.
+   */
+  const apiPort = await freePort()
+  await fsp.writeFile(
+    path.join(appData, 'LLMManager', 'settings.json'),
+    JSON.stringify({ server: { port: apiPort } }, null, 2)
+  )
+
+  return { base, userData, appData, modelsDir, apiPort }
+}
+
+/** Ask the OS for a port nothing is using, and let it go again. */
+async function freePort() {
+  const net = await import('node:net')
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer()
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address()
+      srv.close(() => resolve(port))
+    })
+    srv.on('error', reject)
+  })
 }
 
 export async function addModel(env, filename, opts = {}) {
