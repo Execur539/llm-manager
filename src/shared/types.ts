@@ -401,6 +401,18 @@ export interface AppSettings {
      */
     connections: number
   }
+  video: {
+    /**
+     * How a video's share of the context window is spent.
+     *
+     * Frames cost tokens by area, so this is a direct trade between how many frames are sent and
+     * how legible each one is. 'motion' takes many small frames, for following what happens;
+     * 'detail' takes fewer large ones, for reading text on screen.
+     */
+    detail: 'motion' | 'balanced' | 'detail'
+    /** Fraction of the context window one video may occupy, 0-1. */
+    contextShare: number
+  }
   server: {
     enabled: boolean
     port: number

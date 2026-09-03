@@ -166,6 +166,29 @@ export default function Settings(): JSX.Element {
               <option value="sliding-window">Sliding window (drop oldest)</option>
             </select>
           </dd>
+          {/*
+            * Frames cost tokens by area, so this is a straight trade rather than a quality dial:
+            * smaller frames buy proportionally more of them out of the same budget. The frame
+            * count itself is derived from the loaded model's window, so a bigger context
+            * automatically buys a longer video rather than the same number of frames.
+            */}
+          <dt>Video sampling</dt>
+          <dd>
+            <select
+              value={settings.video.detail}
+              onChange={(e) =>
+                void patch({ video: { ...settings.video, detail: e.target.value as 'motion' | 'balanced' | 'detail' } })
+              }
+              data-testid="video-detail"
+            >
+              <option value="motion">Favour motion (more frames, smaller)</option>
+              <option value="balanced">Balanced</option>
+              <option value="detail">Favour detail (fewer frames, larger)</option>
+            </select>
+            <span className="faint" style={{ marginLeft: 6 }}>
+              how a video spends its share of the context window
+            </span>
+          </dd>
           <dt>Max tool calls / turn</dt>
           <dd>
             <NumberField

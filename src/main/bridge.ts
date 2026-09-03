@@ -62,7 +62,7 @@ import {
 } from './remote/auth'
 import * as rag from './rag'
 import * as chats from './chat/repo'
-import { buildContent } from './chat/multimodal'
+import { buildContent, type VideoContext } from './chat/multimodal'
 import { classifyAttachment, recordAttachment, IMAGE_EXT, AUDIO_EXT, VIDEO_EXT, TEXT_EXT } from './chat/repo'
 import { historicalStats, liveStats, requestLog, recordGeneration, clearStats, setContextUsed } from './stats'
 import { buildDiagnostics, logger } from './log'
@@ -453,11 +453,29 @@ async function pruneStagedUploads(): Promise<void> {
  * Paths are still named alongside, because they remain genuinely useful: the agent can copy,
  * move or convert a file it can also see.
  */
+/**
+ * What a video may spend of this model's context, and whether the server can take one whole.
+ *
+ * Read at send time rather than cached: the window belongs to the loaded plan, which changes
+ * whenever a different model or fit is loaded, and the server's modalities are a property of the
+ * running process.
+ */
+async function videoContext(): Promise<VideoContext> {
+  const s = loadSettings()
+  const modalities = await llama.modalities()
+  return {
+    contextLength: llama.loaded?.plan.contextLength ?? 8192,
+    share: s.video.contextShare,
+    detail: s.video.detail,
+    serverTakesVideo: modalities.video
+  }
+}
+
 async function attachmentTurn(input: string, files: string[]): Promise<{ text: string; media: ContentPart[] }> {
   const caps = llama.loaded?.model.caps
   if (!caps) return { text: input, media: [] }
 
-  const built = await buildContent('', files, caps)
+  const built = await buildContent('', files, caps, await videoContext())
   const sections: string[] = []
   const media: ContentPart[] = []
 
@@ -825,7 +843,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const notes: string[] = []
 
     if (attachments?.length) {
-      const built = await buildContent(text, attachments, loaded.model.caps)
+      const built = await buildContent(text, attachments, loaded.model.caps, await videoContext())
       userContent = built.parts
       notes.push(...built.notes)
     }

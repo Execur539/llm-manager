@@ -50,10 +50,19 @@ export interface LoadedModel {
 }
 
 export interface ContentPart {
-  type: 'text' | 'image_url' | 'input_audio'
+  type: 'text' | 'image_url' | 'input_audio' | 'input_video'
   text?: string
   image_url?: { url: string }
   input_audio?: { data: string; format: string }
+  /**
+   * A whole video, handed to the server rather than pre-split into images.
+   *
+   * llama.cpp expands it through ffmpeg and encodes it as video — pairing consecutive frames
+   * into 6-channel super-frames with a 3D convolution, applying temporal M-RoPE, and
+   * interleaving timestamps. Sending the same frames as separate `image_url` parts gets none of
+   * that: twice the tokens, no motion, and no sense of when anything happened.
+   */
+  input_video?: { data?: string; url?: string }
 }
 
 export interface ChatMessage {
@@ -177,6 +186,8 @@ export class LlamaRuntime extends EventEmitter {
   private current: LoadedModel | null = null
   private starting: Promise<LoadedModel> | null = null
   private lastTimings: Timings | null = null
+  /** Cleared whenever the loaded model changes; see modalities(). */
+  private modalityCache: { vision: boolean; audio: boolean; video: boolean } | null = null
 
   get loaded(): LoadedModel | null {
     return this.current
@@ -184,6 +195,39 @@ export class LlamaRuntime extends EventEmitter {
 
   get timings(): Timings | null {
     return this.lastTimings
+  }
+
+  /**
+   * What the running server will actually accept, as it reports it.
+   *
+   * Distinct from the model's own capabilities. `caps.nativeVideo` says the weights were trained
+   * on video; this says the build in front of us can decode one — which additionally needs mtmd
+   * video support compiled in, a projector loaded, and ffmpeg findable on PATH. Either can be
+   * true without the other, and sending a video to a server that cannot take one is an error the
+   * user sees rather than a graceful fallback.
+   *
+   * Cached per load, since it cannot change while one model is up.
+   */
+  async modalities(): Promise<{ vision: boolean; audio: boolean; video: boolean }> {
+    const none = { vision: false, audio: false, video: false }
+    const loaded = this.current
+    if (!loaded) return none
+    if (this.modalityCache) return this.modalityCache
+    try {
+      const res = await fetch(`http://127.0.0.1:${loaded.port}/props`, {
+        signal: AbortSignal.timeout(5000)
+      })
+      const json = (await res.json()) as { modalities?: Record<string, boolean> }
+      this.modalityCache = {
+        vision: !!json.modalities?.vision,
+        audio: !!json.modalities?.audio,
+        video: !!json.modalities?.video
+      }
+    } catch {
+      // A server that will not answer /props is not one to send a video to either.
+      this.modalityCache = none
+    }
+    return this.modalityCache
   }
 
   private buildArgs(model: ModelRecord, plan: FitPlan, port: number): string[] {
@@ -280,6 +324,7 @@ export class LlamaRuntime extends EventEmitter {
     child.on('exit', (code) => {
       this.emit('status', { phase: 'exited', code })
       if (this.current?.port === port) this.current = null
+    this.modalityCache = null
       this.child = null
     })
 
@@ -295,6 +340,7 @@ export class LlamaRuntime extends EventEmitter {
 
     const loaded: LoadedModel = { model, plan, port, startedAt: Date.now() }
     this.current = loaded
+    this.modalityCache = null
     this.emit('status', { phase: 'ready', model: model.filename, port })
     return loaded
   }
@@ -329,10 +375,12 @@ export class LlamaRuntime extends EventEmitter {
     const child = this.child
     if (!child) {
       this.current = null
+    this.modalityCache = null
       return
     }
     this.child = null
     this.current = null
+    this.modalityCache = null
     await new Promise<void>((resolve) => {
       // Cleared when the child goes quietly, so a normal unload does not leave a four-second
       // timer holding the event loop open behind it — which on quit is four seconds of the

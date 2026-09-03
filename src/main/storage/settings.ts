@@ -38,6 +38,20 @@ export const DEFAULT_SETTINGS: AppSettings = {
   downloads: {
     connections: 4
   },
+  video: {
+    /*
+     * How to spend the context window a video is allowed.
+     *
+     * Frames cost tokens by area, so this is a straight trade: smaller frames buy more of them.
+     * 'motion' favours temporal resolution — many small frames, for following what happens;
+     * 'detail' favours legibility — fewer large frames, for reading text on screen. The frame
+     * count is derived from the model's actual window rather than fixed, so a larger context
+     * automatically buys a longer video rather than the same sixteen frames.
+     */
+    detail: 'balanced',
+    /** Share of the context window a single video may occupy. */
+    contextShare: 0.45
+  },
   server: {
     enabled: false,
     port: 1234,
@@ -88,7 +102,9 @@ const NUMERIC_BOUNDS: { path: [keyof AppSettings, string]; min: number; max: num
   { path: ['ultra', 'samples'], min: 1, max: 8 },
   { path: ['ultra', 'maxContinuations'], min: 0, max: 20 },
   { path: ['server', 'port'], min: 1, max: 65_535 },
-  { path: ['downloads', 'connections'], min: 1, max: 16 }
+  { path: ['downloads', 'connections'], min: 1, max: 16 },
+  // A video may not take the whole window: the question about it has to fit too.
+  { path: ['video', 'contextShare'], min: 0.05, max: 0.8 }
 ]
 
 function clampNumerics(settings: AppSettings): AppSettings {
