@@ -48,6 +48,7 @@ import { makeAgentTools } from './tools/agentic'
 import { checkpointFiles } from './checkpoints'
 import { mcpManager } from './mcp'
 import { readMemory } from './memory'
+import * as chats from '../chat/repo'
 import { APPDATA_DIR } from '../storage/paths'
 
 export interface AgentOptions {
@@ -93,6 +94,15 @@ const PLAN_MODE_PROMPT = `
 PLAN MODE IS ACTIVE. You may only use read-class tools (reading, listing, searching, fetching).
 Investigate first, then present a concise written plan for the user to approve. Do not attempt
 to write files or run commands until plan mode is turned off.`
+
+/** What a compaction did, so the caller can report it rather than guessing. */
+export interface CompactionReport {
+  ok: boolean
+  message: string
+  /** Estimated tokens the session occupied before and after. Absent when nothing was done. */
+  beforeTokens?: number
+  afterTokens?: number
+}
 
 /** Where a planning sample's output goes while it is standing in for the real run. */
 export interface PlanHooks {
@@ -165,6 +175,17 @@ export class Agent extends EventEmitter {
       hardBlocksDisabled: () => this.opts.hardBlocksDisabled,
       ask: (req) => this.opts.requestPermission(req)
     })
+  }
+
+  /**
+   * Drop the rolling history so the next turn rebuilds it from storage.
+   *
+   * Used after the session has been changed underneath the agent — a rewind removes messages the
+   * in-memory window still holds, and without this the model would keep being sent turns the
+   * user has undone.
+   */
+  resetHistory(): void {
+    this.history = []
   }
 
   updateOptions(patch: Partial<AgentOptions>): void {
@@ -467,48 +488,132 @@ Platform: Windows (PowerShell)${memoryBlock}`
   }
 
   /** Force a compaction now, regardless of budget. */
-  async compactNow(): Promise<void> {
+  /**
+   * Compact a session on demand, and make it stick.
+   *
+   * Works from the persisted session rather than the rolling history, and writes the result back
+   * to it. The previous version rewrote `this.history` and nothing else, while every turn
+   * rebuilds that history from storage — so the next message the user sent restored the session
+   * to full size and the context reading barely moved. That was the whole of the reported bug.
+   *
+   * What is kept is decided by token cost, not by counting messages. Keeping "the last four"
+   * sounds conservative until three of them are tool results, each of which enters context at up
+   * to 24,000 characters: the four most recent messages could be twenty thousand tokens that
+   * compaction was structurally unable to touch. That is exactly the case people hit, because
+   * heavy tool use is what fills a window in the first place.
+   */
+  async compactNow(session: AgentSessionState): Promise<CompactionReport> {
     const loaded = llama.loaded
-    if (!loaded || this.history.length < 4) return
-    const saved = this.opts.compaction
-    this.opts.compaction = 'auto-compact'
-    const system = this.history[0]
-    const rest = this.history.slice(1)
-    const recent = rest.slice(-4)
-    const older = rest.slice(0, -4)
-    if (older.length) {
-      const transcript = older
-        .map((m) => `${m.role}: ${typeof m.content === 'string' ? m.content : '[structured]'}`)
-        .join('\n')
-        .slice(-40000)
+    if (!loaded) {
+      return { ok: false, message: 'Load a model first — compacting needs one to summarise with.' }
+    }
 
-      this.emit('compacting', { strategy: 'manual', automatic: false })
-      let summary = ''
-      try {
-        summary = await llama
-          .complete({
-            messages: [
-              { role: 'system', content: 'Summarise this agent transcript densely and factually. No preamble.' },
-              { role: 'user', content: transcript }
-            ],
-            temperature: 0.2,
-            maxTokens: 1024,
-            signal: this.abort?.signal
-          })
-          .catch(() => '(compaction failed)')
-        this.history = [system, { role: 'user', content: `[Summary of earlier work]\n${summary}` }, ...recent]
-      } finally {
-        /*
-         * Emitted exactly once, and from `finally` because it is what releases the interface.
-         *
-         * `compacted` is the signal that clears the in-progress state and re-enables sending, so
-         * a path that skips it leaves the app showing a compaction that never ends. The
-         * summarising call swallows its own failures, but an abort mid-turn throws past that.
-         */
-        this.emit('compacted', { strategy: 'manual', summary })
+    const all = session.messages.filter((m) => m.role !== 'system')
+    const cost = (m: AgentMessage): number => estimateTokens(m.content) + estimateTokens(m.reasoning ?? '')
+    const before = all.reduce((a, m) => a + cost(m), 0)
+
+    /*
+     * How much recent conversation to leave untouched.
+     *
+     * A quarter of the window: enough that the model keeps the thread of what it was doing,
+     * while leaving three quarters to reclaim. The floor matters on a small context, where a
+     * quarter could be less than a single tool result and compaction would thrash.
+     */
+    const windowTokens = loaded.plan.contextLength || 8192
+    const keepBudget = Math.max(1500, Math.floor(windowTokens * 0.25))
+
+    let kept = 0
+    let cut = all.length
+    while (cut > 0) {
+      const next = kept + cost(all[cut - 1])
+      // The last two are kept whatever they cost — a session cannot resume from nothing.
+      if (next > keepBudget && all.length - cut >= 2) break
+      kept = next
+      cut--
+    }
+
+    const older = all.slice(0, cut)
+    if (older.length < 2) {
+      return {
+        ok: false,
+        message: 'Nothing to compact yet — the recent messages are all that is in the window.'
       }
     }
-    this.opts.compaction = saved
+
+    this.emit('compacting', { strategy: 'manual', automatic: false })
+    try {
+      const summary = await this.summarise(older)
+      const boundary = older[older.length - 1].id
+      chats.setSummary(session.id, summary, boundary)
+
+      // Rebuilt from what is now stored, so the running history matches what a resume would give.
+      this.hydrate({ ...session, summary, summaryUpto: boundary })
+
+      const after = estimateTokens(summary) + all.slice(cut).reduce((a, m) => a + cost(m), 0)
+      return {
+        ok: true,
+        message: `Summarised ${older.length} messages.`,
+        beforeTokens: before,
+        afterTokens: after
+      }
+    } finally {
+      this.emit('compacted', { strategy: 'manual' })
+    }
+  }
+
+  /**
+   * Summarise a run of messages, in as many passes as their size requires.
+   *
+   * The transcript used to be cut to its last 40,000 characters before being summarised, so on a
+   * long session most of it was never shown to the summariser at all — removed from the model's
+   * history and described nowhere. Anything too big for one pass is summarised in chunks and
+   * those summaries summarised together, so every message is represented by something.
+   */
+  private async summarise(messages: AgentMessage[]): Promise<string> {
+    const CHUNK_CHARS = 24_000
+    const chunks: string[] = []
+    let buffer = ''
+    for (const m of messages) {
+      const line = `${m.role}: ${m.content}\n`
+      if (buffer && buffer.length + line.length > CHUNK_CHARS) {
+        chunks.push(buffer)
+        buffer = ''
+      }
+      buffer += line
+    }
+    if (buffer) chunks.push(buffer)
+
+    const instruction =
+      'Summarise the following agent transcript. Preserve: the user goal, decisions made, ' +
+      'files and paths touched, commands run and their outcomes, and anything still ' +
+      'outstanding. Be dense and factual. No preamble.'
+
+    const pass = async (text: string): Promise<string> =>
+      llama
+        .complete({
+          messages: [
+            { role: 'system', content: instruction },
+            { role: 'user', content: text }
+          ],
+          temperature: 0.2,
+          maxTokens: 1024,
+          signal: this.abort?.signal
+        })
+        .catch(() => '')
+
+    const parts: string[] = []
+    for (const chunk of chunks) {
+      const out = (await pass(chunk)).trim()
+      if (out) parts.push(out)
+    }
+
+    if (!parts.length) return '(compaction failed; earlier turns are described only by this note)'
+    if (parts.length === 1) return parts[0]
+
+    // A second pass over the summaries, so the result reads as one account rather than several.
+    const joined = parts.map((p, i) => `Part ${i + 1}:\n${p}`).join('\n\n')
+    const merged = (await pass(joined)).trim()
+    return merged || parts.join('\n\n')
   }
 
   /**
@@ -560,12 +665,39 @@ Platform: Windows (PowerShell)${memoryBlock}`
     }
   }
 
-  /** Seed the rolling history from a persisted session (used on resume). */
+  /**
+   * Seed the rolling history from a persisted session (used on resume).
+   *
+   * A compacted session is rebuilt from its summary plus everything after the point that summary
+   * covers. This is the whole reason compaction is stored rather than kept in memory: every turn
+   * rebuilds the history from the session, so a compaction that lived only in the rolling window
+   * was undone by the next message the user sent — the transcript shrank for one turn and was
+   * back to full size for the next.
+   *
+   * A summary whose boundary message no longer exists is ignored rather than trusted. Rewinding
+   * to a checkpoint can remove the messages it described, and a summary of work that has been
+   * undone tells the model about things that did not happen.
+   */
   hydrate(session: AgentSessionState): void {
+    const all = session.messages.filter((m) => m.role !== 'system')
+    let rest = all
+    const summarised: ChatMessage[] = []
+
+    if (session.summary && session.summaryUpto) {
+      const cut = all.findIndex((m) => m.id === session.summaryUpto)
+      if (cut !== -1) {
+        rest = all.slice(cut + 1)
+        summarised.push({
+          role: 'user',
+          content: `[Summary of earlier work in this session]\n${session.summary}`
+        })
+      }
+    }
+
     this.history = [
       { role: 'system', content: this.buildSystemPrompt() },
-      ...session.messages
-        .filter((m) => m.role !== 'system')
+      ...summarised,
+      ...rest
         .map((m): ChatMessage => {
           if (m.role === 'tool') {
             return { role: 'user', content: `[tool result]\n${m.content}` }
@@ -678,6 +810,15 @@ Platform: Windows (PowerShell)${memoryBlock}`
            */
           if (ev.type === 'context') {
             this.emit('contextUsed', { used: ev.used, max: ev.max })
+          }
+          /*
+           * Forwarded as it is written, so the transcript can show what is being composed.
+           *
+           * Dropped during Ultra sampling by the overridden `emit` above, along with everything
+           * else belonging to a draft rather than to the real turn.
+           */
+          if (ev.type === 'tool_call_partial') {
+            this.emit('toolCallPartial', { index: ev.index, name: ev.name, args: ev.args })
           }
           if (ev.type === 'reasoning') {
             thinking += ev.text

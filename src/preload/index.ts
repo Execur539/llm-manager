@@ -28,6 +28,7 @@ const EVENT_CHANNELS = [
   'agent:context',
   'agent:message',
   'agent:tool-call',
+  'agent:tool-call-partial',
   'agent:tool-result',
   'agent:sub-tool-call',
   'agent:permission-request',

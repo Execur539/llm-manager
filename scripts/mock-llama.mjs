@@ -310,10 +310,18 @@ const server = http.createServer(async (req, res) => {
       for (const [index, call] of calls.entries()) {
         send(frame({ tool_calls: [{ index, id: call.id, function: { name: call.function.name, arguments: '' } }] }))
         const args = call.function.arguments
+        /*
+         * Arguments stream at the same pace as prose under [[mock:slow]].
+         *
+         * A real model writes a tool call token by token like anything else, and a long argument
+         * — a file's contents, a command — takes seconds. This was pinned at 6ms regardless, so
+         * a whole call completed in about a tenth of a second and nothing that happens *while* a
+         * call is being written could be observed at all.
+         */
         for (let i = 0; i < args.length; i += 7) {
           if (aborted) return
           send(frame({ tool_calls: [{ index, function: { arguments: args.slice(i, i + 7) } }] }))
-          await sleep(6)
+          await sleep(delay)
         }
       }
       send(frame({}, 'tool_calls'))

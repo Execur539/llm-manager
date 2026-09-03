@@ -252,6 +252,9 @@ function getAgent(): Agent {
     })
     agent.on('message', (m) => emit('agent:message', { sessionId: sid(), message: m }))
     agent.on('toolCall', (c) => emit('agent:tool-call', { sessionId: sid(), call: c }))
+    agent.on('toolCallPartial', (p: { index: number; name: string; args: string }) =>
+      emit('agent:tool-call-partial', { sessionId: sid(), ...p })
+    )
     agent.on('toolResult', (r) => emit('agent:tool-result', { sessionId: sid(), result: r }))
     agent.on('subToolCall', (c) => emit('agent:sub-tool-call', { sessionId: sid(), call: c }))
     agent.on('compacting', (info) => emit('agent:compacting', { sessionId: sid(), ...(info as object) }))
@@ -1150,9 +1153,41 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     drainPendingPermissions()
     return true
   },
-  'agent:compact': async () => {
-    await agent?.compactNow()
-    return true
+  /**
+   * Compact the session the user is looking at.
+   *
+   * This took no argument and compacted whatever happened to be in the agent's memory. Nothing
+   * hydrates it outside of a turn, so clicking this after opening the app — before sending
+   * anything — found an empty history, returned early, and reported success for work it had not
+   * done. When it did find a history, it was whichever session last ran, not necessarily this one.
+   */
+  'agent:compact': async (sessionId?: string) => {
+    const id = sessionId || activeAgentSessionId
+    const session = id ? chats.loadSession(id) : null
+    if (!session) {
+      return { ok: false, message: 'Open a conversation before compacting it.' }
+    }
+
+    const a = getAgent()
+    activeAgentSessionId = id
+    a.hydrate(session)
+    const report = await a.compactNow(session)
+
+    /*
+     * Re-measure, rather than leaving the old figure on screen.
+     *
+     * Compaction issues no request for the conversation itself, so nothing would otherwise
+     * report its new size — the reading stayed at the pre-compaction number and the whole thing
+     * looked as though it had achieved nothing. The estimate is the same one compaction sized
+     * its own work with; the next real turn replaces it with the server's exact count.
+     */
+    if (report.ok && typeof report.afterTokens === 'number') {
+      const max = llama.loaded?.plan.contextLength ?? 0
+      if (max > 0) emit('agent:context', { sessionId: id, used: report.afterTokens, max })
+      chats.setContextUsed(id, report.afterTokens)
+      setContextUsed(report.afterTokens)
+    }
+    return report
   },
   'agent:set-cwd': async (sessionId?: string) => {
     const result = await dialog.showOpenDialog({ properties: ['openDirectory'] })
@@ -1182,6 +1217,16 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   'agent:rewind': async (sessionId: string, checkpointId: string, messageId?: string) => {
     const result = await rewindTo(sessionId, checkpointId)
     if (messageId) chats.truncateFrom(sessionId, messageId)
+    /*
+     * A summary of work that has just been undone is worse than no summary.
+     *
+     * Rewinding removes messages, and the stored summary describes a stretch of them. Keeping it
+     * would have the model told, every turn, about files it wrote and commands it ran that the
+     * rewind has taken back. Dropping it costs only the room the summary was saving.
+     */
+    chats.clearSummary(sessionId)
+    // The agent's rolling history still holds the rewound turns; the next run re-hydrates it.
+    agent?.resetHistory()
     return result
   },
   'agent:memory': () => allMemory(),

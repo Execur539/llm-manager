@@ -337,6 +337,16 @@ export interface AgentSessionState {
    * different one until that model reports for itself.
    */
   contextUsed?: number
+  /**
+   * A summary standing in for the earliest part of this session, when it has been compacted.
+   *
+   * The transcript keeps every message; this is what the *model* is sent in their place. Held
+   * on the session rather than in the rolling history because every turn rebuilds that history
+   * from storage — a compaction that lived only in memory was undone by the next message.
+   */
+  summary?: string
+  /** The last message the summary covers. Everything after it is sent verbatim. */
+  summaryUpto?: string
 }
 
 // ---------------------------------------------------------------- settings

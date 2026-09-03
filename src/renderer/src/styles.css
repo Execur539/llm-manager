@@ -881,6 +881,51 @@ pre {
 }
 
 /*
+ * A call still being written.
+ *
+ * Deliberately the same shell as a finished card, so when the real one replaces it nothing jumps
+ * — the row is already the right height in the right place, and only its contents change. It is
+ * not a <details> because there is nothing to expand yet: half-written JSON is not worth
+ * offering to unfold.
+ */
+.tool-card.pending {
+  border-style: dashed;
+  border-color: var(--border-strong);
+}
+
+.pending-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 10px;
+}
+
+/*
+ * A caret, for the same reason the streaming answer has one: it says the text is still arriving
+ * rather than finished and short.
+ */
+.pending-caret {
+  width: 6px;
+  height: 12px;
+  margin-left: auto;
+  flex-shrink: 0;
+  border-radius: 1px;
+  background: var(--warn);
+  animation: pending-blink 1.05s steps(1) infinite;
+}
+
+@keyframes pending-blink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  51%,
+  100% {
+    opacity: 0.15;
+  }
+}
+
+/*
  * The detail body must not scroll: the <pre> blocks inside it already do, and nesting the two
  * put a scrollbar inside a scrollbar — you had to scroll the code, then scroll the card, to
  * reach the rest. The card grows instead, and the message list is the single scroll region.
@@ -2164,13 +2209,27 @@ button.danger.subtle:hover {
   line-height: 1.45;
 }
 
+/*
+ * Big enough to actually hit.
+ *
+ * A 16px glyph with 2px of padding gave a 15px-wide target — fine for a confident mouse, poor
+ * for a trackpad and worse on the remote UI on a phone, where it is the control for dismissing
+ * something that has appeared over the interface. Widened without moving the glyph: the box
+ * grows around it, so nothing in the toast shifts.
+ */
 .toast-close {
   background: none;
   border: none;
   color: var(--text-faint);
   font-size: 16px;
   line-height: 1;
-  padding: 0 2px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin: -4px -6px -4px 0;
+  padding: 0;
+  border-radius: var(--r-sm);
   cursor: pointer;
   flex-shrink: 0;
 }

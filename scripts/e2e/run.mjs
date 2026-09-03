@@ -330,15 +330,67 @@ const scenarios = {
       await shot(page, 'agent-tools')
       await page.getByTestId('toggle-tools').click()
 
-      // A read-tier tool should run without prompting.
-      await page.getByTestId('agent-input').fill('[[mock:tool]] list the current directory')
+      /*
+       * What the transcript shows while a call is being written, before it can run.
+       *
+       * A call cannot be dispatched until every argument has arrived, so this window used to be
+       * blank — the model had stopped writing prose and the card did not exist yet. Slowed
+       * deliberately, because at full speed a call completes in a tenth of a second and the
+       * state being asserted is over before it can be observed. That is also why it was never
+       * noticed as missing.
+       */
+      await page.getByTestId('agent-input').fill('[[mock:tool]] [[mock:slow]] list the current directory')
       await page.getByTestId('agent-send').click()
+
+      const pending = await page
+        .waitForSelector('[data-testid="pending-tool-call"]', { timeout: 30000 })
+        .then((el) => el.textContent())
+        .catch(() => null)
+      report.check('agent', 'a tool call is shown inline while it is being written',
+        !!pending, pending ?? 'never appeared')
+      report.check('agent', 'and names the tool it is about to run',
+        !!pending && /list_dir|read_file|[a-z_]{3,}/.test(pending), pending ?? '')
+
+      // It must give way to a real card rather than the two accumulating side by side.
+      await page.waitForSelector('[data-testid="tool-card"]', { timeout: 30000 }).catch(() => undefined)
+      await page.waitForTimeout(400)
+      const settled = await page.getByTestId('pending-tool-call').count()
+      report.check('agent', 'a completed call becomes a real card, not a second in-progress one',
+        settled <= 1, `${settled} in-progress cards at once`)
+
+      /*
+       * And nothing is left claiming to be in progress once the turn is over.
+       *
+       * A stopped turn abandons whatever call was mid-composition, and the finished call that
+       * would normally replace it is precisely what never arrives — so without clearing it on
+       * the way out, the transcript kept a card saying the agent was writing while nothing was
+       * running at all.
+       */
+      await stopTurn(page, 'agent-input')
+      await page.waitForTimeout(300)
+      const afterStop = await page.getByTestId('pending-tool-call').count()
+      report.check('agent', 'stopping a turn clears a half-written call',
+        afterStop === 0, `${afterStop} left on screen`)
 
       const sawTool = await page
         .waitForSelector('[data-testid="tool-card"]', { timeout: 30000 })
         .then(() => true)
         .catch(() => false)
       report.check('agent', 'tool call renders a card', sawTool)
+
+      /*
+       * Compacting must say what it did, including when it did nothing.
+       *
+       * The button sent no session id and reported no result. Nothing hydrates the agent outside
+       * of a turn, so clicking it could find an empty history, return early, and look exactly
+       * like success — no message, no visible change, no way to tell the difference. Whichever
+       * branch this session lands in, silence is the one outcome that is wrong.
+       */
+      await page.getByTestId('compact-session').click()
+      await page.waitForTimeout(1500)
+      const said = (await toastTexts(page)).join(' | ')
+      report.check('agent', 'compacting reports what it did rather than failing silently',
+        said.trim().length > 0, said || 'no toast at all')
 
       if (sawTool) {
         await page.waitForTimeout(2500)
@@ -2562,11 +2614,12 @@ for (const name of names) {
 }
 
 /*
- * Scenarios that bind a fixed port, and so cannot have a twin running beside them.
+ * Scenarios that start a server, kept apart from the rest out of caution.
  *
- * The API server's default port is 1234, from the shipped settings — every sandbox gets its own
- * settings file but they all start from the same default, so two of these at once means one of
- * them fails to bind and reports a defect that is entirely the test runner's fault.
+ * Each sandbox is now given its own API port, so these no longer collide with each other — or,
+ * more importantly, with a copy of the app the developer happens to have running, which held
+ * port 1234 and made three scenarios report a server that would not start. Still grouped, since
+ * a bound socket is the one resource here that is not sandboxed by construction.
  */
 const SERIAL = new Set(['server', 'remote', 'apiSurface'])
 

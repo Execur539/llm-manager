@@ -35,6 +35,8 @@ interface ChatRow {
   created_at: number
   updated_at: number
   context_used: number | null
+  summary: string | null
+  summary_upto: string | null
 }
 
 interface MessageRow {
@@ -212,7 +214,9 @@ export function loadSession(chatId: string): AgentSessionState | null {
     ).map((t) => ({ id: t.id, text: t.text, done: !!t.done })),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    contextUsed: row.context_used ?? undefined
+    contextUsed: row.context_used ?? undefined,
+    summary: row.summary ?? undefined,
+    summaryUpto: row.summary_upto ?? undefined
   }
 }
 
@@ -224,6 +228,20 @@ export function loadSession(chatId: string): AgentSessionState | null {
  * that is superseded immediately. What matters across a restart is where the conversation ended
  * up, not every step it took getting there.
  */
+export function setSummary(chatId: string, summary: string, uptoMessageId: string): void {
+  run('UPDATE chats SET summary = ?, summary_upto = ? WHERE id = ?', summary, uptoMessageId, chatId)
+}
+
+/**
+ * Forget a session's summary, so the model sees the whole transcript again.
+ *
+ * Needed when history is rewound past the point the summary covers: a summary of messages that
+ * no longer exist describes work the session has been told never happened.
+ */
+export function clearSummary(chatId: string): void {
+  run('UPDATE chats SET summary = NULL, summary_upto = NULL WHERE id = ?', chatId)
+}
+
 export function setContextUsed(chatId: string, tokens: number): void {
   run('UPDATE chats SET context_used = ? WHERE id = ?', Math.max(0, Math.round(tokens)), chatId)
 }

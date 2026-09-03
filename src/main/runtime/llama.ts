@@ -118,6 +118,20 @@ export type StreamEvent =
    */
   | { type: 'reasoning'; text: string }
   | { type: 'tool_call'; call: StreamedToolCall }
+  /**
+   * A tool call the model is still writing.
+   *
+   * Calls are only complete once their arguments have finished arriving, so a finished
+   * `tool_call` cannot be emitted until the stream ends — which means everything between the
+   * model deciding to act and the call being ready was silence. On a long argument, a file being
+   * written or a command being composed, that is several seconds of the agent appearing to have
+   * stopped.
+   *
+   * `args` is the raw JSON accumulated so far and is therefore usually incomplete: `{"path":"no`
+   * is a normal value for it. It is for showing, not for parsing — the finished `tool_call`
+   * carries the parsed arguments.
+   */
+  | { type: 'tool_call_partial'; index: number; name: string; args: string }
   | { type: 'usage'; promptTokens: number; completionTokens: number }
   /**
    * How far the server has got through *reading* the prompt, before generation begins.
@@ -426,6 +440,12 @@ export class LlamaRuntime extends EventEmitter {
     // index -> accumulating call
     const pending = new Map<number, { id: string; name: string; args: string }>()
 
+    /** Indices already reported as in progress, so a new call is always announced at once. */
+    const announcedCalls = new Set<number>()
+    let lastPartialAt = 0
+    /** Fast enough to look like typing, slow enough not to flood the bridge. */
+    const PARTIAL_INTERVAL_MS = 120
+
     const flushCalls = function* (): Generator<StreamEvent> {
       for (const [, c] of pending) {
         let parsed: Record<string, unknown> = {}
@@ -543,6 +563,23 @@ export class LlamaRuntime extends EventEmitter {
               if (frag.function?.name) existing.name += frag.function.name
               if (frag.function?.arguments) existing.args += frag.function.arguments
               pending.set(idx, existing)
+
+              /*
+               * Report the call as it is being written, not only once it is finished.
+               *
+               * Immediately when a call first appears, because knowing *which* tool is about to
+               * run is the most useful thing here and it is known from the first fragment. After
+               * that on a throttle: arguments arrive a few characters at a time, and forwarding
+               * every fragment would put hundreds of messages across the bridge to animate a
+               * line of text.
+               */
+              const now = Date.now()
+              const isNew = !announcedCalls.has(idx)
+              if (isNew || now - lastPartialAt >= PARTIAL_INTERVAL_MS) {
+                announcedCalls.add(idx)
+                lastPartialAt = now
+                yield { type: 'tool_call_partial', index: idx, name: existing.name, args: existing.args }
+              }
             }
           }
 

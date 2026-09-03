@@ -270,6 +270,22 @@ export const MIGRATIONS: { id: number; sql: string }[] = [
     -- a blank.
     ALTER TABLE chats ADD COLUMN context_used INTEGER;
     `
+  },
+  {
+    id: 8,
+    sql: `
+    -- A compacted session's summary, and the message it summarises up to.
+    --
+    -- Compaction rewrote the agent's in-memory history and nothing else, while every turn
+    -- rebuilt that history from this table -- so the next message undid it completely and the
+    -- context never actually shrank. Recording it here is what makes it survive.
+    --
+    -- The transcript itself is left alone. What is summarised is what the *model* is sent; the
+    -- messages stay in the database and on screen, because a user compacting to reclaim room
+    -- has not asked to lose their own history.
+    ALTER TABLE chats ADD COLUMN summary TEXT;
+    ALTER TABLE chats ADD COLUMN summary_upto TEXT;
+    `
   }
 ]
 

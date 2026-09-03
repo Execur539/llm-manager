@@ -13,6 +13,7 @@ import {
   setReasoning,
   adoptReasoning,
   seedContext,
+  toast,
   DRAFT_AGENT
 } from '../lib/store'
 import type { LoadedModel } from '../App'
@@ -29,6 +30,7 @@ import { Spinner } from '../components/Spinner'
 import PromptProgress from '../components/PromptProgress'
 import ContextMeter from '../components/ContextMeter'
 import CompactingNotice from '../components/CompactingNotice'
+import PendingToolCall from '../components/PendingToolCall'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
@@ -104,6 +106,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   const error = activeId ? stream.errors[activeId] : null
   const notice = activeId ? stream.notices[activeId] : null
   const liveToolCalls = activeId ? (stream.toolCalls[activeId] ?? []) : []
+  const pendingCalls = activeId ? (stream.pendingCalls[activeId] ?? []) : []
   // The agent view restores no session on mount, so this is null far more often than in chat —
   // which is what made the control look broken here first.
   const effortId = activeId ?? DRAFT_AGENT
@@ -295,7 +298,31 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
           <button onClick={() => void pickCwd()} title={cwd || 'Choose the folder the agent works in'}>
             {cwd ? `📁 ${cwd.split(/[\\/]/).filter(Boolean).pop()}` : 'Set folder'}
           </button>
-          <button onClick={() => void invoke('agent:compact')} title="Summarise older turns to free context">
+          {/*
+            * Names the session, and says what happened.
+            *
+            * It used to send no argument and report nothing. With nothing to identify the
+            * conversation the main process compacted whatever was last in memory — often
+            * nothing at all — and either way the button looked identical: no message, no change
+            * on screen, and no way to tell success from a silent no-op.
+            */}
+          <button
+            disabled={!activeId || busy}
+            onClick={async () => {
+              if (!activeId) return
+              const r = await invoke<{ ok: boolean; message: string; beforeTokens?: number; afterTokens?: number }>(
+                'agent:compact',
+                activeId
+              )
+              const saved =
+                r.ok && r.beforeTokens != null && r.afterTokens != null
+                  ? ` Freed about ${Math.max(0, r.beforeTokens - r.afterTokens).toLocaleString()} tokens.`
+                  : ''
+              toast(`${r.message}${saved}`, r.ok ? 'success' : 'info')
+            }}
+            title="Summarise older turns to free context"
+            data-testid="compact-session"
+          >
             Compact
           </button>
           {running && (
@@ -399,6 +426,16 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             <ToolCard key={entry.call.id} call={entry.call} result={entry.result} />
           ))}
 
+          {/*
+            * Calls still being written, in the position their finished cards will take.
+            *
+            * After the completed ones, because that is the order they happened in — the model
+            * finishes one call before starting the next, and this is the one it is on now.
+            */}
+          {pendingCalls.map((c) => (
+            <PendingToolCall key={c.index} name={c.name} args={c.args} />
+          ))}
+
           {(partial || reasoning || ultra.length > 0) && (
             <MessageRow role="assistant" testId="streaming-message">
               {/* Plans, while they are being weighed — above whatever the run then does. */}
@@ -417,7 +454,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             * tool list are both non-empty, so gating on those — as the dots do — would hide the
             * bar for exactly the steps where the wait is longest.
             */}
-          {running && (progress || (!partial && !reasoning && !unsavedCalls.length && !ultra.length)) && (
+          {running && (progress || (!partial && !reasoning && !unsavedCalls.length && !pendingCalls.length && !ultra.length)) && (
             <MessageRow role="assistant">
               {progress ? (
                 <PromptProgress {...progress} />

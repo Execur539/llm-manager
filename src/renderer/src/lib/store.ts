@@ -81,6 +81,14 @@ export interface StreamState {
   /** tool calls seen this turn, so a remount can still render them in order */
   toolCalls: Record<string, { call: ToolCall; result?: ToolResult }[]>
   /**
+   * Tool calls the model is still writing, keyed by conversation and ordered by call index.
+   *
+   * A call cannot be dispatched until its arguments have finished arriving, so between the model
+   * deciding to act and the call being ready there was nothing on screen at all. `args` is the
+   * raw, usually incomplete JSON accumulated so far — for showing, not for parsing.
+   */
+  pendingCalls: Record<string, { index: number; name: string; args: string }[]>
+  /**
    * Ultra's independent attempts for the turn in flight, keyed by conversation.
    *
    * Held apart from `partial` on purpose: these are drafts, and the place the real answer will
@@ -174,6 +182,7 @@ const state: StreamState = {
   permissionQueue: [],
   questionQueue: [],
   toolCalls: {},
+  pendingCalls: {},
   ultra: {},
   ultraSynthesising: {},
   ultraPlan: {},
@@ -205,6 +214,7 @@ function emitChange(): void {
     permissionQueue: [...state.permissionQueue],
     questionQueue: [...state.questionQueue],
     toolCalls: { ...state.toolCalls },
+    pendingCalls: { ...state.pendingCalls },
     ultra: { ...state.ultra },
     ultraSynthesising: { ...state.ultraSynthesising },
     ultraPlan: { ...state.ultraPlan },
@@ -233,13 +243,12 @@ export function setRunning(id: string, running: boolean): void {
     state.errors[id] = null
     state.partial[id] = ''
     state.toolCalls[id] = []
+    state.pendingCalls[id] = []
     state.ultra[id] = []
     state.ultraSynthesising[id] = false
     delete state.ultraPlan[id]
     // Last turn's figure would otherwise flash before the first frame of this one arrives.
     delete state.promptProgress[id]
-  delete state.context[id]
-  delete state.compacting[id]
   } else {
     // The samples were scaffolding for an answer that now exists on its own.
     delete state.ultra[id]
@@ -248,6 +257,14 @@ export function setRunning(id: string, running: boolean): void {
     // A turn that ended without ever generating — stopped, or failed — must not leave a
     // progress bar sitting at whatever it had reached.
     delete state.promptProgress[id]
+    /*
+     * Nor a tool call that is forever about to be written.
+     *
+     * A stopped turn abandons whatever call was mid-composition, and nothing else clears it —
+     * the finished `tool_call` that normally supersedes it is exactly what never arrives. Left
+     * alone it sat there claiming the agent was still writing, with nothing running at all.
+     */
+    delete state.pendingCalls[id]
   }
   emitChange()
 }
@@ -294,6 +311,11 @@ export function clearFor(id: string): void {
   delete state.errors[id]
   delete state.notices[id]
   delete state.toolCalls[id]
+  delete state.pendingCalls[id]
+  // The conversation is gone, so its context reading and any compaction go with it. These are
+  // the only place they are removed: both deliberately outlive individual turns.
+  delete state.context[id]
+  delete state.compacting[id]
   delete state.ultra[id]
   delete state.ultraSynthesising[id]
   delete state.ultraPlan[id]
@@ -628,11 +650,30 @@ function wire(): void {
     emitChange()
   })
 
+  on<{ sessionId?: string; index: number; name: string; args: string }>(
+    'agent:tool-call-partial',
+    (d) => {
+      const id = d.sessionId || activeId
+      const list = state.pendingCalls[id] ?? []
+      const at = list.findIndex((c) => c.index === d.index)
+      const next = { index: d.index, name: d.name, args: d.args }
+      state.pendingCalls[id] = at === -1 ? [...list, next] : list.map((c, i) => (i === at ? next : c))
+      emitChange()
+    }
+  )
+
   on<{ sessionId?: string; call?: ToolCall } | ToolCall>('agent:tool-call', (payload) => {
     const wrapped = payload as { sessionId?: string; call?: ToolCall }
     const call = (wrapped.call ?? payload) as ToolCall
     const id = wrapped.sessionId || activeId
     state.toolCalls[id] = [...(state.toolCalls[id] ?? []), { call }]
+    /*
+     * The finished calls supersede everything that was being written.
+     *
+     * They all arrive together, once the stream ends, so the first real call means every
+     * in-progress one is now complete and about to be rendered properly.
+     */
+    state.pendingCalls[id] = []
     emitChange()
   })
 
