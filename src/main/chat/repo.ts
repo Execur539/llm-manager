@@ -318,6 +318,17 @@ export function recordAttachment(messageId: string, att: AttachmentInput, meta?:
   return id
 }
 
+/**
+ * Fill in what preparing an attachment produced, after the row already exists.
+ *
+ * The row is written before the file is processed so the transcript can show it straight away —
+ * a two-minute video can take a minute to sample, and a message that does not appear until that
+ * finishes looks like the app has hung. What the sampler made of it is known only afterwards.
+ */
+export function setAttachmentMeta(id: string, meta: unknown): void {
+  run('UPDATE attachments SET meta = ? WHERE id = ?', meta ? JSON.stringify(meta) : null, id)
+}
+
 export function attachmentsFor(messageId: string): { id: string; kind: string; path: string }[] {
   return all<{ id: string; kind: string; path: string }>(
     'SELECT id, kind, path FROM attachments WHERE message_id = ?',

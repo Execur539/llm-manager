@@ -47,6 +47,13 @@ export interface StreamState {
    */
   promptProgress: Record<string, { percent: number; processed: number; total: number; cached: number }>
   /**
+   * What is being done to an attachment before the turn can start.
+   *
+   * Preparing a video is several complete passes over the source; on a long or awkwardly encoded
+   * file that is minutes during which nothing else has anything to say.
+   */
+  mediaStage: Record<string, { file: string; stage: string }>
+  /**
    * How much of the model's context window a conversation is occupying, and how big it is.
    *
    * Unlike everything else here this is not per-turn state and is deliberately not cleared when
@@ -172,6 +179,7 @@ function saveSelection(selection: { chat: string | null; agent: string | null })
 const state: StreamState = {
   partial: {},
   promptProgress: {},
+ mediaStage: {},
   context: {},
   compacting: {},
   reasoningPartial: {},
@@ -204,6 +212,7 @@ function emitChange(): void {
   snapshot = {
     partial: { ...state.partial },
     promptProgress: { ...state.promptProgress },
+ mediaStage: { ...state.mediaStage },
     context: { ...state.context },
     compacting: { ...state.compacting },
     reasoningPartial: { ...state.reasoningPartial },
@@ -305,6 +314,7 @@ export function clearFor(id: string): void {
   saveSelection(state.selection)
   delete state.partial[id]
   delete state.promptProgress[id]
+  delete state.mediaStage[id]
   delete state.reasoningPartial[id]
   delete state.running[id]
   delete state.pending[id]
@@ -467,6 +477,20 @@ function wire(): void {
   on<{ sessionId?: string; used: number; max: number }>('agent:context', (d) => {
     const id = d.sessionId || activeId
     state.context[id] = { used: d.used, max: d.max }
+    emitChange()
+  })
+
+  on<{ chatId?: string; file: string; stage: string }>('chat:media-progress', (d) => {
+    const id = d.chatId || activeId
+    if (d.stage) state.mediaStage[id] = { file: d.file, stage: d.stage }
+    else delete state.mediaStage[id]
+    emitChange()
+  })
+
+  on<{ sessionId?: string; file: string; stage: string }>('agent:media-progress', (d) => {
+    const id = d.sessionId || activeId
+    if (d.stage) state.mediaStage[id] = { file: d.file, stage: d.stage }
+    else delete state.mediaStage[id]
     emitChange()
   })
 

@@ -436,9 +436,19 @@ export interface AppSettings {
      * how legible each one is. 'motion' takes many small frames, for following what happens;
      * 'detail' takes fewer large ones, for reading text on screen.
      */
-    detail: 'motion' | 'balanced' | 'detail'
+    detail: 'motion' | 'balanced' | 'detail' | 'high'
     /** Fraction of the context window one video may occupy, 0-1. */
     contextShare: number
+    /** Ceiling on sampling rate in frames per second. */
+    maxFps: number
+    /** Size of the video track relative to a full frame, 0.25-1. */
+    trackScale: number
+    /** Share of the budget kept for full-resolution stills, when the track is reduced. */
+    stillShare: number
+    /** Drop frames that are near-copies of the one before them. */
+    dropDuplicates: boolean
+    /** Crop away the part of the frame that never changes. */
+    cropStatic: boolean
   }
   server: {
     enabled: boolean

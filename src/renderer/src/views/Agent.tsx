@@ -29,6 +29,7 @@ import ReasoningControl, { sendableChoice } from '../components/ReasoningControl
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
 import { Spinner } from '../components/Spinner'
 import PromptProgress from '../components/PromptProgress'
+import MediaStage from '../components/MediaStage'
 import ContextMeter from '../components/ContextMeter'
 import CompactingNotice from '../components/CompactingNotice'
 import PendingToolCall from '../components/PendingToolCall'
@@ -90,6 +91,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   const reasoning = activeId ? (stream.reasoningPartial[activeId] ?? '') : ''
   const running = activeId ? !!stream.running[activeId] : false
   const progress = activeId ? (stream.promptProgress[activeId] ?? null) : null
+  const media = activeId ? (stream.mediaStage[activeId] ?? null) : null
   const ctx = activeId ? (stream.context[activeId] ?? null) : null
   const compacting = activeId ? (stream.compacting[activeId] ?? null) : null
   /*
@@ -459,7 +461,14 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             */}
           {running && (progress || (!partial && !reasoning && !unsavedCalls.length && !pendingCalls.length && !ultra.length)) && (
             <MessageRow role="assistant">
-              {progress ? (
+              {/*
+                * Preparing an attachment comes before the model is given anything at all, so it
+                * outranks the prompt readout: while ffmpeg is sampling a video there is no prompt
+                * yet to be making progress through.
+                */}
+              {media ? (
+                <MediaStage {...media} />
+              ) : progress ? (
                 <PromptProgress {...progress} />
               ) : (
                 <div className="thinking">

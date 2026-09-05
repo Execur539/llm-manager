@@ -3830,3 +3830,217 @@ button.danger.subtle:hover {
   border-color: #5a4515;
   color: var(--text-faint);
 }
+
+/* ------------------------------------------------------------------ video settings */
+
+/*
+ * Rows of label-and-control, rather than the definition list the rest of Settings uses.
+ *
+ * These controls are wider than a checkbox and their labels need a sentence of explanation each,
+ * which a two-column `dl` cannot carry without either truncating the hint or pushing the control
+ * off the edge on a narrow window.
+ */
+.video-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.video-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.video-row:last-of-type {
+  border-bottom: none;
+}
+
+.video-row.is-disabled {
+  opacity: 0.45;
+}
+
+.video-row-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+}
+
+.video-row-hint {
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text-faint);
+}
+
+.video-row-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+/*
+ * Wide enough that a step is a deliberate movement rather than a nudge, and tall enough to grab.
+ *
+ * The element is 18px high while the visible track is 4px: styling the input's own box as the
+ * track made the whole control four pixels tall, which is a fiddly thing to hit with a mouse and
+ * an unusable one on a touchscreen. The layout audit flags anything under sixteen, and it was
+ * right to. The line is painted by the track pseudo-element instead, so the control looks the
+ * same and can actually be grabbed.
+ */
+.video-row-control input[type='range'] {
+  width: 190px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.video-row-control input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--bg-inset);
+}
+
+.video-row-control input[type='range']::-webkit-slider-thumb {
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  /* Centres the thumb on the track: half the thumb, less half the track. */
+  margin-top: -5px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--accent);
+  cursor: pointer;
+  transition: transform 100ms ease;
+}
+
+.video-row-control input[type='range']:hover::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+
+.video-row-control input[type='range']:disabled {
+  cursor: default;
+}
+
+.video-row-control input[type='range']:disabled::-webkit-slider-thumb {
+  background: var(--text-faint);
+  cursor: default;
+}
+
+/* A fixed slot, so the row does not shuffle as the number changes width. */
+.video-row-value {
+  min-width: 5ch;
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * What the settings above actually cost.
+ *
+ * Set apart from the controls because it is a consequence of them rather than another one: this
+ * is the number every slider in the panel is really adjusting, and it should read as the result.
+ */
+.video-estimate {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-inset);
+}
+
+.video-estimate-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.video-lengths {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-1);
+}
+
+.video-lengths button {
+  min-height: 0;
+  padding: 2px 9px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: none;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.video-lengths button:hover:not(.on) {
+  color: var(--text);
+}
+
+.video-lengths button.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+.video-estimate-figure {
+  margin-top: 8px;
+  font-size: 17px;
+  color: var(--text);
+}
+
+.video-estimate-figure strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.video-estimate-detail {
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.video-estimate-note {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--warn);
+}
+
+/*
+ * The preparing-an-attachment line, in the place the prompt readout would otherwise be.
+ *
+ * Shaped like `.thinking` rather than like the progress meter: there is no percentage to show,
+ * because the passes take wildly different amounts of time and dividing a bar evenly between
+ * them would claim a precision that does not exist.
+ */
+.media-stage-note {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.media-stage-file {
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-faint);
+}

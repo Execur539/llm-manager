@@ -47,7 +47,19 @@ const VIDEO_COST_FACTOR = 0.5
  * widths worked out to at 16:9, so a landscape video is unchanged and everything else stops
  * being penalised for its shape.
  */
-const DETAIL_PIXELS = { motion: 448 * 252, balanced: 640 * 360, detail: 896 * 504 } as const
+const DETAIL_PIXELS = {
+  motion: 448 * 252,
+  balanced: 640 * 360,
+  detail: 896 * 504,
+  /*
+   * 720p, for footage where the answer is written on the screen.
+   *
+   * Expensive and honest about it: a frame this size costs roughly four times a balanced one, so
+   * the frame rate drops in proportion. Worth it for a screen recording or anything where small
+   * text decides the answer, wasteful for footage where the motion is the point.
+   */
+  high: 1280 * 720
+} as const
 
 /**
  * Bounds the encoder enforces on a single frame, in tokens.
@@ -64,13 +76,23 @@ export type VideoDetail = keyof typeof DETAIL_PIXELS
 export interface VideoPlan {
   /** How many frames to sample. */
   count: number
-  /** Width to scale them to; height follows the aspect ratio. */
+  /** Full frame width, used for the stills; height follows the aspect ratio. */
   width: number
-  /** Estimated tokens the whole video will occupy. */
+  /** Width of the video track itself, which may be reduced below the full frame. */
+  trackWidth: number
+  /** How many full-resolution stills the budget leaves room for. */
+  stills: number
+  /** What one track frame and one still each cost, so an actual result can be priced. */
+  costPerFrame: number
+  costPerStill: number
+  /** Estimated tokens the whole video will occupy, track and stills together. */
   estimatedTokens: number
   /** Frames per second this works out to over the clip. */
   effectiveFps: number
 }
+
+/** However many cuts a video has, past this the stills stop earning their tokens. */
+export const MAX_STILLS = 24
 
 /**
  * Work out a frame budget from the window the model actually has.
@@ -95,6 +117,17 @@ export function planVideo(opts: {
    * which matters most for exactly the clips that were cropped hardest.
    */
   sourcePixels?: number
+  /**
+   * Fraction of the full frame the video track is sent at, between a quarter and all of it.
+   *
+   * Below 1 the track trades legibility for frame rate and leaves room for full-size stills at
+   * the cuts; at 1 it carries the detail itself and the stills are dropped as redundant.
+   */
+  trackScale?: number
+  /** Share of the budget reserved for those stills. */
+  stillShare?: number
+  /** Ceiling on sampling rate, whatever the budget could otherwise afford. */
+  maxFps?: number
 }): VideoPlan {
   /*
    * Derive the frame's shape from an area budget and its aspect ratio, then round to the 28px
@@ -121,14 +154,38 @@ export function planVideo(opts: {
   const width = Math.max(grid, snap(Math.sqrt(area * aspect)))
   const height = Math.max(grid, snap(width / aspect))
 
-  const perFrame = Math.min(
-    MAX_TOKENS_PER_FRAME,
-    Math.max(MIN_TOKENS_PER_FRAME, (width / grid) * (height / grid))
-  )
-  const costPerFrame = Math.max(1, Math.ceil(perFrame * (opts.temporalPairing ? VIDEO_COST_FACTOR : 1)))
+  /*
+   * The video track is a fraction of the full frame, and the planner has to know it.
+   *
+   * It used to be halved after the fact, downstream of the budget, so the plan believed it was
+   * spending on 644px frames while 336px ones were sent — and once the per-frame cost was
+   * corrected downward, that halving left four fifths of the allowance unspent. Sizing the track
+   * here means the budget is measured against what is actually sent.
+   */
+  const trackWidth = Math.max(grid, snap(width * clamp(opts.trackScale ?? 1, 0.25, 1)))
+  const trackHeight = Math.max(grid, snap(trackWidth / aspect))
+
+  const tokensFor = (w: number, h: number): number =>
+    Math.min(MAX_TOKENS_PER_FRAME, Math.max(MIN_TOKENS_PER_FRAME, (w / grid) * (h / grid)))
+
+  const pairing = opts.temporalPairing ? VIDEO_COST_FACTOR : 1
+  const costPerFrame = Math.max(1, Math.ceil(tokensFor(trackWidth, trackHeight) * pairing))
+  // Stills are sent as images, so they never get the pairing discount.
+  const costPerStill = Math.max(1, Math.ceil(tokensFor(width, height)))
 
   const budget = Math.max(0, Math.floor(opts.contextLength * opts.share))
-  let count = Math.floor(budget / costPerFrame)
+
+  /*
+   * Stills are only worth reserving for when the track is reduced enough to pay for them.
+   *
+   * At full resolution the track already carries the detail they exist to restore, and spending
+   * a third of the window on near-duplicates of frames that are already legible is waste.
+   */
+  const stillShare = opts.temporalPairing && trackWidth < width ? clamp(opts.stillShare ?? 0.3, 0, 0.6) : 0
+  const stills = Math.min(MAX_STILLS, Math.floor((budget * stillShare) / costPerStill))
+  const trackBudget = Math.max(0, budget - stills * costPerStill)
+
+  let count = Math.floor(trackBudget / costPerFrame)
 
   /*
    * Two ceilings that have nothing to do with the budget.
@@ -148,11 +205,11 @@ export function planVideo(opts: {
    * The absolute cap is a guard against a pathological duration turning into tens of thousands
    * of ffmpeg seeks.
    */
-  const MAX_FPS = 2
+  const maxFps = clamp(opts.maxFps ?? 2, 0.1, 4)
   // Qwen's own preprocessing stops at 768 frames; beyond its tested range is not a good place
   // to be inventing behaviour.
   const MAX_FRAMES = 768
-  if (opts.durationSeconds > 0) count = Math.min(count, Math.ceil(opts.durationSeconds * MAX_FPS))
+  if (opts.durationSeconds > 0) count = Math.min(count, Math.ceil(opts.durationSeconds * maxFps))
   count = Math.max(1, Math.min(count, MAX_FRAMES))
 
   /*
@@ -167,9 +224,17 @@ export function planVideo(opts: {
   return {
     count,
     width,
-    estimatedTokens: count * costPerFrame,
+    trackWidth,
+    stills,
+    costPerFrame,
+    costPerStill,
+    estimatedTokens: count * costPerFrame + stills * costPerStill,
     effectiveFps: opts.durationSeconds > 0 ? count / opts.durationSeconds : 0
   }
+}
+
+function clamp(n: number, lo: number, hi: number): number {
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : lo
 }
 
 /**

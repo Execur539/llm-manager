@@ -50,7 +50,29 @@ export const DEFAULT_SETTINGS: AppSettings = {
      */
     detail: 'balanced',
     /** Share of the context window a single video may occupy. */
-    contextShare: 0.45
+    contextShare: 0.45,
+    /**
+     * Ceiling on how often the video is sampled, whatever the budget could otherwise afford.
+     *
+     * Qwen3-VL is trained and evaluated between two and four frames a second, and the sampling
+     * literature puts the practical default at one to two. Past that the extra frames are
+     * near-duplicates paying full price.
+     */
+    maxFps: 2,
+    /**
+     * How large the video track is relative to a full frame.
+     *
+     * Below 1 the clip is sent reduced and full-size stills are sent alongside it for the moments
+     * that changed; at 1 the clip carries the detail itself and the stills are dropped as
+     * redundant. Reducing it buys frame rate and costs legibility.
+     */
+    trackScale: 1,
+    /** Share of the budget reserved for those stills, when the track is reduced. */
+    stillShare: 0.3,
+    /** Drop frames that are near-copies of the one before them. */
+    dropDuplicates: true,
+    /** Crop away the part of the frame that never changes across the clip. */
+    cropStatic: true
   },
   server: {
     enabled: false,
@@ -104,7 +126,13 @@ const NUMERIC_BOUNDS: { path: [keyof AppSettings, string]; min: number; max: num
   { path: ['server', 'port'], min: 1, max: 65_535 },
   { path: ['downloads', 'connections'], min: 1, max: 16 },
   // A video may not take the whole window: the question about it has to fit too.
-  { path: ['video', 'contextShare'], min: 0.05, max: 0.8 }
+  { path: ['video', 'contextShare'], min: 0.05, max: 0.8 },
+  // Below a quarter frame per second a two-minute clip is eight pictures; above four the model
+  // is outside the range it was trained on.
+  { path: ['video', 'maxFps'], min: 0.25, max: 4 },
+  // A quarter-size track is already a sixteenth of the pixels; smaller is not legible.
+  { path: ['video', 'trackScale'], min: 0.25, max: 1 },
+  { path: ['video', 'stillShare'], min: 0, max: 0.6 }
 ]
 
 function clampNumerics(settings: AppSettings): AppSettings {

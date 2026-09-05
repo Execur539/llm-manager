@@ -3,6 +3,7 @@ import type { AppSettings } from '@shared/types'
 import { invoke, on, fmtBytes } from '../lib/api'
 import ConfirmDialog from '../components/ConfirmDialog'
 import NumberField from '../components/NumberField'
+import VideoSettings from '../components/VideoSettings'
 
 interface McpStatus {
   id: string
@@ -177,29 +178,6 @@ export default function Settings(): JSX.Element {
               <option value="sliding-window">Sliding window (drop oldest)</option>
             </select>
           </dd>
-          {/*
-            * Frames cost tokens by area, so this is a straight trade rather than a quality dial:
-            * smaller frames buy proportionally more of them out of the same budget. The frame
-            * count itself is derived from the loaded model's window, so a bigger context
-            * automatically buys a longer video rather than the same number of frames.
-            */}
-          <dt>Video sampling</dt>
-          <dd>
-            <select
-              value={settings.video.detail}
-              onChange={(e) =>
-                void patch({ video: { ...settings.video, detail: e.target.value as 'motion' | 'balanced' | 'detail' } })
-              }
-              data-testid="video-detail"
-            >
-              <option value="motion">Favour motion (more frames, smaller)</option>
-              <option value="balanced">Balanced</option>
-              <option value="detail">Favour detail (fewer frames, larger)</option>
-            </select>
-            <span className="faint" style={{ marginLeft: 6 }}>
-              how a video spends its share of the context window
-            </span>
-          </dd>
           <dt>Max tool calls / turn</dt>
           <dd>
             <NumberField
@@ -257,6 +235,16 @@ export default function Settings(): JSX.Element {
             {settings.agent.hardBlocksDisabled ? 'Re-enable hard blocks' : 'Disable hard blocks…'}
           </button>
         </div>
+      </div>
+
+      <div className="card">
+        <div className="card-title">Video</div>
+        {/*
+          * A video is the one attachment that can fill a context window on its own, so what the
+          * app does to it before the model sees it is worth being able to steer. Every control
+          * here moves the token cost, and the panel prices them rather than describing them.
+          */}
+        <VideoSettings settings={settings} patch={patch} />
       </div>
 
       <div className="card">

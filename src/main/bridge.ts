@@ -64,6 +64,7 @@ import {
 import * as rag from './rag'
 import * as chats from './chat/repo'
 import { buildContent, type VideoContext, type PreparedMedia } from './chat/multimodal'
+import { planVideo } from './chat/video-plan'
 import { classifyAttachment, recordAttachment, IMAGE_EXT, AUDIO_EXT, VIDEO_EXT, TEXT_EXT } from './chat/repo'
 import { historicalStats, liveStats, requestLog, recordGeneration, clearStats, setContextUsed } from './stats'
 import { buildDiagnostics, logger } from './log'
@@ -251,7 +252,25 @@ function getAgent(): Agent {
       // Kept for the end of the turn rather than written on every update — see the persist below.
       lastAgentContext = c.used
     })
-    agent.on('message', (m) => emit('agent:message', { sessionId: sid(), message: m }))
+    /*
+     * Re-attach the files on the way out.
+     *
+     * The user's turn is announced twice by design — once here, before any slow preparation, and
+     * again by the loop when it stores the turn for real. The renderer replaces by id, so the
+     * loop's copy wins, and the loop does not know about attachments: the message it builds has
+     * only text. The result was a transcript that showed the video for a moment and then dropped
+     * back to naming it.
+     *
+     * Looked up rather than remembered, and only for the role and shape that can have any, so a
+     * long agent turn does not query per assistant message.
+     */
+    agent.on('message', (m) => {
+      const message =
+        m.role === 'user' && !m.attachments?.length
+          ? { ...m, attachments: chats.attachmentsForMessage(m.id) }
+          : m
+      emit('agent:message', { sessionId: sid(), message })
+    })
     agent.on('toolCall', (c) => emit('agent:tool-call', { sessionId: sid(), call: c }))
     agent.on('toolCallPartial', (p: { index: number; name: string; args: string }) =>
       emit('agent:tool-call-partial', { sessionId: sid(), ...p })
@@ -468,6 +487,11 @@ async function videoContext(): Promise<VideoContext> {
     contextLength: llama.loaded?.plan.contextLength ?? 8192,
     share: s.video.contextShare,
     detail: s.video.detail,
+    maxFps: s.video.maxFps,
+    trackScale: s.video.trackScale,
+    stillShare: s.video.stillShare,
+    dropDuplicates: s.video.dropDuplicates,
+    cropStatic: s.video.cropStatic,
     serverTakesVideo: modalities.video,
     visionUnavailable: llama.loaded?.visionUnavailable
   }
@@ -475,12 +499,13 @@ async function videoContext(): Promise<VideoContext> {
 
 async function attachmentTurn(
   input: string,
-  files: string[]
+  files: string[],
+  onStage?: (p: { file: string; stage: string }) => void
 ): Promise<{ text: string; media: ContentPart[]; prepared: PreparedMedia[] }> {
   const caps = llama.loaded?.model.caps
   if (!caps) return { text: input, media: [], prepared: [] }
 
-  const built = await buildContent('', files, caps, await videoContext())
+  const built = await buildContent('', files, caps, await videoContext(), onStage)
   const sections: string[] = []
   const media: ContentPart[] = []
 
@@ -506,6 +531,38 @@ async function attachmentTurn(
 export const handlers: Record<string, (...args: never[]) => unknown> = {
   // ---- settings
   'settings:get': () => ({ ...loadSettings(), hfToken: getHfToken() ? '***set***' : null }),
+
+  /**
+   * What the current video settings would cost on a clip of a given length.
+   *
+   * Run through the real planner rather than reproduced in the renderer, because the numbers that
+   * decide it live here: the loaded model's context window, whether this server can take video at
+   * all, and the measured per-frame cost. A settings panel full of sliders whose effect you
+   * cannot see until you upload something is a panel of guesses.
+   */
+  'video:estimate': async (durationSeconds = 120) => {
+    const v = await videoContext()
+    const plan = planVideo({
+      contextLength: v.contextLength,
+      share: v.share,
+      detail: v.detail,
+      durationSeconds: Math.max(1, durationSeconds),
+      // A hypothetical clip has no shape of its own, and 16:9 is what most footage is.
+      aspect: 16 / 9,
+      temporalPairing: v.serverTakesVideo,
+      trackScale: v.trackScale,
+      stillShare: v.stillShare,
+      maxFps: v.maxFps
+    })
+    return {
+      ...plan,
+      contextLength: v.contextLength,
+      /** False when nothing is loaded, so the panel can say the figures are provisional. */
+      modelLoaded: !!llama.loaded,
+      serverTakesVideo: v.serverTakesVideo
+    }
+  },
+
   'settings:patch': (patch: Partial<AppSettings>) => {
     const next = patchSettings(patch)
     // Apply straight away so the agent never operates under superseded settings.
@@ -856,13 +913,6 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      */
     let prepared = new Map<string, PreparedMedia>()
 
-    if (attachments?.length) {
-      const built = await buildContent(text, attachments, loaded.model.caps, await videoContext())
-      userContent = built.parts
-      notes.push(...built.notes)
-      prepared = new Map(built.media.map((m) => [m.source, m]))
-    }
-
     // RAG: prepend retrieved context when a collection is attached.
     if (collectionId) {
       const hw = await getHardware()
@@ -889,14 +939,10 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       createdAt: Date.now()
     }
     chats.appendMessage(chatId, userMsg)
+    const attachmentIds = new Map<string, string>()
     for (const file of attachments ?? []) {
       try {
-        const media = prepared.get(file)
-        recordAttachment(
-          userMsg.id,
-          { path: file, kind: classifyAttachment(file) },
-          media ? { optimised: media.optimised, stills: media.stills, note: media.note } : undefined
-        )
+        attachmentIds.set(file, recordAttachment(userMsg.id, { path: file, kind: classifyAttachment(file) }))
       } catch (err) {
         // A missing attachment row must never cost the user their message — but it should not
         // vanish without trace either, or the only symptom is an export that quietly lost a file.
@@ -904,15 +950,36 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       }
     }
     chats.autoTitle(chatId)
+
     /*
-     * Announced with its files, not just its text.
+     * Announced with its files before any of them are prepared.
      *
-     * The stored message carries the attachments, but this event is what the transcript renders
-     * from until the conversation is next reopened — without them the turn would show as a bare
-     * `[Attached: ...]` line and only become a player after a reload.
+     * This event is what the transcript renders from until the conversation is next reopened, and
+     * preparing a video is minutes of ffmpeg — sending it afterwards meant the question and the
+     * video it was about only appeared once the wait was over.
      */
-    if (attachments?.length) userMsg.attachments = chats.attachmentsForMessage(userMsg.id)
-    emit('chat:message', { chatId, message: userMsg })
+    const announce = (): void => {
+      if (attachments?.length) userMsg.attachments = chats.attachmentsForMessage(userMsg.id)
+      emit('chat:message', { chatId, message: userMsg })
+    }
+    announce()
+
+    if (attachments?.length) {
+      const built = await buildContent(text, attachments, loaded.model.caps, await videoContext(), (p) =>
+        emit('chat:media-progress', { chatId, ...p })
+      )
+      userContent = built.parts
+      notes.push(...built.notes)
+      prepared = new Map(built.media.map((m) => [m.source, m]))
+
+      // Now that the clip exists, the row can point at it and the player gains its toggle.
+      for (const media of prepared.values()) {
+        const id = attachmentIds.get(media.source)
+        if (id) chats.setAttachmentMeta(id, { optimised: media.optimised, stills: media.stills, note: media.note })
+      }
+      if (prepared.size) announce()
+      emit('chat:media-progress', { chatId, file: '', stage: '' })
+    }
     if (notes.length) emit('chat:notes', notes)
 
     const started = Date.now()
@@ -1053,10 +1120,6 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      * it — assistant turns, tool results — stays plain text, which is the arrangement llama.cpp
      * expects and the reason the loop can feed its history back unchanged each iteration.
      */
-    const turn = attachments?.length
-      ? await attachmentTurn(input, attachments)
-      : { text: input, media: [] as ContentPart[], prepared: [] as PreparedMedia[] }
-
     /*
      * What the transcript shows, as distinct from what the model is sent.
      *
@@ -1089,12 +1152,15 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const userMessageId = `${Date.now().toString(36)}-u`
 
     /*
-     * The turn is written now, ahead of the loop, so its files have something to hang off.
+     * Announced before the files are prepared, not after.
      *
-     * Foreign keys are on, so an attachment row naming a message that does not exist is rejected
-     * outright — recording them first failed silently into a log line. The loop stores this same
-     * id a moment later and that write is an upsert, so the row is updated in place rather than
-     * replaced, and the attachments survive it.
+     * Sampling a video is minutes of ffmpeg on anything long or awkwardly encoded, and all of it
+     * used to happen before the turn was announced — so the transcript showed a spinner with
+     * nothing above it and no indication that anything was happening, for the whole wait.
+     *
+     * The message row is written first because foreign keys are on and an attachment naming a
+     * message that does not exist is rejected. The loop stores this same id later and that write
+     * is an upsert, so the row is updated in place and the attachments survive it.
      */
     chats.appendMessage(sessionId, {
       id: userMessageId,
@@ -1103,30 +1169,51 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       createdAt: Date.now()
     })
 
-    const preparedByFile = new Map(turn.prepared.map((m) => [m.source, m]))
+    const attachmentIds = new Map<string, string>()
     for (const file of attachments ?? []) {
       try {
-        const media = preparedByFile.get(file)
-        recordAttachment(
-          userMessageId,
-          { path: file, kind: classifyAttachment(file) },
-          media ? { optimised: media.optimised, stills: media.stills, note: media.note } : undefined
-        )
+        attachmentIds.set(file, recordAttachment(userMessageId, { path: file, kind: classifyAttachment(file) }))
       } catch (err) {
         logger.warn('agent', `could not record attachment ${file}`, err)
       }
     }
 
-    emit('agent:message', {
-      sessionId,
-      message: {
-        id: userMessageId,
-        role: 'user',
-        content: displayText,
-        createdAt: Date.now(),
-        attachments: attachments?.length ? chats.attachmentsForMessage(userMessageId) : undefined
+    const announce = (): void => {
+      emit('agent:message', {
+        sessionId,
+        message: {
+          id: userMessageId,
+          role: 'user',
+          content: displayText,
+          createdAt: Date.now(),
+          attachments: attachments?.length ? chats.attachmentsForMessage(userMessageId) : undefined
+        }
+      })
+    }
+    announce()
+
+    /*
+     * The slow part, now that the turn is on screen.
+     *
+     * Sampling a video is several ffmpeg passes over the source; on a long or awkwardly encoded
+     * file that is minutes, and it all used to happen above this point with nothing shown.
+     */
+    const turn = attachments?.length
+      ? await attachmentTurn(input, attachments, (p) => emit('agent:media-progress', { sessionId, ...p }))
+      : { text: input, media: [] as ContentPart[], prepared: [] as PreparedMedia[] }
+
+    /*
+     * Re-announced now that the sampler has finished, which is what puts the toggle on the
+     * player: until this point the row knows the file but not the clip that was made from it.
+     */
+    emit('agent:media-progress', { sessionId, file: '', stage: '' })
+    if (turn.prepared.length) {
+      for (const media of turn.prepared) {
+        const id = attachmentIds.get(media.source)
+        if (id) chats.setAttachmentMeta(id, { optimised: media.optimised, stills: media.stills, note: media.note })
       }
-    })
+      announce()
+    }
 
     const before = session.messages.length
     activeAgentSessionId = sessionId

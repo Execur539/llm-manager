@@ -135,6 +135,47 @@ console.log('\nplanner')
 }
 
 {
+  /*
+   * The track/stills split. At full size the clip carries the detail itself, so reserving a
+   * third of the window for near-duplicates of frames that are already legible is waste — and
+   * the reverse mistake, halving the track after the budget was set, is what left four fifths of
+   * the allowance unspent in 1.1.0.
+   */
+  const full = planVideo({ ...base, trackScale: 1 })
+  const half = planVideo({ ...base, trackScale: 0.5 })
+  check('at full size the track is the whole frame', full.trackWidth === full.width,
+    `${full.trackWidth} vs ${full.width}`)
+  check('at full size no budget is held back for stills', full.stills === 0, `${full.stills} stills`)
+  check('a reduced track is narrower than the frame', half.trackWidth < half.width,
+    `${half.trackWidth} vs ${half.width}`)
+  check('a reduced track reserves stills to make up for it', half.stills > 0, `${half.stills} stills`)
+  check('a reduced track costs less per frame', half.costPerFrame < full.costPerFrame,
+    `${half.costPerFrame} vs ${full.costPerFrame}`)
+
+  /*
+   * The estimate has to be the sum of what is actually sent. It was previously a frame count
+   * times a per-frame cost that the code then quietly deviated from.
+   */
+  for (const p of [full, half]) {
+    check(`the estimate adds up at trackScale ${p.trackWidth === p.width ? '1' : '0.5'}`,
+      p.estimatedTokens === p.count * p.costPerFrame + p.stills * p.costPerStill,
+      `${p.estimatedTokens} vs ${p.count * p.costPerFrame + p.stills * p.costPerStill}`)
+    check(`it stays inside the budget at trackScale ${p.trackWidth === p.width ? '1' : '0.5'}`,
+      p.estimatedTokens <= base.contextLength * base.share,
+      `${p.estimatedTokens} > ${base.contextLength * base.share}`)
+  }
+
+  const slow = planVideo({ ...base, maxFps: 0.5 })
+  check('the frame rate ceiling is honoured', slow.effectiveFps <= 0.501,
+    `${slow.effectiveFps.toFixed(3)} fps`)
+  check('a lower ceiling buys fewer frames', slow.count < full.count, `${slow.count} vs ${full.count}`)
+
+  const big = planVideo({ ...base, detail: 'high' })
+  check('the 720p tier gives larger frames', big.width > full.width, `${big.width} vs ${full.width}`)
+  check('and correspondingly fewer of them', big.count < full.count, `${big.count} vs ${full.count}`)
+}
+
+{
   const picked = chooseTimestamps([12, 40, 78], 120, 10)
   check('scene selection returns the count asked for', picked.length === 10, `got ${picked.length}`)
   check('scene selection starts at the beginning', picked[0] === 0, `starts at ${picked[0]}`)
@@ -219,6 +260,32 @@ if (!fs.existsSync(FFMPEG)) {
    */
   check('decoding it at the server rate does not duplicate frames',
     Math.abs(decoded - (N + 1)) <= 1, `${N + 1} frames in, ${decoded} out`)
+
+  /*
+   * `-discard nokey`, not `-skip_frame nokey`.
+   *
+   * They read as synonyms. `-skip_frame` asks the decoder to skip frames it has been handed and
+   * dav1d ignores it entirely — on an AV1 capture it returned all 18,169 frames and saved
+   * nothing. `-discard` drops the packets before the decoder sees them. If this ever silently
+   * reverts, the probe passes go back to full decodes and nobody notices except by the wait.
+   */
+  const mm = await fsp.readFile(path.join(ROOT, 'src', 'main', 'chat', 'multimodal.ts'), 'utf8')
+  check('keyframe-only decoding uses -discard, which works, not -skip_frame, which does not',
+    /const KEYFRAMES_ONLY = \['-discard', 'nokey'\]/.test(mm),
+    'multimodal.ts no longer declares KEYFRAMES_ONLY as -discard nokey')
+
+  const kf = path.join(work, 'keyframes')
+  await fsp.mkdir(kf, { recursive: true })
+  await ff(['-y', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+    '-i', 'testsrc2=size=64x64:rate=10:duration=4', '-g', '10', '-pix_fmt', 'yuv420p',
+    path.join(kf, 'src.mp4')])
+  const all = await ff(['-hide_banner', '-i', path.join(kf, 'src.mp4'), '-vf', 'showinfo', '-f', 'null', '-'])
+  const keys = await ff(['-hide_banner', '-discard', 'nokey', '-i', path.join(kf, 'src.mp4'),
+    '-vf', 'showinfo', '-fps_mode', 'passthrough', '-f', 'null', '-'])
+  const nAll = [...(all.stderr ?? '').matchAll(/pts_time:/g)].length
+  const nKey = [...(keys.stderr ?? '').matchAll(/pts_time:/g)].length
+  check('-discard nokey actually reduces what is decoded', nKey > 0 && nKey < nAll,
+    `${nAll} frames decoded normally, ${nKey} with -discard nokey`)
 
   // A crop chain built the way sampleVideo builds it has to survive the same filter graph.
   const cropped = path.join(work, 'crop')

@@ -13,6 +13,7 @@
  */
 
 import path from 'node:path'
+import os from 'node:os'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import crypto from 'node:crypto'
@@ -161,11 +162,74 @@ const PATCH_GRID = 28
  */
 const SERVER_DECODE_FPS = 4
 
+/**
+ * How many threads ffmpeg may use, worked out from the machine it is running on.
+ *
+ * Worth being honest about what this buys: on the machine it was measured on, setting it made no
+ * difference at all — 96.3s against 98.1s on the same file, which is noise. ffmpeg's default of
+ * "auto" was already using what it needed, and the four-cores-of-twenty-four observation that
+ * prompted this turned out to be the filter stage rather than the decoder.
+ *
+ * It stays because the default is a guess made by the build, not a guarantee, and an explicit
+ * number derived from the machine cannot be worse than a conservative one chosen elsewhere.
+ *
+ * `availableParallelism` rather than `cpus().length`: it accounts for affinity masks and
+ * container limits, so a machine that has been restricted to two cores is told two rather than
+ * the number physically present. One core is kept back so the window still paints while a long
+ * video is being prepared, and a two-core machine is given one thread rather than none.
+ *
+ * The ceiling is not arbitrary. Frame threads each hold their own reference frames, so past
+ * roughly sixteen the decode stops getting faster while the memory footprint keeps climbing —
+ * ffmpeg's own automatic choice caps in the same region for the same reason.
+ */
+const MAX_FFMPEG_THREADS = 16
+
+function ffmpegThreads(): number {
+  const raw = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus()?.length
+  const cores = Number.isFinite(raw) && (raw as number) > 0 ? (raw as number) : 1
+  if (cores <= 2) return 1
+  return Math.max(2, Math.min(cores - 1, MAX_FFMPEG_THREADS))
+}
+
+/**
+ * Input-side options every pass shares.
+ *
+ * `-threads` has to precede `-i` to reach the decoder; placed after it, it configures the encoder
+ * instead and the decode stays single-threaded-ish. That distinction is easy to get wrong and
+ * silent when wrong, which is why it lives in one place.
+ */
+function decodeArgs(): string[] {
+  return ['-threads', String(ffmpegThreads())]
+}
+
+/**
+ * Decode only keyframes.
+ *
+ * `-discard`, not `-skip_frame`. The two read as synonyms and are not: `-skip_frame` asks the
+ * decoder to skip frames it has already been handed, and dav1d simply ignores it — measured on a
+ * 120 fps AV1 capture it returned all 18,169 frames and saved nothing at all. `-discard` drops
+ * the packets before the decoder ever sees them, which no decoder can decline. The same file:
+ *
+ *     full decode at 2 fps    66.0s   303 frames
+ *     -discard nokey           0.7s    73 frames
+ *
+ * Ninety-five times faster, still sampling across the whole clip, because keyframes are spread
+ * through it by construction.
+ *
+ * Only for passes asking a coarse question — which part of the picture ever changes, roughly
+ * where the content shifts. The sampling pass needs frames at particular moments rather than at
+ * whatever moments the encoder happened to choose, so it pays for a real decode.
+ */
+const KEYFRAMES_ONLY = ['-discard', 'nokey']
+
 /** Share of a video's budget spent on full-resolution stills rather than on the video itself. */
 const KEYFRAME_SHARE = 0.3
 
 /** However many cuts a video has, past this the stills stop earning their tokens. */
 const MAX_KEYFRAMES = 24
+
+/** How different a frame must be from the one before it to count as a new moment. */
+const SCENE_THRESHOLD = 0.3
 
 /**
  * Width of the pass that decides which part of the picture is worth paying for.
@@ -239,21 +303,48 @@ async function liveRegion(file: string, probe: VideoProbe): Promise<LiveRegion |
      * Written to a file rather than read from stdout: this is binary and `runTool` hands back
      * decoded strings, which would corrupt every byte above 0x7f.
      */
-    await runTool(
-      exe,
-      [
-        '-hide_banner', '-y',
-        '-i', file,
-        '-vf', `fps=${REGION_PROBE_FPS},scale=${w}:${h},format=gray`,
-        '-f', 'rawvideo', '-pix_fmt', 'gray',
-        raw
-      ],
-      120_000
-    )
+    const decodeGray = async (input: string[], filter: string): Promise<number> => {
+      await runTool(
+        exe,
+        [
+          '-hide_banner', '-y',
+          ...input,
+          ...decodeArgs(),
+          '-i', file,
+          '-vf', filter,
+          '-fps_mode', 'passthrough',
+          '-f', 'rawvideo', '-pix_fmt', 'gray',
+          raw
+        ],
+        120_000
+      )
+      try {
+        return Math.floor((await fsp.stat(raw)).size / (w * h))
+      } catch {
+        return 0
+      }
+    }
+
+    /*
+     * Keyframes first, because they are nearly free.
+     *
+     * Deciding which part of the picture ever moves does not need every frame — it needs frames
+     * spread across the clip, and a keyframe-only decode gives exactly that while skipping the
+     * 99% of frames that have to be reconstructed from their neighbours.
+     */
+    let frames = await decodeGray(KEYFRAMES_ONLY, `scale=${w}:${h},format=gray`)
+
+    /*
+     * Some encodes have almost no keyframes — a short clip, or one written as a single GOP.
+     * Two frames is the minimum that can show a change at all, so below that fall back to
+     * sampling by time and pay for the decode.
+     */
+    if (frames < 4) {
+      frames = await decodeGray([], `fps=${REGION_PROBE_FPS},scale=${w}:${h},format=gray`)
+    }
 
     const buf = await fsp.readFile(raw)
     const size = w * h
-    const frames = Math.floor(buf.length / size)
     // One frame cannot show change, so there is nothing to conclude.
     if (frames < 2) return null
 
@@ -316,7 +407,7 @@ async function liveRegion(file: string, probe: VideoProbe): Promise<LiveRegion |
 }
 
 /** Take `n` items spread across a list, rather than the first `n`. */
-function pickSpread(items: number[], n: number): number[] {
+function pickSpread<T>(items: T[], n: number): T[] {
   if (n <= 0 || !items.length) return []
   if (items.length <= n) return items
   const step = items.length / n
@@ -371,25 +462,54 @@ async function probeVideo(file: string): Promise<VideoProbe | null> {
 async function detectScenes(file: string, threshold = 0.3): Promise<number[]> {
   const exe = runtimeBinary('ffmpeg')
   if (!fs.existsSync(exe)) return []
-  const { stderr } = await runTool(
-    exe,
-    [
-      '-hide_banner',
-      '-i', file,
-      // Downscaled first: the score only needs the gist, and comparing full-resolution frames
-      // over a ten-minute video is far slower than the sampling it is meant to inform.
-      '-vf', `scale=192:-2,select='gt(scene,${threshold})',showinfo`,
-      '-f', 'null',
-      '-'
-    ],
-    120_000
-  )
-  const times: number[] = []
-  for (const m of stderr.matchAll(/pts_time:([0-9.]+)/g)) {
-    const t = Number(m[1])
-    if (Number.isFinite(t)) times.push(t)
+
+  const times = async (filter: string): Promise<number[]> => {
+    const { stderr } = await runTool(
+      exe,
+      [
+        '-hide_banner',
+        ...KEYFRAMES_ONLY,
+        ...decodeArgs(),
+        '-i', file,
+        // Downscaled first: the score only needs the gist, and comparing full-resolution frames
+        // over a ten-minute video is far slower than the sampling it is meant to inform.
+        '-vf', filter,
+        '-fps_mode', 'passthrough',
+        '-f', 'null',
+        '-'
+      ],
+      120_000
+    )
+    const out: number[] = []
+    for (const m of stderr.matchAll(/pts_time:([0-9.]+)/g)) {
+      const t = Number(m[1])
+      if (Number.isFinite(t)) out.push(t)
+    }
+    return out
   }
-  return times
+
+  /*
+   * Both passes decode keyframes only, which is what makes this affordable.
+   *
+   * A 120 fps AV1 capture held 18,169 frames and 73 keyframes; asking the decoder for all of them
+   * to find a couple of dozen interesting moments was most of the wait before a video was sent.
+   *
+   * What comes back is coarser than true frame-to-frame scene detection, and that is fine for
+   * both callers: one spreads the moments across the clip and subdivides the gaps between them,
+   * the other picks at most two dozen of them. Neither ranks by how strong the change was.
+   */
+  const cuts = await times(`scale=192:-2,select='gt(scene,${threshold})',showinfo`)
+  if (cuts.length >= 4) return cuts
+
+  /*
+   * Too few, so take the keyframes themselves.
+   *
+   * Comparing keyframes seconds apart is not the comparison the threshold was chosen for, and on
+   * gently changing footage it can select almost nothing. The keyframe positions are still a
+   * reasonable set of candidate moments — encoders place them at cuts as well as periodically —
+   * and a second keyframe-only pass costs a fraction of what one full decode would.
+   */
+  return times('scale=192:-2,showinfo')
 }
 
 /**
@@ -438,6 +558,104 @@ async function extractAt(
   )
   const files = (await fsp.readdir(dir)).filter((f) => f.endsWith('.jpg')).sort()
   return files.map((f) => path.join(dir, f))
+}
+
+/**
+ * Sample the video and take its stills in a single decode.
+ *
+ * These were two passes over the same file, and on anything expensive to decode that was the
+ * dominant cost of sending a video. The frames and the stills want different treatment — one is
+ * reduced and cropped to carry motion, the other is full-size and whole to carry detail — but
+ * they want it from the same pictures, so `split` feeds both from one decode and ffmpeg writes
+ * two sets of files from one invocation.
+ *
+ * The stills branch does its own scene detection inside that shared decode, which is why nothing
+ * has to go looking for the cuts separately afterwards.
+ *
+ * Returns more stills than will be used. Choosing which to keep is a spread across the clip, and
+ * that cannot be expressed as a filter — `-frames:v` would take the first few and leave the end
+ * of the video unrepresented — so the surplus is written and then deleted.
+ */
+async function extractSample(
+  file: string,
+  opts: {
+    /** Sample at a fixed rate, for when the budget is dense enough to not need choosing. */
+    fps?: number
+    /** Or at these specific moments, when it is not. */
+    times?: number[]
+    sourceFps: number
+    videoWidth: number
+    /** Width for the full-resolution stills, or null to take none. */
+    stillWidth: number | null
+    sceneThreshold: number
+    crop: LiveRegion | null
+    /** Drop frames that are near-copies of the one before them. */
+    decimate: boolean
+  }
+): Promise<{ frames: string[]; stills: string[] }> {
+  const exe = runtimeBinary('ffmpeg')
+  const base = path.join(TOOL_OUTPUT_DIR, `frames-${crypto.randomBytes(4).toString('hex')}`)
+  const videoDir = path.join(base, 'video')
+  const stillDir = path.join(base, 'stills')
+  await fsp.mkdir(videoDir, { recursive: true })
+  if (opts.stillWidth) await fsp.mkdir(stillDir, { recursive: true })
+
+  /*
+   * The tolerance is derived from the source rate so each requested moment matches exactly one
+   * frame — too tight and moments are missed, too loose and neighbours are duplicated.
+   */
+  const selector = opts.times?.length
+    ? `select='${opts.times
+        .map((t) => `lt(abs(t-${t.toFixed(3)})\\,${(0.5 / Math.max(1, opts.sourceFps)).toFixed(4)})`)
+        .join('+')}'`
+    : `fps=${(opts.fps ?? 1).toFixed(5)}`
+
+  // Crop before decimating and scaling: the duplicate test then compares only the part of the
+  // picture that was ever going to matter, and the scaler is not asked to resample pixels that
+  // are about to be discarded.
+  const decimate = opts.decimate ? `${MPDECIMATE},` : ''
+  const videoChain = `${selector},${cropFilter(opts.crop)}${decimate}scale='min(${opts.videoWidth},iw)':-2`
+
+  const args = ['-hide_banner', '-y', ...decodeArgs(), '-i', file]
+
+  if (opts.stillWidth) {
+    args.push(
+      '-filter_complex',
+      `[0:v]split=2[a][b];` +
+        `[a]${videoChain}[vid];` +
+        // Deliberately uncropped: a caption or a chart can sit perfectly still and still be the
+        // subject of the question, so the stills always carry the whole frame.
+        `[b]select='gt(scene,${opts.sceneThreshold})',scale='min(${opts.stillWidth},iw)':-2[still]`,
+      '-filter_complex_threads', String(ffmpegThreads()),
+      '-map', '[vid]', '-fps_mode', 'passthrough', '-q:v', '3', path.join(videoDir, 'frame-%04d.jpg'),
+      '-map', '[still]', '-fps_mode', 'passthrough', '-q:v', '3', path.join(stillDir, 'still-%04d.jpg')
+    )
+  } else {
+    args.push(
+      '-vf', videoChain,
+      '-filter_threads', String(ffmpegThreads()),
+      // `-fps_mode passthrough`, not `-vsync 0`: ffmpeg 9 removed `-vsync`, and an unrecognised
+      // option is not a warning — the whole command fails and produces no frames at all.
+      '-fps_mode', 'passthrough',
+      '-q:v', '3',
+      path.join(videoDir, 'frame-%04d.jpg')
+    )
+  }
+
+  await runTool(exe, args, 600_000)
+
+  const read = async (dir: string, prefix: string): Promise<string[]> => {
+    try {
+      return (await fsp.readdir(dir))
+        .filter((f) => f.startsWith(prefix) && f.endsWith('.jpg'))
+        .sort()
+        .map((f) => path.join(dir, f))
+    } catch {
+      return []
+    }
+  }
+
+  return { frames: await read(videoDir, 'frame-'), stills: await read(stillDir, 'still-') }
 }
 
 /** A leading `crop=` stage for the filter chain, or nothing when the whole frame is in use. */
@@ -530,8 +748,37 @@ async function encodeCondensed(frames: string[], dir: string): Promise<string | 
  */
 export async function sampleVideo(
   file: string,
-  opts: { contextLength: number; share: number; detail: VideoDetail; temporalPairing: boolean }
-): Promise<{ frames: string[]; condensed: string | null; keyframes: string[]; note: string }> {
+  opts: {
+    contextLength: number
+    share: number
+    detail: VideoDetail
+    temporalPairing: boolean
+    trackScale?: number
+    stillShare?: number
+    maxFps?: number
+    /** Drop frames that are near-copies of the one before them. */
+    dropDuplicates?: boolean
+    /** Crop away the part of the frame that never changes. */
+    cropStatic?: boolean
+    /**
+     * Called as each pass begins.
+     *
+     * Preparing a video is several complete passes over the source, and on a long or awkwardly
+     * encoded file that is minutes of silence. Naming the pass is the difference between a wait
+     * and an apparent hang.
+     */
+    onStage?: (stage: string) => void
+  }
+): Promise<{
+  frames: string[]
+  condensed: string | null
+  keyframes: string[]
+  note: string
+  /** What the model needs to be told about the clip's timeline, or null if there is nothing to say. */
+  guidance: string | null
+}> {
+  const stage = opts.onStage ?? ((): void => {})
+  stage('reading the video')
   const probe = await probeVideo(file)
   const duration = probe?.duration ?? 0
 
@@ -543,7 +790,8 @@ export async function sampleVideo(
    * inside it is 9:16. Planning against the live rectangle spends the area budget on the
    * subject instead.
    */
-  const region = probe ? await liveRegion(file, probe) : null
+  if (probe && opts.cropStatic !== false) stage('finding what moves')
+  const region = probe && opts.cropStatic !== false ? await liveRegion(file, probe) : null
   const aspect = region ? region.w / region.h : (probe?.aspect ?? 16 / 9)
   const sourcePixels = region
     ? region.w * region.h
@@ -558,7 +806,10 @@ export async function sampleVideo(
     durationSeconds: duration,
     aspect,
     temporalPairing: opts.temporalPairing,
-    sourcePixels
+    sourcePixels,
+    trackScale: opts.trackScale,
+    stillShare: opts.stillShare,
+    maxFps: opts.maxFps
   })
 
   /*
@@ -582,7 +833,9 @@ export async function sampleVideo(
    * motion, and the split would just be a worse sample.
    */
   const hybrid = opts.temporalPairing
-  const videoWidth = hybrid ? Math.max(PATCH_GRID, Math.round((plan.width * 0.5) / PATCH_GRID) * PATCH_GRID) : plan.width
+  // Sized by the planner now, so the budget is measured against what is actually sent rather
+  // than against a full-size frame that then gets halved on the way out.
+  const videoWidth = plan.trackWidth
 
   const dense = duration > 0 && plan.count / duration >= 1
   let frames: string[]
@@ -600,17 +853,37 @@ export async function sampleVideo(
   const OVERSAMPLE = 1.8
   const target = Math.min(plan.count * OVERSAMPLE, duration > 0 ? duration * 4 : plan.count * OVERSAMPLE)
 
+  /*
+   * How many stills the budget can carry, settled before the decode rather than after it.
+   *
+   * They used to be chosen once the video track was already extracted, which meant a second pass
+   * over the source to go and fetch them. Knowing the number up front lets the same decode
+   * produce both.
+   */
+  const maxStills = hybrid && duration > 0 ? plan.stills : 0
+  const decimate = opts.dropDuplicates !== false
+  const stillWidth = maxStills > 0 ? plan.width : null
+  const sourceFps = probe?.fps ?? 30
+  const uniformFps = duration > 0 ? Math.ceil(target) / duration : 1
+
+  let sampled: { frames: string[]; stills: string[] }
+  stage(`sampling ${plan.count} frames`)
   if (dense || duration <= 0) {
-    frames = await extractUniform(file, Math.ceil(target), duration, videoWidth, region)
+    sampled = await extractSample(file, {
+      fps: uniformFps, sourceFps, videoWidth, stillWidth,
+      sceneThreshold: SCENE_THRESHOLD, crop: region, decimate
+    })
     how = 'evenly spaced'
   } else {
-    const scenes = await detectScenes(file)
+    const scenes = await detectScenes(file, SCENE_THRESHOLD)
     const times = chooseTimestamps(scenes, duration, Math.ceil(target))
-    frames = times.length
-      ? await extractAt(file, times, videoWidth, region)
-      : await extractUniform(file, Math.ceil(target), duration, videoWidth, region)
+    sampled = await extractSample(file, {
+      ...(times.length ? { times } : { fps: uniformFps }),
+      sourceFps, videoWidth, stillWidth, sceneThreshold: SCENE_THRESHOLD, crop: region, decimate
+    })
     how = scenes.length ? `${scenes.length} scene changes, then the widest gaps` : 'evenly spaced'
   }
+  frames = sampled.frames
 
   /*
    * Whatever survived decimation, trimmed to what the budget can pay for.
@@ -627,6 +900,7 @@ export async function sampleVideo(
   if (frames.length > 1 && frames.length % 2 === 1) frames = frames.slice(0, -1)
 
   let condensed: string | null = null
+  if (opts.temporalPairing && frames.length) stage('building the clip')
   if (opts.temporalPairing && frames.length) {
     condensed = await encodeCondensed(frames, path.dirname(frames[0]))
   }
@@ -638,39 +912,61 @@ export async function sampleVideo(
    * costs less than sending everything at full size. Spread across the cuts rather than taking
    * the first few, because the last minute of a video matters as much as the first.
    */
-  if (hybrid && condensed && duration > 0) {
-    const stillCost = Math.max(1, Math.round(plan.estimatedTokens / Math.max(1, plan.count)))
-    const affordable = Math.floor((plan.estimatedTokens * KEYFRAME_SHARE) / stillCost)
-    if (affordable >= 1) {
-      const cuts = await detectScenes(file)
-      const chosen = pickSpread(cuts.filter((t) => t > 0 && t < duration), Math.min(affordable, MAX_KEYFRAMES))
-      /*
-       * Deliberately uncropped, unlike the video track.
-       *
-       * Cropping to the live region is safe for the video because the video's job is motion, and
-       * by definition nothing outside that region moves. It is not safe as the *only* view of the
-       * clip: a burnt-in caption, a title card or a chart can sit perfectly still and still be
-       * the thing being asked about. Sending the stills whole means the model always has the full
-       * frame somewhere, and the aggressive crop costs nothing it cannot recover.
-       */
-      if (chosen.length) keyframes = await extractAt(file, chosen, plan.width)
-    }
+  if (hybrid && condensed && sampled.stills.length) {
+    /*
+     * Chosen from what the decode already produced.
+     *
+     * The stills branch writes one for every scene change it finds, which is usually more than
+     * the budget can carry. Spread across the clip rather than taking the first few, because the
+     * last minute of a video matters as much as the first — and the rest are deleted rather than
+     * left behind, since nothing prunes the scratch directory.
+     */
+    keyframes = pickSpread(sampled.stills, maxStills)
+    const keep = new Set(keyframes)
+    await Promise.all(
+      sampled.stills.filter((f) => !keep.has(f)).map((f) => fsp.rm(f, { force: true }).catch(() => undefined))
+    )
   }
 
   const mins = Math.floor(duration / 60)
   const secs = Math.round(duration % 60)
-  const perFrame = plan.count > 0 ? plan.estimatedTokens / plan.count : 0
   const actualFps = duration > 0 ? frames.length / duration : 0
   const dropped = Math.max(0, Math.ceil(target) - survived)
   const note =
     `sampled ${frames.length} frames from ${mins}m ${secs}s ` +
-    `(${actualFps.toFixed(2)} fps at ${plan.width}px, ${how}` +
+    `(${actualFps.toFixed(2)} fps at ${plan.trackWidth}px, ${how}` +
     (region ? `; cropped to the ${region.w}x${region.h} region that changes, ${Math.round((1 - region.share) * 100)}% of the frame never did` : '') +
+    (condensed && duration > 0 && frames.length
+      ? `; the clip plays ${(duration / (frames.length / SERVER_DECODE_FPS)).toFixed(1)}x faster than real time, which the model is told about`
+      : '') +
     (dropped > 0 ? `; ${dropped} near-duplicate frames dropped` : '') +
     (keyframes.length ? `; plus ${keyframes.length} full-resolution stills at scene changes` : '') +
-    `; about ${Math.round(frames.length * perFrame * (hybrid ? 0.25 : 1) + keyframes.length * perFrame).toLocaleString()} tokens)`
+    `; about ${(frames.length * plan.costPerFrame + keyframes.length * plan.costPerStill).toLocaleString()} tokens)`
 
-  return { frames, condensed, keyframes, note }
+  /*
+   * The clip's timeline is not the video's timeline, and the model has to be told.
+   *
+   * Frames are chosen across real time and then muxed at the rate the server decodes at, so a
+   * clip covering two and a half minutes plays in seventy-five seconds. llama.cpp interleaves
+   * its own timestamps, and those describe the clip, not the source — left unexplained the model
+   * reasons about elapsed time and gets it wrong by exactly this factor. It showed up as a model
+   * arguing with itself about whether an on-screen counter should advance half a second or a
+   * whole one per frame.
+   *
+   * A sentence is cheap next to the frames it describes, and it is the only place this mapping
+   * exists: nothing in the container records that the clip was sampled.
+   */
+  const clipSeconds = condensed && frames.length ? frames.length / SERVER_DECODE_FPS : 0
+  const guidance =
+    condensed && duration > 0 && clipSeconds > 0
+      ? `The video that follows is a sample of a longer recording, not the recording itself. ` +
+        `${frames.length} frames were taken across ${duration.toFixed(1)} seconds of source and are played back ` +
+        `at ${SERVER_DECODE_FPS} fps, so the clip lasts ${clipSeconds.toFixed(1)} seconds and any timestamp you ` +
+        `see for it must be multiplied by ${(duration / clipSeconds).toFixed(2)} to give the time in the original. ` +
+        `Consecutive frames are ${(duration / frames.length).toFixed(2)} seconds apart in real time.`
+      : null
+
+  return { frames, condensed, keyframes, note, guidance }
 }
 
 /**
@@ -688,6 +984,16 @@ export interface VideoContext {
   contextLength: number
   share: number
   detail: VideoDetail
+  /** Ceiling on sampling rate, whatever the budget could otherwise afford. */
+  maxFps?: number
+  /** Size of the video track relative to a full frame. */
+  trackScale?: number
+  /** Share of the budget kept for full-resolution stills, when the track is reduced. */
+  stillShare?: number
+  /** Drop frames that are near-copies of the one before them. */
+  dropDuplicates?: boolean
+  /** Crop away the part of the frame that never changes. */
+  cropStatic?: boolean
   /** True when the running server reports it can decode video, not merely that the model was trained on it. */
   serverTakesVideo: boolean
   /** Set when the projector failed to allocate at load, so media would crash the server. */
@@ -705,7 +1011,8 @@ export async function buildContent(
   text: string,
   attachments: string[],
   caps: ModelCapabilities,
-  video: VideoContext = DEFAULT_VIDEO
+  video: VideoContext = DEFAULT_VIDEO,
+  onStage?: (progress: { file: string; stage: string }) => void
 ): Promise<AttachmentPlan> {
   const parts: ContentPart[] = []
   const notes: string[] = []
@@ -770,7 +1077,13 @@ export async function buildContent(
           contextLength: video.contextLength,
           share: video.share,
           detail: video.detail,
-          temporalPairing: video.serverTakesVideo
+          temporalPairing: video.serverTakesVideo,
+          maxFps: video.maxFps,
+          trackScale: video.trackScale,
+          stillShare: video.stillShare,
+          dropDuplicates: video.dropDuplicates,
+          cropStatic: video.cropStatic,
+          onStage: (stage) => onStage?.({ file: path.basename(file), stage })
         })
         extractedFrames.push(...sampled.frames)
 
@@ -785,6 +1098,7 @@ export async function buildContent(
            * 2,400 frames, several times the whole context window.
            */
           const data = await fsp.readFile(sampled.condensed)
+          if (sampled.guidance) parts.push({ type: 'text', text: sampled.guidance })
           parts.push({ type: 'input_video', input_video: { data: data.toString('base64') } })
           extractedFrames.push(sampled.condensed)
 

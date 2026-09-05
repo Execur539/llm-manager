@@ -27,6 +27,7 @@ import ReasoningControl, { sendableChoice } from '../components/ReasoningControl
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
 import { Spinner } from '../components/Spinner'
 import PromptProgress from '../components/PromptProgress'
+import MediaStage from '../components/MediaStage'
 import ContextMeter from '../components/ContextMeter'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
@@ -55,6 +56,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   const reasoning = activeId ? (stream.reasoningPartial[activeId] ?? '') : ''
   const busy = activeId ? !!stream.running[activeId] : false
   const progress = activeId ? (stream.promptProgress[activeId] ?? null) : null
+  const media = activeId ? (stream.mediaStage[activeId] ?? null) : null
   const ctx = activeId ? (stream.context[activeId] ?? null) : null
   // Usable before the first message: the choice is held against a draft key and adopted by
   // whatever conversation the message goes on to create.
@@ -305,7 +307,14 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
                 * read faster than the server bothers to report, and a server too old to know
                 * `return_progress` never reports at all.
                 */}
-              {progress ? (
+              {/*
+                * Preparing an attachment comes before the model is given anything at all, so it
+                * outranks the prompt readout: while ffmpeg is sampling a video there is no prompt
+                * yet to be making progress through.
+                */}
+              {media ? (
+                <MediaStage {...media} />
+              ) : progress ? (
                 <PromptProgress {...progress} />
               ) : (
                 <div className="thinking">
