@@ -15,6 +15,7 @@
 
 import { spawn, ChildProcess } from 'node:child_process'
 import net from 'node:net'
+import os from 'node:os'
 import { EventEmitter } from 'node:events'
 import type { Backend, FitPlan, ModelRecord, ToolDefinition } from '@shared/types'
 import path from 'node:path'
@@ -191,6 +192,31 @@ export interface Timings {
   tokensPerSecond: number
 }
 
+
+/**
+ * How much system RAM to let llama.cpp use for its prompt cache and context checkpoints.
+ *
+ * Costs no VRAM and buys back the thing that actually hurts on a long conversation: a hybrid
+ * model cannot truncate its cache to resume part-way, so it resumes from a checkpoint or it
+ * reprocesses the entire prompt. Each checkpoint is on the order of 150 MB, and the default
+ * budget of 8 GB is a handful of them.
+ *
+ * Measured against free memory rather than total, and capped, for three reasons: the figure is
+ * a ceiling llama.cpp fills opportunistically rather than an allocation, other things on the
+ * machine need room, and past a few dozen gigabytes the cache is holding conversations nobody
+ * will return to. A machine with little free memory gets the default left alone.
+ */
+function hostCacheBudgetMb(): number {
+  const freeMb = Math.floor(os.freemem() / (1024 * 1024))
+  const DEFAULT_MB = 8192
+  const CAP_MB = 49152
+  // Below this there is nothing to give, and taking a quarter of it would hurt.
+  if (freeMb < 12288) return 0
+  const quarter = Math.floor(freeMb / 4)
+  return Math.max(DEFAULT_MB, Math.min(quarter, CAP_MB))
+}
+
+
 export class LlamaRuntime extends EventEmitter {
   private child: ChildProcess | null = null
   private current: LoadedModel | null = null
@@ -257,8 +283,79 @@ export class LlamaRuntime extends EventEmitter {
       '--jinja'
     ]
 
-    if (plan.kvType !== 'f16') {
-      args.push('--cache-type-k', plan.kvType, '--cache-type-v', plan.kvType)
+    /*
+     * Keys and values are set separately, because they are not equally sensitive.
+     *
+     * Both used to take the same type, so buying context meant pushing the keys down as far as
+     * the values -- and four-bit keys are the one setting measured to break a model rather than
+     * blunt it. The planner now picks them independently and this passes what it picked.
+     */
+    if (plan.kvType !== 'f16') args.push('--cache-type-k', plan.kvType)
+    if ((plan.kvTypeV ?? plan.kvType) !== 'f16') args.push('--cache-type-v', plan.kvTypeV ?? plan.kvType)
+
+    /*
+     * Host memory, put to work.
+     *
+     * This model is hybrid: forty-eight of its sixty-five layers keep a recurrent state rather
+     * than a KV cache, and a recurrent state cannot be rolled back to an earlier token the way a
+     * KV cache can be truncated. llama.cpp therefore cannot resume mid-conversation from the
+     * cache alone -- it resumes from a context checkpoint, and when none covers the resume point
+     * it reprocesses the whole prompt from token zero. That is the long silence before a reply on
+     * a conversation that has been going a while.
+     *
+     * Checkpoints live in system RAM, and the defaults are sized for a machine that does not have
+     * much: 8 GB of prompt cache, 32 checkpoints, and cache-reuse switched off entirely. On a
+     * machine with real headroom those are the wrong numbers, and none of them cost VRAM.
+     */
+    const cacheRamMb = hostCacheBudgetMb()
+    if (cacheRamMb > 0) args.push('--cache-ram', String(cacheRamMb))
+    /*
+     * Two different mechanisms, and which one applies depends on the architecture.
+     *
+     * `--cache-reuse` works by shifting the KV cache to line a new prefix up with a cached one.
+     * That is only meaningful where the cache is sliceable, so it does nothing for a model with
+     * recurrent layers -- a DeltaNet state has to be restored whole at a position, not cut at a
+     * token -- and llama.cpp reports as much rather than doing it. Sending it anyway would be
+     * noise in the log and a claim in this file that is not true.
+     *
+     * Hybrid models get context checkpoints instead, which is their only way back into the
+     * middle of a conversation without reprocessing from zero. Thirty-two across a long session
+     * is thin, and they cost host memory rather than VRAM.
+     *
+     * `--checkpoint-min-step` is deliberately left alone: ggml-org/llama.cpp#24055 reports
+     * checkpoints being invalidated outright on hybrid models when it is set, and it is open.
+     */
+    const recurrent = (model.arch?.ssmLayers ?? 0) > 0
+    if (!recurrent) {
+      // 256 tokens is the chunk size the llama.cpp tutorials settle on: large enough not to churn
+      // on fragments, small enough to catch the shared block an agent turn actually has.
+      args.push('--cache-reuse', '256')
+    } else if (cacheRamMb > 0) {
+      args.push('--ctx-checkpoints', '64')
+    }
+
+    /*
+     * Context past what the model was trained for, only when asked for explicitly.
+     *
+     * YaRN interpolates the rotary positions so the model can address a longer window than it
+     * ever saw. It works, and it is not free: llama.cpp applies the scaling statically, at every
+     * length, so a short prompt is also being fed positions the model was not trained on. The
+     * long-context benchmarks are unkind here even before extension -- most models fall below
+     * their own advertised effective length -- so this stays off unless someone turns it on.
+     */
+    const trained = model.arch?.contextLength ?? 0
+    if (trained > 0 && plan.contextLength > trained) {
+      const scale = plan.contextLength / trained
+      args.push(
+        '--rope-scaling', 'yarn',
+        '--rope-scale', scale.toFixed(5),
+        '--yarn-orig-ctx', String(trained)
+      )
+      logger.warn(
+        'model',
+        `context ${plan.contextLength.toLocaleString()} exceeds the trained ${trained.toLocaleString()}; ` +
+          `YaRN scaling by ${scale.toFixed(2)}x. Quality past the trained length is not guaranteed.`
+      )
     }
     if (plan.flashAttention) args.push('--flash-attn', 'on')
     if (plan.tensorSplit.length > 1) {

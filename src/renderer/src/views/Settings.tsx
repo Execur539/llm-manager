@@ -113,9 +113,31 @@ export default function Settings(): JSX.Element {
               value={settings.autoFit.idealContext}
               min={512}
               max={10_000_000}
-              hint="stop growing here"
+              hint="stop growing here; the model's trained length still caps it"
               onCommit={(n) => void patch({ autoFit: { ...settings.autoFit, idealContext: n } })}
             />
+          </dd>
+          {/*
+            * Off by default, and worth a sentence rather than a bare checkbox.
+            *
+            * Rope scaling genuinely extends the window, but llama.cpp applies it at every length
+            * rather than only past the trained one, so short prompts are affected too — and the
+            * long-context evaluations find most models degrading before their advertised limit
+            * even without it.
+            */}
+          <dt>Extend past trained context</dt>
+          <dd>
+            <input
+              type="checkbox"
+              checked={settings.autoFit.allowRopeScaling}
+              onChange={(e) =>
+                void patch({ autoFit: { ...settings.autoFit, allowRopeScaling: e.target.checked } })
+              }
+              data-testid="allow-rope-scaling"
+            />
+            <span className="faint" style={{ marginLeft: 6 }}>
+              rope scaling, up to 4x — quality past the trained length is not guaranteed
+            </span>
           </dd>
           <dt>Preferred KV</dt>
           <dd>

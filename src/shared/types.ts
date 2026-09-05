@@ -189,6 +189,14 @@ export interface FitConstraints {
    * rather than split. Ignoring it is enough to turn a fitting plan into an OOM.
    */
   companionBytes?: number
+  /**
+   * Allow planning a context longer than the model was trained for, via rope scaling.
+   *
+   * Off by default. It works, but the scaling is applied at every length rather than only past
+   * the trained one, and long-context evaluations find most models already degrading before
+   * their advertised limit — so it is a deliberate choice rather than free headroom.
+   */
+  allowRopeScaling?: boolean
   /** user overrides that must be honoured, not silently changed */
   overrides: Partial<{
     contextLength: number
@@ -204,7 +212,15 @@ export interface FitPlan {
   /** human-facing label, e.g. "Max context" */
   label: string
   contextLength: number
+  /**
+   * Precision of the key cache.
+   *
+   * Named without a suffix because it is the half that decides quality: keys quantised too far
+   * break a model outright, where values tolerate it almost unnoticed.
+   */
   kvType: KvType
+  /** Precision of the value cache, which is allowed to be coarser than the keys. */
+  kvTypeV: KvType
   /** how many of the model's blocks are offloaded to GPU */
   gpuLayers: number
   totalLayers: number
@@ -389,6 +405,8 @@ export interface AppSettings {
     targetContext: number
     idealContext: number
     headroomMb: number
+    /** Allow planning past the model's trained context using rope scaling. */
+    allowRopeScaling: boolean
   }
   agent: {
     enabled: boolean

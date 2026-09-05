@@ -142,8 +142,45 @@ section('Hybrid attention/SSM models cache only on attention layers')
   // On this rig the fix is the difference between the ideal context and a degraded one.
   const rig = hw([gpu('RTX 5080', 16, 13.4), gpu('RTX 4070 Ti', 12, 11.7, true, 1)])
   const result = planFit(hybrid, rig, DEFAULT_CONSTRAINTS)
-  check('hybrid 27B reaches the ideal context on a 5080+4070Ti', result.chosen?.contextLength === 131072, `${result.chosen?.contextLength}`)
-  check('at the preferred KV quality, not the floor', result.chosen?.kvType === 'q8_0')
+  /*
+   * Asserted as behaviour rather than as a number. The planner used to stop at a hardcoded
+   * 131,072 whatever the model or the hardware allowed; it now spends what is free, so pinning
+   * the exact figure would only record today's fixture.
+   */
+  check('hybrid 27B reaches at least the old fixed ceiling', (result.chosen?.contextLength ?? 0) >= 131072, `${result.chosen?.contextLength}`)
+  check('and does not exceed what the model was trained for', (result.chosen?.contextLength ?? 0) <= hybrid.contextLength)
+  check('at the preferred KV quality, not the floor', result.chosen?.kvType === 'q8_0', `${result.chosen?.kvType}/${result.chosen?.kvTypeV}`)
+  /*
+   * The important half. A coarser cache reaches the full 262,144 on this rig, and four-bit keys
+   * are the one step measured to break a model rather than blunt it — so the planner must leave
+   * that context on the table rather than take it.
+   */
+  check('never trades key precision for extra context', result.chosen?.kvType !== 'q4_0', `${result.chosen?.kvType}`)
+
+  /*
+   * The keys and the values are charged separately now, so a mixed pairing has to land between
+   * the two uniform ones. Charging both at one rate is what hid the asymmetry that makes the
+   * mixed rung worth having.
+   */
+  const bothQ8 = kvCacheBytes(hybrid, 131072, { k: 'q8_0', v: 'q8_0' })
+  const mixed = kvCacheBytes(hybrid, 131072, { k: 'q8_0', v: 'q4_0' })
+  const bothQ4 = kvCacheBytes(hybrid, 131072, { k: 'q4_0', v: 'q4_0' })
+  check('a mixed cache sits between the two uniform ones', mixed < bothQ8 && mixed > bothQ4,
+    `${fmtBytes(bothQ4)} < ${fmtBytes(mixed)} < ${fmtBytes(bothQ8)}`)
+  check('a single type still means both halves', Math.abs(kvCacheBytes(hybrid, 131072, 'q8_0') - bothQ8) < 1)
+
+  /*
+   * The longer plan is offered rather than taken. Someone feeding it video wants that trade and
+   * someone doing careful work does not, which makes it a choice rather than a default.
+   */
+  const longer = result.alternatives.find((p) => p.label === 'More context')
+  check('a longer-context alternative is offered', !!longer, result.alternatives.map((p) => p.label).join(', ') || 'none')
+  if (longer) {
+    check('it buys context with the values, never the keys', longer.kvType === result.chosen?.kvType && longer.kvTypeV !== result.chosen?.kvTypeV,
+      `${longer.kvType}/${longer.kvTypeV} vs ${result.chosen?.kvType}/${result.chosen?.kvTypeV}`)
+    check('and it is actually longer', longer.contextLength > (result.chosen?.contextLength ?? 0),
+      `${longer.contextLength} vs ${result.chosen?.contextLength}`)
+  }
   check('explains the hybrid layout', result.notes.some((n) => /hybrid architecture/i.test(n)))
   console.log(`  128K KV: ${fmtBytes(naive)} naive -> ${fmtBytes(actual)} actual`)
 }

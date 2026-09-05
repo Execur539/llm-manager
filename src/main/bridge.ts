@@ -368,6 +368,7 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
       targetContext: s.autoFit.targetContext,
       idealContext: s.autoFit.idealContext,
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
+      allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
       overrides: {}
     })
@@ -738,6 +739,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       targetContext: s.autoFit.targetContext,
       idealContext: s.autoFit.idealContext,
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
+      allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
       overrides: (overrides ?? {}) as never
     })

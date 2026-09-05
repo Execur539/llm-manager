@@ -16,8 +16,26 @@ export const DEFAULT_SETTINGS: AppSettings = {
     minKvType: 'q4_0',
     preferredKvType: 'q8_0',
     targetContext: 65536,
-    idealContext: 131072,
-    headroomMb: 768
+    /*
+     * As much as the model was trained for, rather than a fixed 131,072.
+     *
+     * This was the real ceiling on every load: a model trained to 262,144 was planned at half its
+     * context however much VRAM was free, because the ideal never asked for more. The planner
+     * caps at the trained length on its own, so a large number here means "as much as the model
+     * and the card allow" rather than "as much as possible at any cost" — it will not trade cache
+     * precision for length.
+     */
+    idealContext: 1048576,
+    headroomMb: 768,
+    /*
+     * Plan past the trained length using rope scaling. Off deliberately.
+     *
+     * It works, and llama.cpp applies the scaling at every length rather than only past the
+     * trained one, so short prompts are affected too. Long-context evaluations also find most
+     * models degrading before their advertised limit, so extending past a *trained* 262,144 is
+     * buying something the model was already struggling to deliver.
+     */
+    allowRopeScaling: false
   },
   agent: {
     enabled: true,

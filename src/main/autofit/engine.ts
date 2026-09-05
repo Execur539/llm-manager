@@ -39,6 +39,14 @@ const KV_ELEMENT_BYTES: Record<KvType, number> = {
 const KV_ORDER: KvType[] = ['f16', 'q8_0', 'q4_0']
 
 /**
+ * How far past its trained length a model may be stretched, when stretching is allowed at all.
+ *
+ * Four is what the YaRN paper and the Qwen documentation both work in, and it is where the
+ * published evidence stops rather than where the arithmetic does.
+ */
+const MAX_ROPE_SCALE = 4
+
+/**
  * Where a KV type sits in the quality order, with a fallback for one that is not in it at all.
  *
  * `indexOf` returns -1 for an unrecognised value, and -1 fed to `slice` counts from the end —
@@ -47,6 +55,39 @@ const KV_ORDER: KvType[] = ['f16', 'q8_0', 'q4_0']
 function clampToOrder(kv: KvType, fallback: number): number {
   const i = KV_ORDER.indexOf(kv)
   return i === -1 ? fallback : i
+}
+
+/** A cache precision for the keys and one for the values, which need not be the same. */
+export interface KvChoice {
+  k: KvType
+  v: KvType
+}
+
+export function kvLabel(kv: KvChoice): string {
+  return kv.k === kv.v ? kv.k : `${kv.k}/${kv.v}`
+}
+
+/**
+ * Every key/value pairing worth trying, largest first.
+ *
+ * The keys are held at or above the floor and the values are free to go lower, which is the whole
+ * point: they are not equally sensitive. Values quantised to four bits change roughly one answer
+ * in five hundred; keys quantised to four bits have been measured taking a model from 92% to
+ * 24.2%. A single lever for both could only offer the cliff.
+ *
+ * Ordered by bytes per element rather than by nesting, so stepping down the list is monotonic in
+ * memory and the engine's "step down to buy context" logic reads the same as before.
+ */
+function kvLadder(preferred: KvType, floor: KvType): KvChoice[] {
+  const floorIndex = clampToOrder(floor, KV_ORDER.length - 1)
+  const preferredIndex = Math.min(clampToOrder(preferred, 0), floorIndex)
+  const pairs: KvChoice[] = []
+  for (const k of KV_ORDER.slice(preferredIndex, floorIndex + 1)) {
+    // Values never finer than the keys: spending more on the tolerant half would be backwards.
+    for (const v of KV_ORDER.slice(KV_ORDER.indexOf(k))) pairs.push({ k, v })
+  }
+  const size = (c: KvChoice): number => KV_ELEMENT_BYTES[c.k] + KV_ELEMENT_BYTES[c.v]
+  return pairs.sort((a, b) => size(b) - size(a))
 }
 
 /** CUDA runtime + cuBLAS workspace claimed per device before any weights load. */
@@ -85,10 +126,38 @@ const MMPROJ_OVERHEAD = 2.4
 const MMPROJ_MIN_COMPUTE = 512 * 1024 * 1024
 
 export const DEFAULT_CONSTRAINTS: FitConstraints = {
+  /*
+   * The floor applies to the keys, which are the half that cannot be pushed far.
+   *
+   * Left at q4_0 so nothing that used to fit stops fitting, but it is now the last rung rather
+   * than the second. Stepping down used to go straight from q8_0 on both halves to q4_0 on both,
+   * and four-bit keys are the one setting measured to break a model outright. The ladder now has
+   * q8_0 keys with q4_0 values in between, which is where almost all of the saving was anyway --
+   * so q4_0 keys are only reached when nothing else fits at all, and the plan says so.
+   */
   minKvType: 'q4_0',
+  /*
+   * q8_0 rather than f16, still.
+   *
+   * Its measured cost is a rounding error -- on the order of 0.002 to 0.05 perplexity, and zero
+   * changed answers across sixteen hundred deep-context comparisons -- and it halves the cache.
+   * Preferring f16 would make the first plan that clears the target the one with the least
+   * context, which is the opposite of the point.
+   */
   preferredKvType: 'q8_0',
   targetContext: 65536,
-  idealContext: 131072,
+  /*
+   * As much as the model was trained for.
+   *
+   * This was a fixed 131,072 and it was the real ceiling on every load: a model trained to
+   * 262,144 was planned at half its context regardless of how much VRAM was free, because the
+   * ideal never asked for more. The trained length is the honest ceiling -- past it the model is
+   * extrapolating, which is a decision to be taken deliberately rather than by a default.
+   *
+   * A large finite number rather than Infinity: this value reaches a binary search as its upper
+   * bound, and an infinite bound never converges.
+   */
+  idealContext: 1_048_576,
   headroomBytes: 768 * MB,
   overrides: {}
 }
@@ -108,10 +177,21 @@ export const DEFAULT_CONSTRAINTS: FitConstraints = {
  * The recurrent state on SSM layers is added separately: it is real memory, but a fixed amount
  * that does not scale with context.
  */
-export function kvCacheBytes(arch: ModelArchInfo, contextLength: number, kvType: KvType): number {
+export function kvCacheBytes(arch: ModelArchInfo, contextLength: number, kv: KvType | KvChoice): number {
   // Older metadata (or a model parsed before hybrid support) leaves attentionLayers unset.
   const attentionLayers = arch.attentionLayers || arch.blockCount
-  const perTokenPerLayer = 2 * arch.headCountKv * arch.headDim * KV_ELEMENT_BYTES[kvType]
+  /*
+   * K and V are sized separately, because they do not tolerate quantisation equally.
+   *
+   * Measured across llama.cpp's own comparisons, q4_0 on the values changes about one answer in
+   * five hundred, while q4_0 on the keys can collapse a model outright — one Qwen 2.5 test went
+   * from 92% to 24.2% accuracy. Charging both at the same rate hid that asymmetry and made
+   * "step the cache down" a single lever with a cliff hidden in the middle of it.
+   */
+  const choice = typeof kv === 'string' ? { k: kv, v: kv } : kv
+  const perTokenPerLayer =
+    (arch.headCountKv * arch.headDim * KV_ELEMENT_BYTES[choice.k]) +
+    (arch.headCountKv * arch.headDim * KV_ELEMENT_BYTES[choice.v])
   const attentionCache = perTokenPerLayer * attentionLayers * contextLength
   // The recurrent state is allocated per sequence slot. We run llama-server with --parallel 1,
   // so this is one slot's worth — but it is measured empirically to be larger than the naive
@@ -199,7 +279,7 @@ function attempt(
   hw: HardwareSnapshot,
   budgets: number[],
   contextLength: number,
-  kvType: KvType,
+  kvType: KvChoice,
   gpuLayers: number,
   batchSize: number,
   flashAttention: boolean
@@ -242,7 +322,7 @@ function maxContextFor(
   arch: ModelArchInfo,
   hw: HardwareSnapshot,
   budgets: number[],
-  kvType: KvType,
+  kvType: KvChoice,
   gpuLayers: number,
   batchSize: number,
   flashAttention: boolean,
@@ -250,7 +330,8 @@ function maxContextFor(
 ): number {
   const MIN_CTX = 512
   let lo = 0
-  let hi = ceiling
+  // A non-finite bound would never converge; a caller passing one means "as much as possible".
+  let hi = Number.isFinite(ceiling) ? ceiling : 1_048_576
 
   if (!attempt(arch, hw, budgets, MIN_CTX, kvType, gpuLayers, batchSize, flashAttention).fits) {
     return 0
@@ -273,7 +354,7 @@ function buildPlan(
   hw: HardwareSnapshot,
   budgets: number[],
   contextLength: number,
-  kvType: KvType,
+  kvType: KvChoice,
   gpuLayers: number,
   batchSize: number,
   flashAttention: boolean,
@@ -289,7 +370,8 @@ function buildPlan(
   return {
     label,
     contextLength,
-    kvType,
+    kvType: kvType.k,
+    kvTypeV: kvType.v,
     gpuLayers,
     totalLayers,
     tensorSplit: proportionalSplit(budgets),
@@ -384,14 +466,24 @@ export function planFit(
     )
   }
 
+  /*
+   * The trained length is the ceiling unless someone deliberately lifts it.
+   *
+   * Past it the model is being handed positions it never saw, which llama.cpp can do with YaRN
+   * and which the long-context benchmarks suggest is a poorer deal than it sounds: most models
+   * already fall below their advertised effective length well before reaching it. So the default
+   * stops here, and `allowRopeScaling` is what says otherwise.
+   */
   const trainedCeiling = arch.contextLength > 0 ? arch.contextLength : constraints.idealContext
-  const ceiling = Math.min(
-    o.contextLength ?? constraints.idealContext,
-    trainedCeiling,
-    constraints.idealContext
-  )
-  if (arch.contextLength > 0 && constraints.idealContext > arch.contextLength) {
-    notes.push(`Model was trained for ${arch.contextLength.toLocaleString()} tokens; capping there.`)
+  const hardCeiling = constraints.allowRopeScaling ? trainedCeiling * MAX_ROPE_SCALE : trainedCeiling
+  const ceiling = Math.min(o.contextLength ?? constraints.idealContext, hardCeiling, constraints.idealContext)
+
+  if (arch.contextLength > 0 && ceiling >= arch.contextLength && constraints.idealContext > arch.contextLength) {
+    notes.push(
+      constraints.allowRopeScaling
+        ? `Model was trained for ${arch.contextLength.toLocaleString()} tokens. Rope scaling is enabled, so more than that may be planned — quality past the trained length is not guaranteed.`
+        : `Model was trained for ${arch.contextLength.toLocaleString()} tokens; capping there.`
+    )
   }
 
   if (arch.ssmLayers > 0) {
@@ -406,7 +498,7 @@ export function planFit(
   const fullGpuLayers = o.gpuLayers ?? totalLayers
 
   if (totalBudget <= 0) {
-    const plan = buildPlan('CPU only', arch, hw, budgets, Math.min(8192, ceiling), constraints.preferredKvType, 0, batchSize, flashAttention, [
+    const plan = buildPlan('CPU only', arch, hw, budgets, Math.min(8192, ceiling), { k: constraints.preferredKvType, v: constraints.preferredKvType }, 0, batchSize, flashAttention, [
       'No usable GPU memory detected — running entirely on CPU.'
     ])
     return { chosen: plan, alternatives: [], needsUserChoice: false, hardware: hw, notes }
@@ -430,8 +522,19 @@ export function planFit(
    * what is unacceptable, where the preference only says what is nicest.
    */
   const floorIndex = clampToOrder(constraints.minKvType, KV_ORDER.length - 1)
-  const preferredIndex = Math.min(clampToOrder(constraints.preferredKvType, 0), floorIndex)
-  const kvCandidates = o.kvType ? [o.kvType] : KV_ORDER.slice(preferredIndex, floorIndex + 1)
+  const kvCandidates: KvChoice[] = o.kvType
+    ? [{ k: o.kvType, v: o.kvType }]
+    : kvLadder(constraints.preferredKvType, constraints.minKvType)
+
+  const warnIfKeysPushed = (kv: KvChoice, into: string[]): void => {
+    if (kv.k === 'q4_0') {
+      into.push(
+        'Keys are at q4_0, which is the bottom of the ladder and the one step that can cost real ' +
+          'accuracy rather than a rounding error. Reduce the context or raise the KV floor in ' +
+          'Settings if answers look wrong.'
+      )
+    }
+  }
 
   if (KV_ORDER.indexOf(constraints.preferredKvType) > floorIndex) {
     notes.push(
@@ -440,19 +543,90 @@ export function planFit(
     )
   }
 
-  // Pass 1: everything on GPU, best KV type that reaches the ideal context.
+  /*
+   * Pass 1: the best cache quality that clears the target, and as much context as that allows.
+   *
+   * The order of these two questions is the whole behaviour. Asking "which candidate reaches the
+   * largest context" first means the answer is always the coarsest cache, because that is what
+   * being coarse buys — on a hybrid 27B it planned the full 262,144 tokens with four-bit keys,
+   * which is the configuration measured to break a model. Asking "which candidate is good
+   * enough" first, and then spending whatever it leaves on context, gives up some length and
+   * keeps the answers.
+   *
+   * Quality is only traded away when the target cannot be met at all, which is pass 2.
+   */
   for (const kvType of kvCandidates) {
     const maxCtx = maxContextFor(arch, hw, budgets, kvType, fullGpuLayers, batchSize, flashAttention, ceiling)
-    if (maxCtx >= Math.min(constraints.idealContext, ceiling)) {
-      const ctx = Math.min(constraints.idealContext, ceiling, maxCtx)
+    /*
+     * Clamped to the ceiling, which the target is not bound by.
+     *
+     * `targetContext` is what the user asked for and the ceiling is what the model or an explicit
+     * override permits; taking the larger of target and ideal without clamping let a 64K target
+     * override a 32K request.
+     */
+    const enough = Math.min(ceiling, Math.max(constraints.targetContext, Math.min(constraints.idealContext, ceiling)))
+    /*
+     * The target, but never more than the ceiling allows.
+     *
+     * A model trained to 8K, or an explicit 8K override, cannot clear a 64K target however much
+     * VRAM is free — and treating that as a failure sent a perfectly good full-GPU plan down the
+     * "present the user with tradeoffs" path for no reason. Reaching the ceiling is success.
+     */
+    if (maxCtx >= Math.min(constraints.targetContext, ceiling)) {
+      const ctx = Math.min(enough, maxCtx)
+      const reachedIdeal = ctx >= Math.min(constraints.idealContext, ceiling)
       const rationale = [
         `All ${totalLayers} layers on GPU.`,
-        `KV cache at ${kvType} reaches ${ctx.toLocaleString()} tokens — the ideal target.`,
+        reachedIdeal
+          ? `KV cache at ${kvLabel(kvType)} reaches ${ctx.toLocaleString()} tokens — the ideal target.`
+          : `KV cache at ${kvLabel(kvType)} reaches ${ctx.toLocaleString()} tokens, the most this quality affords.`,
         'Full context KV is reserved up front, so the load cannot OOM as the chat grows.'
       ]
+      if (!reachedIdeal) {
+        rationale.push(
+          'A coarser cache would fit more context; it is not used because the extra length is ' +
+            'worth less than the accuracy it would cost.'
+        )
+      }
+      warnIfKeysPushed(kvType, rationale)
+
+      /*
+       * Offer the longer context, without taking it.
+       *
+       * The values tolerate a coarser cache in a way the keys do not — llama.cpp's own
+       * comparisons put q4_0 values at about one changed answer in five hundred, against a
+       * collapse for q4_0 keys. So there is usually a rung below the chosen one that buys real
+       * length for very little, and the right thing is to put it in front of the user rather
+       * than to decide for them: this is exactly the trade someone feeding it long documents or
+       * video wants to make, and someone doing careful work does not.
+       *
+       * Only ever with the keys left where they are. A rung that touches them is a different
+       * kind of offer and does not belong beside this one.
+       */
+      const longer: FitPlan[] = []
+      for (const other of kvCandidates.slice(kvCandidates.indexOf(kvType) + 1)) {
+        if (other.k !== kvType.k) continue
+        const otherMax = maxContextFor(arch, hw, budgets, other, fullGpuLayers, batchSize, flashAttention, ceiling)
+        // Worth showing only if it is a step, not a rounding difference.
+        if (otherMax < ctx * 1.1) continue
+        longer.push(
+          buildPlan('More context', arch, hw, budgets, Math.min(otherMax, ceiling), other, fullGpuLayers, batchSize, flashAttention, [
+            `All ${totalLayers} layers on GPU.`,
+            `Values at ${other.v} instead of ${kvType.v} reach ${Math.min(otherMax, ceiling).toLocaleString()} tokens — ` +
+              `${Math.round((Math.min(otherMax, ceiling) / ctx - 1) * 100)}% more than the default plan.`,
+            'Keys are unchanged, which is the half that carries the accuracy; coarser values ' +
+              'measure at roughly one changed answer in five hundred.'
+          ])
+        )
+        break
+      }
+
       return {
-        chosen: buildPlan('Ideal', arch, hw, budgets, ctx, kvType, fullGpuLayers, batchSize, flashAttention, rationale),
-        alternatives: [],
+        chosen: buildPlan(
+          reachedIdeal ? 'Ideal' : 'Best quality',
+          arch, hw, budgets, ctx, kvType, fullGpuLayers, batchSize, flashAttention, rationale
+        ),
+        alternatives: longer,
         needsUserChoice: false,
         hardware: hw,
         notes
@@ -463,12 +637,12 @@ export function planFit(
   // Pass 2: everything on GPU, accept the best context we can reach at or above target.
   for (const kvType of kvCandidates) {
     const maxCtx = maxContextFor(arch, hw, budgets, kvType, fullGpuLayers, batchSize, flashAttention, ceiling)
-    if (maxCtx >= constraints.targetContext) {
+    if (maxCtx >= Math.min(constraints.targetContext, ceiling)) {
       const rationale = [
         `All ${totalLayers} layers on GPU.`,
-        `KV at ${kvType} reaches ${maxCtx.toLocaleString()} tokens, above the ${constraints.targetContext.toLocaleString()} target.`,
-        kvType !== constraints.preferredKvType
-          ? `Stepped down from ${constraints.preferredKvType} to ${kvType} to buy context, staying at or above the ${constraints.minKvType} floor.`
+        `KV at ${kvLabel(kvType)} reaches ${maxCtx.toLocaleString()} tokens, above the ${constraints.targetContext.toLocaleString()} target.`,
+        kvType.k !== constraints.preferredKvType || kvType.v !== constraints.preferredKvType
+          ? `Stepped down from ${constraints.preferredKvType} to ${kvLabel(kvType)} to buy context, keeping the keys at or above the ${constraints.minKvType} floor.`
           : 'KV kept at the preferred quality.'
       ]
       return {
@@ -483,7 +657,16 @@ export function planFit(
 
   // Target unreachable with everything on GPU. Present real tradeoffs instead of choosing.
   const alternatives: FitPlan[] = []
-  const floorKv = constraints.minKvType
+  /*
+   * The bottom of the ladder: keys at the floor, values as far down as they go.
+   *
+   * This is the last configuration tried before layers start moving to the host, so it should be
+   * the smallest one that is still safe rather than the smallest one that exists.
+   */
+  const floorKv: KvChoice = kvLadder(constraints.preferredKvType, constraints.minKvType).at(-1) ?? {
+    k: constraints.minKvType,
+    v: constraints.minKvType
+  }
 
   // (a) Keep the target context, offload layers to host.
   let layersForTarget = 0
