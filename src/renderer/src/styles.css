@@ -2669,22 +2669,41 @@ button.danger.subtle:hover {
 
 /* The collapsed state: the chosen level, sitting in the row like a piece of its small print. */
 .reasoning-trigger {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   min-height: 0;
-  padding: 2px 7px;
-  border: 1px solid transparent;
-  border-radius: var(--r-sm);
-  background: none;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-1);
   color: var(--text-dim);
   font: inherit;
-  font-weight: 600;
+  font-weight: 550;
   cursor: pointer;
   transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+/* A caret, so it reads as something that opens rather than as a label that happens to be bold. */
+.reasoning[data-kind='effort'] .reasoning-trigger::after {
+  content: '';
+  width: 0;
+  height: 0;
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+  border-top: 3px solid currentColor;
+  opacity: 0.6;
+  transition: transform 120ms ease;
+}
+
+.reasoning[data-kind='effort'] .reasoning-trigger.open::after {
+  transform: rotate(180deg);
 }
 
 .reasoning-trigger:hover:not(:disabled),
 .reasoning-trigger.open {
   background: var(--surface-2);
-  border-color: var(--border);
+  border-color: var(--border-strong);
   color: var(--text);
 }
 
@@ -2972,11 +2991,23 @@ button.danger.subtle:hover {
 }
 
 /* The control sits on the composer's own row, so it shares the transcript column. */
+/*
+ * The strip under the composer: how full the context is, how to send, how hard to think.
+ *
+ * Three unrelated facts, so they are placed as three zones rather than left to flow. Both the
+ * meter and the effort control previously claimed `margin-left: auto`, which meant the first one
+ * pushed itself off the left edge and the row ended up huddled to the right with a band of dead
+ * space beside it. The meter belongs at the left, under the composer's own edge; the effort
+ * control belongs at the right with the other per-request settings; the hint takes what is left
+ * and centres in it.
+ */
 .composer-meta {
   display: flex;
   align-items: center;
-  gap: 14px;
-  margin: 7px 2px 0;
+  gap: 12px;
+  /* Held steady so the row does not change height when the meter appears mid-conversation. */
+  min-height: 24px;
+  margin: 8px 2px 0;
   font-size: 10.5px;
   color: var(--text-faint);
 }
@@ -3023,16 +3054,26 @@ button.danger.subtle:hover {
 .context-meter {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
+  flex-shrink: 0;
   cursor: default;
-  /* Pinned to the end of the row so it does not shuffle sideways as the hint text changes. */
-  margin-left: auto;
+  /*
+   * Anchored left, under the composer's own edge.
+   *
+   * It used to be pushed right, which put it in the middle of the row next to the effort control
+   * and left the left third empty. It describes the conversation above it, so it reads correctly
+   * at the start of the line.
+   */
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-1);
 }
 
 .context-bar {
   display: block;
-  width: 46px;
-  height: 4px;
+  width: 42px;
+  height: 3px;
   flex-shrink: 0;
   border-radius: var(--r-pill);
   background: var(--bg-inset);
@@ -3060,8 +3101,36 @@ button.danger.subtle:hover {
   color: var(--bad);
 }
 
+/*
+ * A size of its own, because the monospace face reads noticeably larger than the surrounding
+ * text at the same nominal size — at 10.5px it was the loudest thing in the row.
+ */
+.context-text {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
+.context-meter.filling .context-text {
+  color: var(--warn);
+}
+
 .composer-meta .composer-hint {
+  flex: 1;
+  min-width: 0;
   margin: 0;
+  text-align: center;
+  /* The first thing to go when the pane is narrow: it is a reminder, not information. */
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 720px) {
+  .composer-meta .composer-hint {
+    display: none;
+  }
 }
 
 /*
@@ -3072,7 +3141,9 @@ button.danger.subtle:hover {
  * per-request controls are.
  */
 .composer-meta .reasoning {
-  margin-left: auto;
+  /* No auto margin: the hint's flex already claims the gap, and two elements both pushing left
+     was what unbalanced the row. */
+  flex-shrink: 0;
 }
 
 /* ---------------------------------------------------------------- thinking */
@@ -3591,4 +3662,171 @@ button.danger.subtle:hover {
 .modal .actions .tiny-note {
   margin-right: auto;
   text-align: left;
+}
+
+/* ------------------------------------------------------- attachments in a message */
+
+/*
+ * The files a turn was sent with, under its text.
+ *
+ * Sized to sit inside the transcript rather than dominate it: a message with a video in it is
+ * still a message, and a player that fills the pane pushes the conversation off screen. The
+ * ceiling is a height, not a width, so a portrait phone video and a widescreen capture both come
+ * out the same size on the page instead of the vertical one being three times taller.
+ */
+.msg-media {
+  display: flex;
+  flex-wrap: wrap;
+  /* Each card keeps its own height: stretching made an audio player as tall as the image beside
+     it, which is a small control in a large empty box. */
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.media-frame {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  /*
+   * Bounded so a message stays a message.
+   *
+   * Left to itself a 16:9 frame takes the full column and pushes the reply below the fold, which
+   * makes scrolling back through a conversation with a few clips in it tedious. Wide enough to
+   * watch, narrow enough that two can sit side by side.
+   */
+  max-width: min(100%, 420px);
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  overflow: hidden;
+}
+
+.media-frame img,
+.media-frame video {
+  display: block;
+  width: 100%;
+  max-height: 260px;
+  /* Contain, not cover: this is evidence, and cropping it to fit would be a lie about the frame. */
+  object-fit: contain;
+  background: var(--bg-inset);
+  /*
+   * Chromium's built-in media controls follow this, and default to the light set — a white
+   * play bar under a dark transcript, which looked like a rendering fault rather than a choice.
+   */
+  color-scheme: dark;
+}
+
+/* Positioned so the version toggle can sit over the picture rather than beneath it. */
+.media-stage {
+  position: relative;
+  display: flex;
+  background: var(--bg-inset);
+}
+
+/*
+ * Which of the two clips is playing.
+ *
+ * Over the video and out of the way of its own controls, which occupy the bottom edge. Kept
+ * legible against whatever frame is behind it by its own background rather than by hoping the
+ * footage is dark.
+ */
+.media-toggle {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--r-pill);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(20, 19, 18, 0.82);
+  backdrop-filter: blur(6px);
+}
+
+.media-toggle button {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 0;
+  padding: 3px 9px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: none;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 10.5px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.media-toggle button:hover:not(.on) {
+  color: #fff;
+}
+
+.media-toggle button.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+.media-caption {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.media-size {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * What the sampler did, shown only while its own clip is on screen.
+ *
+ * Separated by a rule rather than by spacing because it is a different kind of statement from
+ * the filename above it — one names the file, the other explains what was done to it.
+ */
+.media-note {
+  padding: 7px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-inset);
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.media-audio {
+  min-width: 280px;
+  padding-bottom: 10px;
+}
+
+.media-audio audio {
+  width: calc(100% - 20px);
+  margin: 0 10px;
+  height: 32px;
+  color-scheme: dark;
+}
+
+/* A document was inlined as text, so there is nothing to play — only something to name. */
+.media-chip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.media-chip.missing {
+  border-color: #5a4515;
+  color: var(--text-faint);
 }

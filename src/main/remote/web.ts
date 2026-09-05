@@ -15,6 +15,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { app } from 'electron'
 import { loadSettings } from '../storage/settings'
+import { resolveMedia, mediaHeaders, mediaStream } from '../chat/media'
 import {
   isLockedOut,
   issueSession,
@@ -370,6 +371,39 @@ export class RemoteWebServer {
         clearInterval(keepAlive)
         this.clients.delete(res)
       })
+      return
+    }
+
+    /*
+     * Attached files, for a transcript being read from a browser.
+     *
+     * The desktop shell reaches these over a registered scheme; this is the same resolver behind
+     * a route, so the two shells show the same thing. Authentication has already been enforced
+     * above — this sits below the gate deliberately, because these are the user's own files.
+     *
+     * The id is the only input, and it is looked up rather than joined onto anything, so unlike
+     * the static branch below there is no containment test to get wrong.
+     */
+    if (url.pathname === '/media') {
+      const id = url.searchParams.get('id') ?? ''
+      const variant = url.searchParams.get('v') === 'optimised' ? 'optimised' : 'source'
+      const hit = id ? resolveMedia(id, variant, req.headers.range ?? null) : null
+      if (!hit) {
+        res.writeHead(404, baseHeaders)
+        res.end()
+        return
+      }
+      res.writeHead(hit.range ? 206 : 200, { ...mediaHeaders(hit), ...baseHeaders })
+      if (req.method === 'HEAD') {
+        res.end()
+        return
+      }
+      const stream = mediaStream(hit)
+      // A player that seeks away mid-download aborts the response; without this the read stream
+      // is left open holding a file handle for every scrub.
+      res.on('close', () => stream.destroy())
+      stream.on('error', () => res.destroy())
+      stream.pipe(res)
       return
     }
 

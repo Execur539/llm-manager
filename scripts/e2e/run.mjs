@@ -2367,7 +2367,61 @@ const scenarios = {
       report.check('attachments', 'an image is accepted by a vision model',
         (await page.locator('[data-testid="attachment"].warned').count()) === 0)
 
+      /*
+       * The attached file comes back as a picture, not as its filename.
+       *
+       * Worth asserting on the decoded bitmap rather than on the element being present. The
+       * renderer runs from file:// behind a CSP and reaches these bytes over a registered
+       * scheme; if either the scheme or the CSP entry were wrong the <img> would still be in
+       * the DOM, the onError fallback would quietly swap in a chip, and the only symptom would
+       * be a filename where a picture should be. naturalWidth is what proves bytes arrived.
+       */
+      await page.getByTestId('chat-input').fill('what is this')
+      await page.getByTestId('chat-send').click()
+      await page.waitForFunction(
+        () => {
+          const el = document.querySelector('[data-testid="chat-input"]')
+          return el instanceof HTMLTextAreaElement && !el.disabled
+        },
+        undefined,
+        { timeout: 30000 }
+      )
+
+      const decoded = await page
+        .waitForFunction(
+          () => {
+            const img = document.querySelector('[data-testid="media-image"] img')
+            return img instanceof HTMLImageElement && img.complete && img.naturalWidth > 0
+              ? { w: img.naturalWidth, src: img.currentSrc }
+              : null
+          },
+          undefined,
+          { timeout: 15000 }
+        )
+        .then((h) => h.jsonValue())
+        .catch(() => null)
+
+      report.check('attachments', 'an attached image is shown in the transcript, not just named',
+        !!decoded && decoded.w > 0, decoded ? `${decoded.w}px from ${decoded.src}` : 'never decoded')
+      report.check('attachments', 'it is served over the media scheme rather than inlined',
+        !!decoded && /^llmm-media:/.test(decoded.src ?? ''), decoded?.src ?? 'no src')
+
+      // The filenames are dropped from the text once the files themselves are on screen.
+      const transcript = (await page.getByTestId('chat-messages').textContent()) ?? ''
+      report.check('attachments', 'the bracketed filename line is not shown twice',
+        !/\[Attached:/.test(transcript), transcript.slice(0, 200))
+
       await shot(page, 'attachments')
+
+      /*
+       * Re-staged, because sending consumed the one that was staged above.
+       *
+       * The steps below are about the composer rather than the transcript, and they need
+       * something sitting in it.
+       */
+      await stubDialogs(app, { open: [imageFile] })
+      await page.getByTestId('attach-button').click()
+      await page.waitForSelector('[data-testid="attachment"]', { timeout: 10000 })
 
       // ---- removing
       await page.getByTestId('attachment-remove').first().click()

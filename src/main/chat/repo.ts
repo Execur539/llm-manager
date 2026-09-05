@@ -9,9 +9,10 @@
 import crypto from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
+import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import { all, get, run, transaction } from '../storage/db'
-import type { AgentMessage, AgentSessionState } from '@shared/types'
+import type { AgentMessage, AgentSessionState, MessageAttachment } from '@shared/types'
 
 export interface ChatSummary {
   id: string
@@ -136,8 +137,30 @@ export function searchChats(query: string): { chatId: string; title: string; sni
 
 export function appendMessage(chatId: string, message: AgentMessage): void {
   transaction(() => {
+    /*
+     * An upsert, not INSERT OR REPLACE.
+     *
+     * `REPLACE` resolves a conflict by deleting the existing row and inserting a new one, and
+     * attachments reference messages with ON DELETE CASCADE — so re-storing a message silently
+     * took its files with it. Storing the same message twice is routine here: the agent loop
+     * writes the user's turn under an id the bridge minted before it, and every turn that gets
+     * revised comes back through this function.
+     *
+     * Verified against node:sqlite with foreign keys on — REPLACE dropped the child rows, the
+     * upsert kept them.
+     */
     run(
-      'INSERT OR REPLACE INTO messages (id, chat_id, parent_id, role, content, reasoning, plan, tool_calls, tool_result, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)',
+      `INSERT INTO messages (id, chat_id, parent_id, role, content, reasoning, plan, tool_calls, tool_result, created_at)
+       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         chat_id = excluded.chat_id,
+         role = excluded.role,
+         content = excluded.content,
+         reasoning = excluded.reasoning,
+         plan = excluded.plan,
+         tool_calls = excluded.tool_calls,
+         tool_result = excluded.tool_result,
+         created_at = excluded.created_at`,
       message.id,
       chatId,
       message.role,
@@ -160,10 +183,12 @@ export function appendMessage(chatId: string, message: AgentMessage): void {
  * SQLite meant a transcript that could come back with a tool result above the call that made it.
  */
 export function loadMessages(chatId: string): AgentMessage[] {
+  const attachments = attachmentsByMessage(chatId)
   return all<MessageRow>('SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at, rowid', chatId).map((r) => ({
     id: r.id,
     role: r.role as AgentMessage['role'],
     content: r.content,
+    attachments: attachments.get(r.id),
     reasoning: r.reasoning ?? undefined,
     plan: r.plan ?? undefined,
     toolCalls: r.tool_calls ? JSON.parse(r.tool_calls) : undefined,
@@ -298,6 +323,97 @@ export function attachmentsFor(messageId: string): { id: string; kind: string; p
     'SELECT id, kind, path FROM attachments WHERE message_id = ?',
     messageId
   )
+}
+
+/** What was stored alongside an attachment when the message was sent. */
+interface AttachmentMeta {
+  /** The re-encoded clip actually sent to the model, when one was built. */
+  optimised?: string
+  stills?: string[]
+  note?: string
+}
+
+/**
+ * Resolve an attachment to a file on disk, by id.
+ *
+ * The one place that turns an id into a path, so the media route can serve attachments without
+ * ever accepting a path from a client. `which` picks between the file the user attached and the
+ * clip that was sent in its place.
+ */
+export function attachmentFile(id: string, which: 'source' | 'optimised' = 'source'): string | null {
+  const row = get<{ path: string; meta: string | null }>('SELECT path, meta FROM attachments WHERE id = ?', id)
+  if (!row) return null
+  if (which === 'source') return row.path
+  try {
+    return (JSON.parse(row.meta ?? '{}') as AttachmentMeta).optimised ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Every attachment in a conversation, grouped by the message it belongs to.
+ *
+ * One query rather than one per message: a long transcript with attachments scattered through it
+ * would otherwise pay a round trip per turn every time it was opened.
+ *
+ * Paths are deliberately dropped here. The renderer addresses files by id through a route that
+ * looks them up again, so a remote session cannot name a file of its own choosing, and the
+ * machine's directory layout never reaches a browser.
+ */
+export function attachmentsByMessage(chatId: string): Map<string, MessageAttachment[]> {
+  const rows = all<{ id: string; message_id: string; kind: string; path: string; meta: string | null }>(
+    `SELECT a.id, a.message_id, a.kind, a.path, a.meta
+       FROM attachments a
+       JOIN messages m ON m.id = a.message_id
+      WHERE m.chat_id = ?
+      ORDER BY a.created_at, a.rowid`,
+    chatId
+  )
+
+  const byMessage = new Map<string, MessageAttachment[]>()
+  for (const r of rows) {
+    const list = byMessage.get(r.message_id) ?? []
+    list.push(toMessageAttachment(r))
+    byMessage.set(r.message_id, list)
+  }
+  return byMessage
+}
+
+/** The attachments on one message, for announcing a turn that has just been sent. */
+export function attachmentsForMessage(messageId: string): MessageAttachment[] {
+  return all<{ id: string; kind: string; path: string; meta: string | null }>(
+    'SELECT id, kind, path, meta FROM attachments WHERE message_id = ? ORDER BY created_at, rowid',
+    messageId
+  ).map(toMessageAttachment)
+}
+
+function toMessageAttachment(r: { id: string; kind: string; path: string; meta: string | null }): MessageAttachment {
+  let meta: AttachmentMeta = {}
+  try {
+    meta = JSON.parse(r.meta ?? '{}') as AttachmentMeta
+  } catch {
+    // A malformed row should cost the attachment its extras, not its place in the transcript.
+  }
+  return {
+    id: r.id,
+    kind: (r.kind as MessageAttachment['kind']) ?? 'doc',
+    name: path.basename(r.path),
+    bytes: fileBytes(r.path),
+    // Checked rather than trusted: the clip lives in a scratch directory, and offering a toggle
+    // that opens a dead player is worse than not offering one.
+    optimised: !!meta.optimised && fs.existsSync(meta.optimised),
+    note: meta.note
+  }
+}
+
+/** Size on disk, or undefined if the file has since been moved or deleted. */
+function fileBytes(file: string): number | undefined {
+  try {
+    return fs.statSync(file).size
+  } catch {
+    return undefined
+  }
 }
 
 /** Classify a dropped file so the UI and the model handler agree on what it is. */

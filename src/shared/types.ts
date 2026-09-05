@@ -302,10 +302,37 @@ export interface AgentQuestion {
   options: string[]
 }
 
+/**
+ * A file that was sent with a message, as the transcript needs to show it.
+ *
+ * Deliberately not a path. The renderer fetches bytes by id through a route that resolves the
+ * id against the database, so a remote session cannot ask for a file that was never attached —
+ * and the machine's directory layout never leaves the main process.
+ */
+export interface MessageAttachment {
+  id: string
+  kind: 'image' | 'audio' | 'video' | 'doc'
+  /** Basename, for the caption and the download name. */
+  name: string
+  bytes?: number
+  /**
+   * Whether a second, re-encoded version exists to compare the original against.
+   *
+   * Only videos have one: what reaches the model is sampled, cropped and reduced, and being able
+   * to watch that rather than infer it from a sentence is the difference between trusting the
+   * optimisation and guessing at it.
+   */
+  optimised?: boolean
+  /** What the sampler did, in the same words the composer reported at send time. */
+  note?: string
+}
+
 export interface AgentMessage {
   id: string
   role: 'user' | 'assistant' | 'tool' | 'system'
   content: string
+  /** Files sent with this message. Absent on everything the model produced. */
+  attachments?: MessageAttachment[]
   /** The model's chain of thought, when it produced one. */
   reasoning?: string
   /**

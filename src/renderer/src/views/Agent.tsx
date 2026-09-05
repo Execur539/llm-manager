@@ -21,6 +21,7 @@ import ConversationList, { type ChatSummary } from '../components/ConversationLi
 import Icon from '../components/Icon'
 import Markdown from '../components/Markdown'
 import MessageRow from '../components/MessageRow'
+import MessageMedia, { stripAttachmentLine } from '../components/MessageMedia'
 import ThinkingBlock from '../components/ThinkingBlock'
 import UltraSamples from '../components/UltraSamples'
 import RailToggle from '../components/RailToggle'
@@ -402,7 +403,9 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                 </>
               ) : (
                 <>
-                  <div className="body">{m.content}</div>
+                  {/* The names are dropped from the text once the files themselves are shown. */}
+                  <div className="body">{stripAttachmentLine(m.content, !!m.attachments?.length)}</div>
+                  {m.attachments?.length ? <MessageMedia items={m.attachments} /> : null}
                   {/* Kept with the turn it directed, so reading the transcript back explains
                       why the agent did what it did. */}
                   {m.plan && (

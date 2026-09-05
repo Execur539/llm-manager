@@ -145,3 +145,21 @@ export function fmtRelative(ts: number): string {
   if (days < 30) return `${days}d ago`
   return new Date(ts).toLocaleDateString()
 }
+
+/**
+ * Where the bytes of an attached file live, for this shell.
+ *
+ * Two transports for the same resolver in the main process. The desktop renderer runs from
+ * `file://`, which cannot reach a localhost port without weakening the page's CSP, so it uses a
+ * registered scheme; a remote browser is already same-origin with the web server and uses a
+ * plain route. Neither carries a path — the id is looked up against the database at the other
+ * end, so a client cannot ask for a file that was never attached.
+ */
+export function mediaUrl(id: string, variant: 'source' | 'optimised' = 'source'): string {
+  const optimised = variant === 'optimised'
+  // The two forms differ in more than their prefix: one already carries a query string, so the
+  // separator is not the same character.
+  return isDesktop
+    ? `llmm-media://attachment/${encodeURIComponent(id)}${optimised ? '?v=optimised' : ''}`
+    : `/media?id=${encodeURIComponent(id)}${optimised ? '&v=optimised' : ''}`
+}

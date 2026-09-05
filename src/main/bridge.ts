@@ -21,7 +21,8 @@ import type {
   AgentQuestion,
   PermissionDecision,
   PermissionRequest,
-  AttachmentInfo
+  AttachmentInfo,
+  AgentMessage
 } from '@shared/types'
 import { defaultModelsDir, exeDir, TOOL_OUTPUT_DIR } from './storage/paths'
 import { loadSettings, patchSettings } from './storage/settings'
@@ -62,7 +63,7 @@ import {
 } from './remote/auth'
 import * as rag from './rag'
 import * as chats from './chat/repo'
-import { buildContent, type VideoContext } from './chat/multimodal'
+import { buildContent, type VideoContext, type PreparedMedia } from './chat/multimodal'
 import { classifyAttachment, recordAttachment, IMAGE_EXT, AUDIO_EXT, VIDEO_EXT, TEXT_EXT } from './chat/repo'
 import { historicalStats, liveStats, requestLog, recordGeneration, clearStats, setContextUsed } from './stats'
 import { buildDiagnostics, logger } from './log'
@@ -472,9 +473,12 @@ async function videoContext(): Promise<VideoContext> {
   }
 }
 
-async function attachmentTurn(input: string, files: string[]): Promise<{ text: string; media: ContentPart[] }> {
+async function attachmentTurn(
+  input: string,
+  files: string[]
+): Promise<{ text: string; media: ContentPart[]; prepared: PreparedMedia[] }> {
   const caps = llama.loaded?.model.caps
-  if (!caps) return { text: input, media: [] }
+  if (!caps) return { text: input, media: [], prepared: [] }
 
   const built = await buildContent('', files, caps, await videoContext())
   const sections: string[] = []
@@ -494,7 +498,8 @@ async function attachmentTurn(input: string, files: string[]): Promise<{ text: s
 
   return {
     text: sections.length ? `${sections.join('\n\n')}\n\n${input}` : input,
-    media
+    media,
+    prepared: built.media
   }
 }
 
@@ -842,11 +847,20 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
 
     let userContent: string | Awaited<ReturnType<typeof buildContent>>['parts'] = text
     const notes: string[] = []
+    /*
+     * What each file became, keyed by the path it came in as.
+     *
+     * Hoisted out of the branch because the attachment rows are written further down, and a
+     * video's sampled clip has to be recorded against the row or the transcript can only ever
+     * describe the optimisation rather than show it.
+     */
+    let prepared = new Map<string, PreparedMedia>()
 
     if (attachments?.length) {
       const built = await buildContent(text, attachments, loaded.model.caps, await videoContext())
       userContent = built.parts
       notes.push(...built.notes)
+      prepared = new Map(built.media.map((m) => [m.source, m]))
     }
 
     // RAG: prepend retrieved context when a collection is attached.
@@ -868,16 +882,21 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       ? `\n\n[Attached: ${attachments.map((f) => path.basename(f)).join(', ')}]`
       : ''
 
-    const userMsg = {
+    const userMsg: AgentMessage = {
       id: `${Date.now().toString(36)}-u`,
-      role: 'user' as const,
+      role: 'user',
       content: `${text}${attachmentSummary}`,
       createdAt: Date.now()
     }
     chats.appendMessage(chatId, userMsg)
     for (const file of attachments ?? []) {
       try {
-        recordAttachment(userMsg.id, { path: file, kind: classifyAttachment(file) })
+        const media = prepared.get(file)
+        recordAttachment(
+          userMsg.id,
+          { path: file, kind: classifyAttachment(file) },
+          media ? { optimised: media.optimised, stills: media.stills, note: media.note } : undefined
+        )
       } catch (err) {
         // A missing attachment row must never cost the user their message — but it should not
         // vanish without trace either, or the only symptom is an export that quietly lost a file.
@@ -885,6 +904,14 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       }
     }
     chats.autoTitle(chatId)
+    /*
+     * Announced with its files, not just its text.
+     *
+     * The stored message carries the attachments, but this event is what the transcript renders
+     * from until the conversation is next reopened — without them the turn would show as a bare
+     * `[Attached: ...]` line and only become a player after a reload.
+     */
+    if (attachments?.length) userMsg.attachments = chats.attachmentsForMessage(userMsg.id)
     emit('chat:message', { chatId, message: userMsg })
     if (notes.length) emit('chat:notes', notes)
 
@@ -1028,7 +1055,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      */
     const turn = attachments?.length
       ? await attachmentTurn(input, attachments)
-      : { text: input, media: [] as ContentPart[] }
+      : { text: input, media: [] as ContentPart[], prepared: [] as PreparedMedia[] }
 
     /*
      * What the transcript shows, as distinct from what the model is sent.
@@ -1060,9 +1087,45 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      * what it stores is this message rather than a second one.
      */
     const userMessageId = `${Date.now().toString(36)}-u`
+
+    /*
+     * The turn is written now, ahead of the loop, so its files have something to hang off.
+     *
+     * Foreign keys are on, so an attachment row naming a message that does not exist is rejected
+     * outright — recording them first failed silently into a log line. The loop stores this same
+     * id a moment later and that write is an upsert, so the row is updated in place rather than
+     * replaced, and the attachments survive it.
+     */
+    chats.appendMessage(sessionId, {
+      id: userMessageId,
+      role: 'user',
+      content: displayText,
+      createdAt: Date.now()
+    })
+
+    const preparedByFile = new Map(turn.prepared.map((m) => [m.source, m]))
+    for (const file of attachments ?? []) {
+      try {
+        const media = preparedByFile.get(file)
+        recordAttachment(
+          userMessageId,
+          { path: file, kind: classifyAttachment(file) },
+          media ? { optimised: media.optimised, stills: media.stills, note: media.note } : undefined
+        )
+      } catch (err) {
+        logger.warn('agent', `could not record attachment ${file}`, err)
+      }
+    }
+
     emit('agent:message', {
       sessionId,
-      message: { id: userMessageId, role: 'user', content: displayText, createdAt: Date.now() }
+      message: {
+        id: userMessageId,
+        role: 'user',
+        content: displayText,
+        createdAt: Date.now(),
+        attachments: attachments?.length ? chats.attachmentsForMessage(userMessageId) : undefined
+      }
     })
 
     const before = session.messages.length

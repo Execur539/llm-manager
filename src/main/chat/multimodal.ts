@@ -70,6 +70,26 @@ export interface AttachmentPlan {
   notes: string[]
   /** frames we extracted ourselves, when we did the sampling rather than llama.cpp */
   extractedFrames: string[]
+  /**
+   * What became of each attachment, so the transcript can show it rather than name it.
+   *
+   * The sampled clip is the interesting half. Everything the model was actually shown of a video
+   * — the frame rate, the crop, the resolution — is decided here and then described in a
+   * sentence; keeping the artefact means the transcript can play it instead.
+   */
+  media: PreparedMedia[]
+}
+
+export interface PreparedMedia {
+  /** The file as the user attached it. */
+  source: string
+  kind: 'image' | 'audio' | 'video' | 'doc'
+  /** The re-encoded clip that was sent, when one was built. */
+  optimised?: string
+  /** Full-resolution stills sent alongside that clip. */
+  stills?: string[]
+  /** How the video was sampled, in the words the composer already uses. */
+  note?: string
 }
 
 interface VideoProbe {
@@ -690,6 +710,14 @@ export async function buildContent(
   const parts: ContentPart[] = []
   const notes: string[] = []
   const extractedFrames: string[] = []
+  /*
+   * Only what was actually sent gets an entry.
+   *
+   * Every branch below can bail out with a note — no projector, no audio support, an unreadable
+   * file — and a transcript that offered to play something the model never received would be
+   * worse than one that said nothing.
+   */
+  const media: PreparedMedia[] = []
 
   if (text.trim()) parts.push({ type: 'text', text })
 
@@ -714,6 +742,7 @@ export async function buildContent(
         continue
       }
       parts.push({ type: 'image_url', image_url: { url: await toDataUrl(file) } })
+      media.push({ source: file, kind: 'image' })
       continue
     }
 
@@ -727,6 +756,7 @@ export async function buildContent(
         type: 'input_audio',
         input_audio: { data: buf.toString('base64'), format: path.extname(file).slice(1) || 'wav' }
       })
+      media.push({ source: file, kind: 'audio' })
       continue
     }
 
@@ -770,6 +800,20 @@ export async function buildContent(
           }
           extractedFrames.push(...sampled.keyframes)
           notes.push(`${path.basename(file)}: ${sampled.note}, sent as video so the model can follow the order.`)
+          /*
+           * The clip is kept, not just described.
+           *
+           * It already exists on disk and nothing deletes it, so recording where it went costs
+           * nothing and turns "1.8 fps at 336px, cropped to the region that changes" from a
+           * claim the user has to take on faith into something they can watch.
+           */
+          media.push({
+            source: file,
+            kind: 'video',
+            optimised: sampled.condensed,
+            stills: sampled.keyframes,
+            note: sampled.note
+          })
         } else {
           for (const frame of sampled.frames) {
             parts.push({ type: 'image_url', image_url: { url: await toDataUrl(frame) } })
@@ -780,6 +824,8 @@ export async function buildContent(
                 ? ' This build cannot take video directly, so the frames carry no timing.'
                 : ' This model was not trained on video, so treat the result as a description of stills.')
           )
+          // No clip to offer, but the stills are still what the model was shown.
+          media.push({ source: file, kind: 'video', stills: sampled.frames, note: sampled.note })
         }
       } catch (err) {
         notes.push(`${path.basename(file)} could not be processed: ${err instanceof Error ? err.message : String(err)}`)
@@ -825,5 +871,5 @@ export async function buildContent(
     }
   }
 
-  return { parts, notes, extractedFrames }
+  return { parts, notes, extractedFrames, media }
 }

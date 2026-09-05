@@ -5,7 +5,7 @@
  * bridge to IPC, and orderly shutdown. Everything else lives in its own module.
  */
 
-import { app, BrowserWindow, ipcMain, Menu, Tray, dialog, nativeImage, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, Tray, dialog, nativeImage, protocol, shell } from 'electron'
 import path from 'node:path'
 import { ensureDirs } from './storage/paths'
 import { loadSettings, patchSettings } from './storage/settings'
@@ -21,6 +21,7 @@ import { remoteWeb } from './remote/web'
 import { llama } from './runtime/llama'
 import { vendorDiagnostics } from './runtime/binaries'
 import { handlers, invokeBridge, setEmitter, setLibrary, shutdown, modelsDir, startHardwareRefresh, stopHardwareRefresh } from './bridge'
+import { handleMediaProtocol } from './chat/media'
 import { installCrashHandlers, logger } from './log'
 
 let mainWindow: BrowserWindow | null = null
@@ -257,6 +258,18 @@ async function firstRunChecks(): Promise<void> {
   await invokeBridge('relocation:move', [proposal])
 }
 
+/*
+ * Registered before the app is ready, which is the only time this call is allowed.
+ *
+ * `standard` gives the scheme a real origin so URLs parse as scheme://host/path; `stream` is
+ * what lets a <video> issue range requests and seek instead of refetching from zero; `secure`
+ * keeps it out of the mixed-content rules that would otherwise block it on a file:// page.
+ * `supportFetchAPI` is off — nothing fetches these, they are only ever element sources.
+ */
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'llmm-media', privileges: { standard: true, secure: true, stream: true, supportFetchAPI: false } }
+])
+
 app.whenReady().then(async () => {
   installCrashHandlers()
   ensureDirs()
@@ -267,6 +280,15 @@ app.whenReady().then(async () => {
   void handlers['attachments:prune']?.()
 
   setEmitter(emitToSurfaces)
+
+  /*
+   * Attached files, served back to the transcript.
+   *
+   * Addressed by attachment id rather than by path: the handler looks the id up in the database
+   * and serves whatever that row points at, so the renderer has no way to name a file of its own
+   * and no way to escape upward out of one.
+   */
+  protocol.handle('llmm-media', (request) => handleMediaProtocol(request))
 
   registerIpc()
   createWindow()
