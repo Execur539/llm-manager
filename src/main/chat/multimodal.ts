@@ -78,6 +78,9 @@ interface VideoProbe {
   fps: number
   /** width / height */
   aspect: number
+  /** Source dimensions in pixels, so a crop rectangle can be expressed in them. */
+  width: number
+  height: number
 }
 
 function ffprobePath(): string | null {
@@ -125,11 +128,172 @@ const MPDECIMATE = 'mpdecimate=hi=64*12:lo=64*5:frac=0.33'
 /** The encoder's patch grid; frame dimensions are rounded to it, so choosing off it is waste. */
 const PATCH_GRID = 28
 
+/**
+ * The rate llama.cpp decodes video at, which the condensed clip has to be muxed at.
+ *
+ * Not a preference — a fixed property of the server. Newer builds expose `--video-fps`, but this
+ * one has only `--media-path`, so the rate is hardcoded upstream and the clip must meet it. Mux
+ * below it and every frame is decoded twice and charged twice; mux above it and frames we paid
+ * to select are thrown away before the encoder ever sees them.
+ *
+ * If the bundled llama.cpp is ever updated, check `--help` for `--video-fps` and either pass it
+ * explicitly or re-confirm this default before trusting it.
+ */
+const SERVER_DECODE_FPS = 4
+
 /** Share of a video's budget spent on full-resolution stills rather than on the video itself. */
 const KEYFRAME_SHARE = 0.3
 
 /** However many cuts a video has, past this the stills stop earning their tokens. */
 const MAX_KEYFRAMES = 24
+
+/**
+ * Width of the pass that decides which part of the picture is worth paying for.
+ *
+ * Deliberately tiny. The question is only "does this region ever change", which survives heavy
+ * downscaling, and a 160px pass over a ten-minute video costs a fraction of the extraction it
+ * informs.
+ */
+const REGION_PROBE_WIDTH = 160
+
+/** Sampling rate for that pass. Two per second is ample to tell movement from stillness. */
+const REGION_PROBE_FPS = 2
+
+/** Below this much variation across the whole clip, a pixel is codec noise rather than motion. */
+const REGION_NOISE = 8
+
+/**
+ * How much of the frame the live region must save before it is worth cropping to.
+ *
+ * Cropping is not free of risk: something static can still be informative, and a region that
+ * covers most of the frame anyway buys little for that risk. Requiring a fifth of the frame back
+ * keeps the crop to cases where it clearly pays — screen recordings, fixed-camera footage,
+ * letterboxed uploads — and leaves handheld or full-frame footage completely alone.
+ */
+const REGION_MIN_SAVING = 0.8
+
+/** A rectangle of source pixels, and what fraction of the frame it covers. */
+interface LiveRegion {
+  w: number
+  h: number
+  x: number
+  y: number
+  share: number
+}
+
+/**
+ * Find the rectangle the picture actually uses.
+ *
+ * Two different kinds of waste have the same shape and the same cure. Letterbox and pillarbox
+ * bars are charged for at exactly the same rate as content — a phone video padded into a 16:9
+ * container measured 68% dead pixels, all of them black, all of them paid for in every frame.
+ * And a screen recording or a fixed-camera talking head spends most of its area on a desktop or
+ * a wall that is identical in every single frame. Both are regions that never change.
+ *
+ * So rather than detecting bars specifically, this measures change: decode a thumbnail-sized
+ * grayscale pass, track each pixel's high and low water mark across the whole clip, and take the
+ * bounding box of everything whose range clears the noise floor. Bars have zero range and fall
+ * outside it; so does the static half of a screen recording.
+ *
+ * ffmpeg's own `cropdetect` was the obvious tool and is the wrong one — it scans inward from the
+ * edges looking for a border, so interior motion gives it nonsense (it returned a negative height
+ * when tried). Doing the measurement directly is both simpler and correct.
+ *
+ * Measured on synthetic cases: a 1920x1080 screen recording with one active pane came back at 9%
+ * of the frame, a fixed-camera talking head at 10%, and handheld footage that genuinely fills the
+ * frame at 100% — which is the important one, because it means the technique declines to act
+ * rather than damaging content that needs the whole frame.
+ *
+ * Returns null when there is nothing worth cropping, which callers treat as "use the whole frame".
+ */
+async function liveRegion(file: string, probe: VideoProbe): Promise<LiveRegion | null> {
+  const exe = runtimeBinary('ffmpeg')
+  if (!fs.existsSync(exe) || !probe.width || !probe.height) return null
+
+  const w = REGION_PROBE_WIDTH
+  const h = Math.max(2, Math.round((probe.height / probe.width) * w / 2) * 2)
+  const raw = path.join(TOOL_OUTPUT_DIR, `region-${crypto.randomBytes(4).toString('hex')}.gray`)
+
+  try {
+    /*
+     * Written to a file rather than read from stdout: this is binary and `runTool` hands back
+     * decoded strings, which would corrupt every byte above 0x7f.
+     */
+    await runTool(
+      exe,
+      [
+        '-hide_banner', '-y',
+        '-i', file,
+        '-vf', `fps=${REGION_PROBE_FPS},scale=${w}:${h},format=gray`,
+        '-f', 'rawvideo', '-pix_fmt', 'gray',
+        raw
+      ],
+      120_000
+    )
+
+    const buf = await fsp.readFile(raw)
+    const size = w * h
+    const frames = Math.floor(buf.length / size)
+    // One frame cannot show change, so there is nothing to conclude.
+    if (frames < 2) return null
+
+    const hi = Buffer.alloc(size, 0)
+    const lo = Buffer.alloc(size, 255)
+    for (let f = 0; f < frames; f++) {
+      const off = f * size
+      for (let i = 0; i < size; i++) {
+        const v = buf[off + i]
+        if (v > hi[i]) hi[i] = v
+        if (v < lo[i]) lo[i] = v
+      }
+    }
+
+    let x1 = w
+    let x2 = -1
+    let y1 = h
+    let y2 = -1
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x
+        if (hi[i] - lo[i] <= REGION_NOISE) continue
+        if (x < x1) x1 = x
+        if (x > x2) x2 = x
+        if (y < y1) y1 = y
+        if (y > y2) y2 = y
+      }
+    }
+    // A clip where nothing moves at all: a still frame, or a probe that failed to decode.
+    if (x2 < 0 || y2 < 0) return null
+
+    /*
+     * A margin, because the probe is coarse and the cost of cutting into the subject is far
+     * higher than the cost of carrying a little dead space around it.
+     */
+    const pad = 2
+    x1 = Math.max(0, x1 - pad)
+    y1 = Math.max(0, y1 - pad)
+    x2 = Math.min(w - 1, x2 + pad)
+    y2 = Math.min(h - 1, y2 + pad)
+
+    const sx = probe.width / w
+    const sy = probe.height / h
+    // Even values throughout: yuv420p subsamples chroma and rejects odd dimensions and offsets.
+    const even = (n: number): number => Math.max(2, Math.round(n / 2) * 2)
+    const cw = Math.min(probe.width, even((x2 - x1 + 1) * sx))
+    const ch = Math.min(probe.height, even((y2 - y1 + 1) * sy))
+    const cx = Math.min(probe.width - cw, even(x1 * sx))
+    const cy = Math.min(probe.height - ch, even(y1 * sy))
+
+    const share = (cw * ch) / (probe.width * probe.height)
+    if (share > REGION_MIN_SAVING) return null
+    return { w: cw, h: ch, x: cx, y: cy, share }
+  } catch {
+    // Nothing here is load-bearing; a failed probe just means the whole frame is used.
+    return null
+  } finally {
+    await fsp.rm(raw, { force: true }).catch(() => {})
+  }
+}
 
 /** Take `n` items spread across a list, rather than the first `n`. */
 function pickSpread(items: number[], n: number): number[] {
@@ -163,9 +327,11 @@ async function probeVideo(file: string): Promise<VideoProbe | null> {
     const s = j.streams?.[0]
     const [num, den] = (s?.avg_frame_rate ?? '0/1').split('/').map(Number)
     const fps = den > 0 && num > 0 ? num / den : 30
-    const aspect = s?.width && s?.height ? s.width / s.height : 16 / 9
+    const width = s?.width ?? 0
+    const height = s?.height ?? 0
+    const aspect = width && height ? width / height : 16 / 9
     if (!Number.isFinite(duration) || duration <= 0) return null
-    return { duration, fps, aspect }
+    return { duration, fps, aspect, width, height }
   } catch {
     return null
   }
@@ -214,7 +380,12 @@ async function detectScenes(file: string, threshold = 0.3): Promise<number[]> {
  * tolerance is derived from the source frame rate so that each requested moment matches exactly
  * one frame — too tight and moments are missed, too loose and neighbours are duplicated.
  */
-async function extractAt(file: string, times: number[], width: number): Promise<string[]> {
+async function extractAt(
+  file: string,
+  times: number[],
+  width: number,
+  crop?: LiveRegion | null
+): Promise<string[]> {
   const exe = runtimeBinary('ffmpeg')
   const dir = path.join(TOOL_OUTPUT_DIR, `frames-${crypto.randomBytes(4).toString('hex')}`)
   await fsp.mkdir(dir, { recursive: true })
@@ -228,7 +399,10 @@ async function extractAt(file: string, times: number[], width: number): Promise<
     [
       '-hide_banner',
       '-i', file,
-      '-vf', `select='${expr}',${MPDECIMATE},scale='min(${width},iw)':-2`,
+      // Crop before decimating and scaling: dropping the dead area first means the duplicate
+      // test compares only the part of the picture that was ever going to matter, and the
+      // scaler is not asked to resample pixels about to be discarded.
+      '-vf', `select='${expr}',${cropFilter(crop)}${MPDECIMATE},scale='min(${width},iw)':-2`,
       /*
        * Keep every selected frame rather than re-timing them to a constant rate.
        *
@@ -246,8 +420,19 @@ async function extractAt(file: string, times: number[], width: number): Promise<
   return files.map((f) => path.join(dir, f))
 }
 
+/** A leading `crop=` stage for the filter chain, or nothing when the whole frame is in use. */
+function cropFilter(crop?: LiveRegion | null): string {
+  return crop ? `crop=${crop.w}:${crop.h}:${crop.x}:${crop.y},` : ''
+}
+
 /** Evenly spaced frames, for when the sample is dense enough that scene detection adds nothing. */
-async function extractUniform(file: string, count: number, duration: number, width: number): Promise<string[]> {
+async function extractUniform(
+  file: string,
+  count: number,
+  duration: number,
+  width: number,
+  crop?: LiveRegion | null
+): Promise<string[]> {
   const exe = runtimeBinary('ffmpeg')
   const dir = path.join(TOOL_OUTPUT_DIR, `frames-${crypto.randomBytes(4).toString('hex')}`)
   await fsp.mkdir(dir, { recursive: true })
@@ -257,7 +442,7 @@ async function extractUniform(file: string, count: number, duration: number, wid
     [
       '-hide_banner',
       '-i', file,
-      '-vf', `fps=${fps.toFixed(5)},${MPDECIMATE},scale='min(${width},iw)':-2`,
+      '-vf', `fps=${fps.toFixed(5)},${cropFilter(crop)}${MPDECIMATE},scale='min(${width},iw)':-2`,
       // No -frames:v ceiling: decimation decides how many survive, and capping here would cut
       // the tail of the video rather than its redundancy. `-fps_mode` because ffmpeg 9 removed
       // `-vsync`, and an unrecognised option fails the command outright.
@@ -288,18 +473,31 @@ async function encodeCondensed(frames: string[], dir: string): Promise<string | 
   if (!frames.length) return null
   const exe = runtimeBinary('ffmpeg')
   const listFile = path.join(dir, 'frames.txt')
+  /*
+   * One output frame per frame we chose, and no more.
+   *
+   * This clip was encoded at 2 fps while the server decodes video at SERVER_DECODE_FPS, so
+   * llama.cpp was resampling upward and handing the vision encoder each frame twice. Measured
+   * against Qwen3.8-27B: the same twelve pictures cost 1,616 prompt tokens muxed at 2 fps and
+   * 809 muxed at 4 — exactly double, for identical content.
+   *
+   * The rate is not cosmetic metadata, it is the contract with the decoder. Frame duration is
+   * derived from it rather than written separately so the two cannot drift apart.
+   */
+  const dur = (1 / SERVER_DECODE_FPS).toFixed(4)
   // Concat demuxer rather than a numbered pattern: the frames are already named in order and
   // this avoids re-deriving a glob that has to match exactly.
   await fsp.writeFile(
     listFile,
-    frames.map((f) => `file '${f.replace(/\\/g, '/')}'\nduration 0.5`).join('\n') +
+    frames.map((f) => `file '${f.replace(/\\/g, '/')}'\nduration ${dur}`).join('\n') +
       `\nfile '${frames[frames.length - 1].replace(/\\/g, '/')}'\n`,
     'utf8'
   )
   const out = path.join(dir, 'condensed.mp4')
   await runTool(
     exe,
-    ['-hide_banner', '-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-r', '2', '-pix_fmt', 'yuv420p', out],
+    ['-hide_banner', '-y', '-f', 'concat', '-safe', '0', '-i', listFile,
+     '-r', String(SERVER_DECODE_FPS), '-pix_fmt', 'yuv420p', out],
     300_000
   )
   return fs.existsSync(out) ? out : null
@@ -316,13 +514,31 @@ export async function sampleVideo(
 ): Promise<{ frames: string[]; condensed: string | null; keyframes: string[]; note: string }> {
   const probe = await probeVideo(file)
   const duration = probe?.duration ?? 0
+
+  /*
+   * Which part of the frame is worth paying for, decided before the budget is spent.
+   *
+   * This has to come first because it changes the shape being budgeted for: a phone video
+   * padded into a 16:9 container is planned as 16:9 and charged for bars, where the picture
+   * inside it is 9:16. Planning against the live rectangle spends the area budget on the
+   * subject instead.
+   */
+  const region = probe ? await liveRegion(file, probe) : null
+  const aspect = region ? region.w / region.h : (probe?.aspect ?? 16 / 9)
+  const sourcePixels = region
+    ? region.w * region.h
+    : probe?.width && probe?.height
+      ? probe.width * probe.height
+      : undefined
+
   const plan = planVideo({
     contextLength: opts.contextLength,
     share: opts.share,
     detail: opts.detail,
     durationSeconds: duration,
-    aspect: probe?.aspect ?? 16 / 9,
-    temporalPairing: opts.temporalPairing
+    aspect,
+    temporalPairing: opts.temporalPairing,
+    sourcePixels
   })
 
   /*
@@ -365,12 +581,14 @@ export async function sampleVideo(
   const target = Math.min(plan.count * OVERSAMPLE, duration > 0 ? duration * 4 : plan.count * OVERSAMPLE)
 
   if (dense || duration <= 0) {
-    frames = await extractUniform(file, Math.ceil(target), duration, videoWidth)
+    frames = await extractUniform(file, Math.ceil(target), duration, videoWidth, region)
     how = 'evenly spaced'
   } else {
     const scenes = await detectScenes(file)
     const times = chooseTimestamps(scenes, duration, Math.ceil(target))
-    frames = times.length ? await extractAt(file, times, videoWidth) : await extractUniform(file, Math.ceil(target), duration, videoWidth)
+    frames = times.length
+      ? await extractAt(file, times, videoWidth, region)
+      : await extractUniform(file, Math.ceil(target), duration, videoWidth, region)
     how = scenes.length ? `${scenes.length} scene changes, then the widest gaps` : 'evenly spaced'
   }
 
@@ -406,6 +624,15 @@ export async function sampleVideo(
     if (affordable >= 1) {
       const cuts = await detectScenes(file)
       const chosen = pickSpread(cuts.filter((t) => t > 0 && t < duration), Math.min(affordable, MAX_KEYFRAMES))
+      /*
+       * Deliberately uncropped, unlike the video track.
+       *
+       * Cropping to the live region is safe for the video because the video's job is motion, and
+       * by definition nothing outside that region moves. It is not safe as the *only* view of the
+       * clip: a burnt-in caption, a title card or a chart can sit perfectly still and still be
+       * the thing being asked about. Sending the stills whole means the model always has the full
+       * frame somewhere, and the aggressive crop costs nothing it cannot recover.
+       */
       if (chosen.length) keyframes = await extractAt(file, chosen, plan.width)
     }
   }
@@ -418,6 +645,7 @@ export async function sampleVideo(
   const note =
     `sampled ${frames.length} frames from ${mins}m ${secs}s ` +
     `(${actualFps.toFixed(2)} fps at ${plan.width}px, ${how}` +
+    (region ? `; cropped to the ${region.w}x${region.h} region that changes, ${Math.round((1 - region.share) * 100)}% of the frame never did` : '') +
     (dropped > 0 ? `; ${dropped} near-duplicate frames dropped` : '') +
     (keyframes.length ? `; plus ${keyframes.length} full-resolution stills at scene changes` : '') +
     `; about ${Math.round(frames.length * perFrame * (hybrid ? 0.25 : 1) + keyframes.length * perFrame).toLocaleString()} tokens)`

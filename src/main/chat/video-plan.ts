@@ -16,17 +16,26 @@ const PIXELS_PER_TOKEN_EDGE = 28
 /**
  * What a frame costs as part of a video, relative to the same frame sent as an image.
  *
- * The 3D convolution that pairs consecutive frames suggests this should be a half, and it is
- * not. Measured against llama-server with Qwen3.8-27B, twelve 448x252 frames cost 1,505 prompt
- * tokens — about 125 each, against 144 for the naive patch count. So the video path is cheaper,
- * but by around a seventh rather than a half; the interleaved timestamps and the encoder's own
- * geometry account for the rest.
+ * The 3D convolution that pairs consecutive frames says this should be a half, and it is. An
+ * earlier measurement here put it at 0.9 and reasoned about why the saving was smaller than the
+ * architecture implied — that reasoning was explaining an artefact. The clip it measured was
+ * encoded at half the rate the server decodes at, so every frame was being sent twice; the
+ * constant was fitted to the duplication rather than to the encoder.
  *
- * Erring high is the safe direction. Under-estimating the cost means planning more frames than
+ * Re-measured against llama-server with Qwen3.8-27B once the encode rate matched, across three
+ * frame sizes and two frame counts:
+ *
+ *     448x252, 12 frames    809 tokens    67.4/frame   vs 144 naive    0.468
+ *     644x364, 12 frames  1,565 tokens   130.4/frame   vs 299 naive    0.436
+ *     336x196, 12 frames    487 tokens    40.6/frame   vs  84 naive    0.483
+ *     448x252, 24 frames  1,502 tokens    62.6/frame   vs 144 naive    0.435
+ *
+ * Mean 0.456 with a spread of 0.049, so the constant is rounded up rather than to the mean.
+ * Erring high is the safe direction: under-estimating the cost means planning more frames than
  * fit and overflowing the window, which fails the request; over-estimating means a slightly
  * shorter sample than was strictly affordable, which nobody notices.
  */
-const VIDEO_COST_FACTOR = 0.9
+const VIDEO_COST_FACTOR = 0.5
 
 /**
  * Pixels per frame for each preference, rather than a width.
@@ -77,6 +86,15 @@ export function planVideo(opts: {
   durationSeconds: number
   aspect: number
   temporalPairing: boolean
+  /**
+   * Pixels actually available in a source frame, after any crop.
+   *
+   * Upscaling buys nothing: the extraction clamps to the source width, so a frame smaller than
+   * the budget costs less than the budget assumed. Without this the planner believes it spent
+   * the whole allowance, under-counts what is left, and buys fewer frames than it can afford —
+   * which matters most for exactly the clips that were cropped hardest.
+   */
+  sourcePixels?: number
 }): VideoPlan {
   /*
    * Derive the frame's shape from an area budget and its aspect ratio, then round to the 28px
@@ -84,10 +102,24 @@ export function planVideo(opts: {
    * asking for 641 pixels of width costs exactly what 644 does.
    */
   const aspect = opts.aspect || 16 / 9
-  const area = DETAIL_PIXELS[opts.detail] ?? DETAIL_PIXELS.balanced
+  const budgetArea = DETAIL_PIXELS[opts.detail] ?? DETAIL_PIXELS.balanced
+  const available = opts.sourcePixels && opts.sourcePixels > 0 ? opts.sourcePixels : Number.POSITIVE_INFINITY
+  const area = Math.min(budgetArea, available)
   const grid = PIXELS_PER_TOKEN_EDGE
-  const width = Math.max(grid, Math.round(Math.sqrt(area * aspect) / grid) * grid)
-  const height = Math.max(grid, Math.round(width / aspect / grid) * grid)
+
+  /*
+   * Rounded down to the grid rather than to the nearest when the source is what limits us.
+   *
+   * Rounding to the nearest can overshoot by up to a full cell — a 240px source plans as 252 —
+   * and the extraction clamps to the source width regardless, so the plan would be charging for
+   * a column of pixels that never arrives. Down is also the safe direction for the budget.
+   */
+  const sourceBound = available < budgetArea
+  const snap = sourceBound
+    ? (n: number): number => Math.floor(n / grid) * grid
+    : (n: number): number => Math.round(n / grid) * grid
+  const width = Math.max(grid, snap(Math.sqrt(area * aspect)))
+  const height = Math.max(grid, snap(width / aspect))
 
   const perFrame = Math.min(
     MAX_TOKENS_PER_FRAME,
@@ -101,12 +133,22 @@ export function planVideo(opts: {
   /*
    * Two ceilings that have nothing to do with the budget.
    *
-   * There is no value in sampling faster than the source changes, and Qwen3-VL is trained and
-   * evaluated at 2-4 fps — beyond that the extra frames are near-duplicates paying full price.
+   * The frame rate cap matters more than it used to. While frames were being charged twice, the
+   * budget ran out long before this ceiling did, so its value barely mattered; at the real price
+   * a two-minute clip can afford roughly six hundred frames, and without a ceiling the planner
+   * would buy every one of them and spend the whole saving on frame rate nobody asked for.
+   *
+   * Two is the knee rather than an arbitrary retreat from four. Qwen3-VL is trained and
+   * evaluated at 2-4 fps, so this stays inside its range, and the literature on frame sampling
+   * puts the practical default at 1-2 fps with returns flattening above that — beyond it the
+   * extra frames are near-duplicates paying full price, which is precisely what mpdecimate then
+   * has to throw away again. Raising it back to 4 is a one-line change for anyone who wants to
+   * spend the budget that way.
+   *
    * The absolute cap is a guard against a pathological duration turning into tens of thousands
    * of ffmpeg seeks.
    */
-  const MAX_FPS = 4
+  const MAX_FPS = 2
   // Qwen's own preprocessing stops at 768 frames; beyond its tested range is not a good place
   // to be inventing behaviour.
   const MAX_FRAMES = 768
