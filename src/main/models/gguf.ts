@@ -438,6 +438,19 @@ export function extractArchInfo(meta: GgufMetadata, fileSize?: number): ModelArc
     ? (ssmInnerSize * Math.max(0, ssmConvKernel - 1) + ssmInnerSize * ssmStateSize) * 4
     : 0
 
+  /*
+   * Whether the model can draft for itself.
+   *
+   * Read from the metadata first and confirmed against the tensors, because the two can disagree:
+   * a converted file may declare the layer count while the head was stripped during quantisation,
+   * and asking llama.cpp to use a head that is not there is a startup failure rather than a
+   * degraded mode. Requiring both is what makes this safe to act on without any user
+   * configuration — there is nothing to choose and nothing to mismatch.
+   */
+  const declaredMtp = p('nextn_predict_layers') ?? 0
+  const hasMtpTensors = meta.tensors.some((t) => /\.nextn\./.test(t.name))
+  const mtpLayers = declaredMtp > 0 && hasMtpTensors ? declaredMtp : 0
+
   return {
     architecture: arch,
     name: typeof kv['general.name'] === 'string' ? (kv['general.name'] as string) : null,
@@ -455,6 +468,7 @@ export function extractArchInfo(meta: GgufMetadata, fileSize?: number): ModelArc
     expertCount,
     attentionLayers,
     ssmLayers,
+    mtpLayers,
     ssmStateBytesPerLayer,
     unknownTensorTypes: [...unknownTypes]
   }

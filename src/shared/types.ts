@@ -63,6 +63,17 @@ export interface ModelArchInfo {
   attentionLayers: number
   /** Layers using a recurrent/SSM state instead of a KV cache. */
   ssmLayers: number
+  /**
+   * Multi-token-prediction layers built into the model itself.
+   *
+   * Some models ship a small head trained to guess the next few tokens, so they can draft for
+   * themselves rather than needing a second model alongside. Qwen3.5 and Qwen3.8 carry one, as
+   * `nextn_predict_layers` in the metadata and `blk.N.nextn.*` among the tensors.
+   *
+   * Zero means the model cannot, which is the whole check: there is no configuration to get
+   * wrong and no second file to be incompatible with.
+   */
+  mtpLayers: number
   /** Per-layer SSM state in bytes. Constant — it does not grow with context length. */
   ssmStateBytesPerLayer: number
   /**
@@ -221,6 +232,12 @@ export interface FitPlan {
   kvType: KvType
   /** Precision of the value cache, which is allowed to be coarser than the keys. */
   kvTypeV: KvType
+  /**
+   * Tokens the model drafts ahead of itself each step, when it can.
+   *
+   * Carried on the plan rather than read at spawn time so a plan is loaded the way it was costed.
+   */
+  draftMax?: number
   /** how many of the model's blocks are offloaded to GPU */
   gpuLayers: number
   totalLayers: number
@@ -407,6 +424,12 @@ export interface AppSettings {
     headroomMb: number
     /** Allow planning past the model's trained context using rope scaling. */
     allowRopeScaling: boolean
+  }
+  speculative: {
+    /** Applies only to models carrying a multi-token-prediction head; others ignore it. */
+    enabled: boolean
+    /** Tokens drafted per step. */
+    nMax: number
   }
   agent: {
     enabled: boolean

@@ -376,6 +376,16 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
     if (!chosen) throw new Error('No workable configuration was found for this model on this hardware.')
   }
 
+  /*
+   * How far the model may draft ahead of itself, attached once the plan is settled.
+   *
+   * Only meaningful where the model carries an MTP head; llama.ts checks that rather than
+   * trusting this, so a plan reused against a different model cannot ask for something it
+   * cannot do.
+   */
+  const spec = loadSettings().speculative
+  chosen = { ...chosen, draftMax: spec.enabled ? spec.nMax : 0 }
+
   const loaded = await llama.load(model, chosen, fresh.backend)
   logger.info('model', `loaded ${model.filename}`, { ctx: chosen.contextLength, layers: chosen.gpuLayers })
 

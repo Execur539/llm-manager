@@ -362,6 +362,24 @@ export class LlamaRuntime extends EventEmitter {
       args.push('--tensor-split', plan.tensorSplit.map((s) => s.toFixed(3)).join(','))
     }
     if (model.caps.mmprojPath) args.push('--mmproj', model.caps.mmprojPath)
+
+    /*
+     * Speculative decoding, using the model's own multi-token-prediction head.
+     *
+     * The model proposes the next few tokens itself and then verifies them in the same pass, so
+     * the output is identical to running without it — a wrong guess is discarded, not accepted.
+     * That makes this unusual among speed settings in having no quality axis at all.
+     *
+     * Gated on the head actually being present rather than on configuration. A separate draft
+     * model is the other way to do this and it has failure modes: a mismatched tokenizer, a
+     * second file to keep in step, and its weights and cache competing for the memory that would
+     * otherwise be context. A head that shipped inside this GGUF has none of those — either the
+     * tensors are there or they are not, and `mtpLayers` is only set when both the metadata and
+     * the tensors agree.
+     */
+    if ((model.arch?.mtpLayers ?? 0) > 0 && (plan.draftMax ?? 0) > 0) {
+      args.push('--spec-type', 'draft-mtp', '--spec-draft-n-max', String(plan.draftMax ?? 3))
+    }
     return args
   }
 

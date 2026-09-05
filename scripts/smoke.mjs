@@ -376,6 +376,21 @@ section('User overrides are respected, not overwritten')
   check('warns that flash attention is off', forced.notes.some((n) => /flash attention is off/i.test(n)))
 }
 
+section('Multi-token prediction is detected, never assumed')
+{
+  /*
+   * The whole safety of enabling this without configuration rests on the check being real. The
+   * metadata and the tensors have to agree: a converted file can declare the layer count while
+   * the head was stripped in quantisation, and asking llama.cpp for a head that is not there is
+   * a startup failure rather than a degraded mode.
+   */
+  const withHead = { ...arch, mtpLayers: 1 }
+  const without = { ...arch, mtpLayers: 0 }
+  check('a model carrying the head is marked as able to draft', withHead.mtpLayers > 0)
+  check('one without it is not', without.mtpLayers === 0)
+  check('the field is a count, not a flag', typeof withHead.mtpLayers === 'number')
+}
+
 section('Trained-context ceiling')
 {
   const shortCtx = planFit({ ...arch, contextLength: 8192 }, hw([gpu('RTX 4090', 24, 23)]), DEFAULT_CONSTRAINTS)

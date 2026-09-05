@@ -37,6 +37,29 @@ export const DEFAULT_SETTINGS: AppSettings = {
      */
     allowRopeScaling: false
   },
+  /*
+   * Speculative decoding, using a model's own multi-token-prediction head.
+   *
+   * On by default, which is unusual for a performance setting and is the point: the model
+   * proposes its own next few tokens and verifies them in the same pass, so a wrong guess is
+   * discarded rather than accepted and the output is identical either way. There is no quality
+   * axis to trade against.
+   *
+   * It also costs nothing to have on. The head ships inside the model file and is already
+   * loaded; models without one simply do not get the flag, which is checked against the tensors
+   * rather than assumed. Nothing to configure means nothing to configure wrongly.
+   */
+  speculative: {
+    enabled: true,
+    /**
+     * How many tokens to draft ahead.
+     *
+     * Three is llama.cpp's default and a sensible one: each guess is nearly free, but a wrong
+     * guess discards everything after it, so drafting far ahead pays less than it looks on
+     * anything but very predictable text.
+     */
+    nMax: 3
+  },
   agent: {
     enabled: true,
     planMode: false,
