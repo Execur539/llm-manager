@@ -25,7 +25,21 @@ export const DEFAULT_SETTINGS: AppSettings = {
      * and the card allow" rather than "as much as possible at any cost" — it will not trade cache
      * precision for length.
      */
-    idealContext: 1048576,
+    /*
+     * Back to a figure that is known to load, after 1.2.0 raised it to "whatever the model was
+     * trained for" and produced plans that did not.
+     *
+     * The ceiling was never the only thing holding context down. The engine's compute-buffer
+     * estimate under-counts the prompt-processing buffers by roughly a gigabyte per device --
+     * `logits` was sized for one token where llama.cpp reserves a row per token of the physical
+     * batch -- and it models the embedding and output tensors as split across devices where
+     * llama.cpp places them whole. Raising the ceiling on top of that produced 165,376 tokens on
+     * a machine that could not allocate it, and the load failed outright.
+     *
+     * 131,072 is what this hardware has been running. It goes back until the estimate is right,
+     * because a context that will not load is worse than a smaller one that will.
+     */
+    idealContext: 131072,
     headroomMb: 768,
     /*
      * Plan past the trained length using rope scaling. Off deliberately.
