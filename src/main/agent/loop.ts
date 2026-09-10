@@ -702,14 +702,7 @@ Platform: Windows (PowerShell)${memoryBlock}`
           if (m.role === 'tool') {
             return { role: 'user', content: `[tool result]\n${m.content}` }
           }
-          // Reasoning survives a restart the same way it survives a turn: the stored message
-          // has it, and a rehydrated history that drops it diverges from the cache exactly where
-          // a live one would.
-          return {
-            role: m.role as 'user' | 'assistant',
-            content: m.content,
-            ...(m.role === 'assistant' && m.reasoning ? { reasoning_content: m.reasoning } : {})
-          }
+          return { role: m.role as 'user' | 'assistant', content: m.content }
         })
     ]
   }
@@ -857,9 +850,7 @@ Platform: Windows (PowerShell)${memoryBlock}`
             createdAt: Date.now()
           }
           session.messages.push(assistant)
-          // Handed back with its thinking, so the next turn's prompt still matches the cache
-          // this one just filled. See ChatMessage.reasoning_content.
-          this.history.push({ role: 'assistant', content: text, reasoning_content: thinking.trim() || undefined })
+          this.history.push({ role: 'assistant', content: text })
           this.emit('message', assistant)
           this.emit('done', 'complete')
           return
@@ -884,7 +875,6 @@ Platform: Windows (PowerShell)${memoryBlock}`
         this.history.push({
           role: 'assistant',
           content: text,
-          reasoning_content: thinking.trim() || undefined,
           tool_calls: toolCalls.map((c) => ({
             id: c.id,
             type: 'function' as const,

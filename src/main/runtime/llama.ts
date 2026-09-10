@@ -82,19 +82,6 @@ export interface ChatMessage {
   tool_call_id?: string
   name?: string
   tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[]
-  /**
-   * What the model thought on a past turn, handed back to it.
-   *
-   * Not optional flavour: Qwen-family templates render past assistant turns as
-   * `<think>` + reasoning_content + `</think>` + content, and default `preserve_thinking` to
-   * true. Sending the turn without it renders an *empty* think block where the cache from
-   * generation holds the real thinking — so the prompt stops matching the cache at the start of
-   * every assistant turn that thought, and everything after it is processed again.
-   *
-   * On a turn that called tools that is the thinking, the prose, the calls and their results:
-   * the whole of the previous response, re-read, every time.
-   */
-  reasoning_content?: string
 }
 
 export interface CompletionOptions {
