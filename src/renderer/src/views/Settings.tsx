@@ -145,6 +145,23 @@ export default function Settings(): JSX.Element {
               roughly twice the generation speed on models that carry the head, same answers
             </span>
           </dd>
+          {/*
+            * Past reasoning goes back to the model with each answer, so it can remember why it
+            * decided something a few messages ago, not only what it said. It costs context in
+            * proportion to how much the model thinks, which is why it is a switch.
+            */}
+          <dt>Remember past reasoning</dt>
+          <dd>
+            <input
+              type="checkbox"
+              checked={settings.reasoning.preserve}
+              onChange={(e) => void patch({ reasoning: { ...settings.reasoning, preserve: e.target.checked } })}
+              data-testid="reasoning-preserve"
+            />
+            <span className="faint" style={{ marginLeft: 6 }}>
+              keeps earlier turns' thinking in the context; uses more of it · applies on the next model load
+            </span>
+          </dd>
           <dt>Tokens drafted ahead</dt>
           <dd>
             <NumberField

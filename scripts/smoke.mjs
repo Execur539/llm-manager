@@ -17,12 +17,22 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 // Rebuild the test bundles so the suite always runs against current source.
 execFileSync(process.execPath, [path.join(ROOT, 'scripts/build-tests.mjs')], { stdio: 'inherit' })
 
-const { planFit, kvCacheBytes, computeBufferBytes, proportionalSplit, DEFAULT_CONSTRAINTS, fmtBytes, verifyPrediction } =
-  await import('./built/engine.js')
+const {
+  planFit,
+  kvCacheBytes,
+  computeBufferBytes,
+  logitsBufferBytes,
+  proportionalSplit,
+  DEFAULT_CONSTRAINTS,
+  fmtBytes,
+  verifyPrediction,
+  nglFor
+} = await import('./built/engine.js')
 const { toolCallGrammar, schemaGrammar } = await import('./built/gbnf.js')
 const { checkHardBlock, describeCall, PermissionEngine } = await import('./built/permissions.js')
-const { readGguf, extractArchInfo, tensorByteSize, isKnownGgmlType } = await import('./built/gguf.js')
-const { recommendQuant, findMmprojFor } = await import('./built/hf.js')
+const { readGguf, readGgufParts, extractArchInfo, tensorByteSize, isKnownGgmlType } = await import('./built/gguf.js')
+const { recommendQuant, findMmprojFor, groupVariants } = await import('./built/hf.js')
+const { buildGguf } = await import('./e2e/fixtures.mjs')
  const { isVirtualAdapter } = await import('./built/gpu.js')
 const { exportFilename, uniquePath } = await import('./built/filenames.js')
 const { detectReasoning, reasoningRequestFields } = await import('./built/reasoning.js')
@@ -147,7 +157,20 @@ section('Hybrid attention/SSM models cache only on attention layers')
    * 131,072 whatever the model or the hardware allowed; it now spends what is free, so pinning
    * the exact figure would only record today's fixture.
    */
-  check('hybrid 27B reaches at least the old fixed ceiling', (result.chosen?.contextLength ?? 0) >= 131072, `${result.chosen?.contextLength}`)
+  /*
+   * The ceiling used to be a hardcoded 131,072 regardless of hardware or model. It is now
+   * computed, and computing it honestly costs a little: the logits buffer (batch x vocab x 4
+   * bytes) is charged to whichever GPU holds the output layer, where it used to be missing
+   * entirely. That is a real fix — a plan that omitted it could OOM the moment the server
+   * actually reserved that buffer — so the new context is expected to land a little under the
+   * old number, not to match it. Bounded below so a regression elsewhere is still caught.
+   */
+  const logits = logitsBufferBytes(hybrid, 512)
+  check(
+    'hybrid 27B still reaches nearly the old fixed ceiling once the logits buffer is honestly charged',
+    (result.chosen?.contextLength ?? 0) >= 131072 - 8192,
+    `${result.chosen?.contextLength} (logits buffer costs ${fmtBytes(logits)} on the GPU holding the output layer)`
+  )
   check('and does not exceed what the model was trained for', (result.chosen?.contextLength ?? 0) <= hybrid.contextLength)
   check('at the preferred KV quality, not the floor', result.chosen?.kvType === 'q8_0', `${result.chosen?.kvType}/${result.chosen?.kvTypeV}`)
   /*
@@ -631,19 +654,200 @@ section('Quant recommendation')
     { filename: 'mmproj-f16.gguf', bytes: 0.6 * GB, quant: null, url: '', isMmproj: true, shard: null }
   ]
 
-  const big = recommendQuant(files, hw([gpu('RTX 4090', 24, 23)]), 65536)
-  check('picks the highest quality that fits on a big card', big?.filename === 'm-Q8_0.gguf', big?.filename)
+  const variants = groupVariants(files)
+  const big = recommendQuant(variants, hw([gpu('RTX 4090', 24, 23)]), 65536)
+  check('picks the highest quality that fits on a big card', big?.variantId === 'm-Q8_0.gguf', big?.variantId)
   check('says it fits', big?.fitsFullyOnGpu === true)
 
-  const small = recommendQuant(files, hw([gpu('RTX 3060', 12, 11)]), 65536)
-  check('steps down on a smaller card', small?.filename !== 'm-Q8_0.gguf', small?.filename)
+  const small = recommendQuant(variants, hw([gpu('RTX 3060', 12, 11)]), 65536)
+  check('steps down on a smaller card', small?.variantId !== 'm-Q8_0.gguf', small?.variantId)
 
-  const tiny = recommendQuant(files, hw([gpu('GTX 1050', 4, 3.5)]), 65536)
+  const tiny = recommendQuant(variants, hw([gpu('GTX 1050', 4, 3.5)]), 65536)
   check('admits when nothing fits', tiny?.fitsFullyOnGpu === false)
   check('explains the recommendation', !!tiny?.reason && tiny.reason.length > 20)
 
-  check('never recommends an mmproj as the model', ![big, small, tiny].some((r) => r?.filename.includes('mmproj')))
+  check('never recommends an mmproj as the model', ![big, small, tiny].some((r) => r?.variantId.includes('mmproj')))
   check('finds the mmproj companion', findMmprojFor(files)?.filename === 'mmproj-f16.gguf')
+}
+
+section('Split models are one variant with one download')
+{
+  const MB = 1024 ** 2
+  const f = (filename, bytes, quant = null) => {
+    const base = filename.split('/').pop()
+    const m = base.match(/-(\d{5})-of-(\d{5})\.gguf$/i)
+    return {
+      filename, bytes, quant, sha256: null, url: '',
+      isMmproj: /mmproj/i.test(base),
+      shard: m ? { index: Number(m[1]), total: Number(m[2]) } : null
+    }
+  }
+  // Shaped after unsloth/Qwen3.8-Flash-Next-GGUF: quant folders, a metadata-only first part.
+  const files = [
+    f('BF16/M-BF16-00001-of-00003.gguf', 10 * MB, 'BF16'),
+    f('BF16/M-BF16-00002-of-00003.gguf', 150 * GB, 'BF16'),
+    f('BF16/M-BF16-00003-of-00003.gguf', 150 * GB, 'BF16'),
+    f('UD-Q4_K_XL/M-UD-Q4_K_XL-00001-of-00002.gguf', 10 * MB, 'Q4_K_XL'),
+    f('UD-Q4_K_XL/M-UD-Q4_K_XL-00002-of-00002.gguf', 60 * GB, 'Q4_K_XL'),
+    f('UD-Q2_K_XL/M-UD-Q2_K_XL-00001-of-00003.gguf', 10 * MB, 'Q2_K_XL'),
+    f('UD-Q2_K_XL/M-UD-Q2_K_XL-00003-of-00003.gguf', 20 * GB, 'Q2_K_XL'),
+    f('M-Q3_K_M.gguf', 18 * GB, 'Q3_K_M'),
+    f('mmproj-F16.gguf', 0.8 * GB),
+    f('MTP/mtp-M-Q8_0.gguf', 3 * GB, 'Q8_0')
+  ]
+  const variants = groupVariants(files)
+  const models = variants.filter((v) => v.kind === 'model')
+  const bf16 = variants.find((v) => v.label === 'BF16')
+  const q4 = variants.find((v) => v.label === 'UD-Q4_K_XL')
+  const q2 = variants.find((v) => v.label === 'UD-Q2_K_XL')
+  check('one variant per quant, not one per part', models.length === 4, models.map((v) => v.label).join(', '))
+  check('a variant totals every part', Math.abs((bf16?.bytes ?? 0) - (300 * GB + 10 * MB)) < 1, fmtBytes(bf16?.bytes ?? 0))
+  check('parts are kept in order', bf16?.parts.map((p) => p.shard.index).join() === '1,2,3')
+  check('a missing part marks the variant incomplete', q2 && !q2.complete && q2.missing.join() === '2')
+  check('projectors are companions', variants.find((v) => v.id === 'mmproj-F16.gguf')?.kind === 'mmproj')
+  check('MTP modules are companions, not models', variants.find((v) => v.id.startsWith('MTP/'))?.kind === 'mtp')
+
+  const rig = { ...hw([gpu('RTX 5080', 16, 13.4), gpu('RTX 4070 Ti', 12, 11.7, true, 1)]), totalRam: 125.6 * GB, freeRam: 100 * GB }
+  const plain = recommendQuant(variants, rig, 65536)
+  // The screenshot bug: "BF16 is 0.0 GB and fits your 26.3 GB of free VRAM".
+  check('never judged by its metadata-only first part', plain?.label !== 'BF16', plain?.label)
+  check('the reason states a real size', !/\b0\.0 GB\b/.test(plain?.reason ?? ''), plain?.reason)
+  const moe = recommendQuant(variants, rig, 65536, { [q4.id]: { expertCount: 512 }, [bf16.id]: { expertCount: 512 } })
+  check('an MoE variant is recommended when its experts fit in system RAM', moe?.variantId === q4.id, moe?.label)
+  check('without claiming it fits on the GPU alone', moe?.fitsFullyOnGpu === false)
+  check('an incomplete variant is never recommended', ![plain, moe].some((r) => r?.variantId === q2.id))
+}
+
+section('-ngl counts the output layer')
+{
+  check('nothing offloaded is 0', nglFor({ gpuLayers: 0, totalLayers: 65 }) === 0)
+  check('full offload asks for every layer', nglFor({ gpuLayers: 65, totalLayers: 65 }) === 999)
+  check('partial offload adds one for the output layer', nglFor({ gpuLayers: 40, totalLayers: 65 }) === 41)
+}
+
+section('Placement follows llama.cpp: input on the CPU, output on the last GPU')
+{
+  const placed = {
+    ...arch,
+    inputBytes: 0.6 * GB,
+    outputBytes: 0.9 * GB,
+    layerDenseBytes: new Array(arch.blockCount).fill((15 * GB) / arch.blockCount),
+    layerExpertBytes: new Array(arch.blockCount).fill(0)
+  }
+  const plan = planFit(placed, hw([gpu('A', 16, 15), gpu('B', 16, 15, true, 1)]), DEFAULT_CONSTRAINTS).chosen
+  check('the split counts the output layer as one more', plan?.layerSplit?.reduce((a, b) => a + b, 0) === arch.blockCount + 1,
+    JSON.stringify(plan?.layerSplit))
+  check('the token embedding is charged to system RAM', (plan?.predictedHostBytes ?? 0) >= 0.6 * GB - 1)
+}
+
+section('MoE models keep their routed experts in system RAM first')
+{
+  const blocks = 48
+  // Shaped after Qwen3.8-Flash-Next UD-Q4_K_XL as its real headers read.
+  const flash = {
+    ...arch,
+    architecture: 'qwen4exp',
+    name: 'Flash-Next-shaped',
+    blockCount: blocks,
+    embeddingLength: 2560,
+    headCount: 24,
+    headCountKv: 2,
+    headDim: 256,
+    contextLength: 262144,
+    vocabSize: 248320,
+    attentionLayers: 12,
+    ssmLayers: 36,
+    ssmStateBytesPerLayer: 3219456,
+    expertCount: 512,
+    expertUsedCount: 10,
+    inputBytes: 27.5 * GB,
+    pleBytes: 26.8 * GB,
+    outputBytes: 0.65 * GB,
+    layerDenseBytes: new Array(blocks).fill(0.08 * GB),
+    layerExpertBytes: new Array(blocks).fill(1.5 * GB),
+    perLayerBytes: blocks * 1.58 * GB,
+    nonLayerBytes: 28.15 * GB
+  }
+  flash.weightBytes = flash.perLayerBytes + flash.nonLayerBytes
+  const rig = { ...hw([gpu('RTX 5080', 16, 13.4), gpu('RTX 4070 Ti', 12, 11.7, true, 1)]), totalRam: 125.6 * GB, freeRam: 100 * GB }
+  const r = planFit(flash, rig, DEFAULT_CONSTRAINTS)
+  const c = r.chosen
+  check('an MoE model larger than VRAM is planned without asking', !!c && !r.needsUserChoice, r.notes.join(' | '))
+  check('every block stays on the GPU', c?.gpuLayers === blocks, `${c?.gpuLayers}`)
+  check('some, not all, expert layers move to system RAM', (c?.cpuMoeLayers ?? 0) > 0 && (c?.cpuMoeLayers ?? 0) < blocks, `${c?.cpuMoeLayers}`)
+  check('the planned context clears the target', (c?.contextLength ?? 0) >= DEFAULT_CONSTRAINTS.targetContext, `${c?.contextLength}`)
+  check('full offload maps to -ngl 999', !!c && nglFor(c) === 999)
+  const fewer = planFit(flash, rig, {
+    ...DEFAULT_CONSTRAINTS,
+    overrides: { cpuMoeLayers: (c?.cpuMoeLayers ?? 1) - 1, kvType: c?.kvType, kvTypeV: c?.kvTypeV }
+  })
+  check('it moves the fewest layers it can', !fewer.chosen, `${fewer.chosen?.contextLength}`)
+  check('moving every expert is offered, and is slower', r.alternatives.every((a) => a.speedScore <= (c?.speedScore ?? 0)))
+
+  const morePle = {
+    ...flash,
+    inputBytes: flash.inputBytes + 10 * GB,
+    pleBytes: flash.pleBytes + 10 * GB,
+    nonLayerBytes: flash.nonLayerBytes + 10 * GB,
+    weightBytes: flash.weightBytes + 10 * GB
+  }
+  const rp = planFit(morePle, rig, DEFAULT_CONSTRAINTS).chosen
+  check('the per-layer embedding table costs no VRAM', rp?.cpuMoeLayers === c?.cpuMoeLayers && rp?.contextLength === c?.contextLength)
+  check('but it is counted in system RAM', (rp?.predictedHostBytes ?? 0) - (c?.predictedHostBytes ?? 0) > 9 * GB)
+  check('a set --n-cpu-moe is honoured exactly',
+    planFit(flash, rig, { ...DEFAULT_CONSTRAINTS, overrides: { cpuMoeLayers: blocks } }).chosen?.cpuMoeLayers === blocks)
+}
+
+section('GGUF tensors are classed the way llama.cpp places them')
+{
+  const tensors = [
+    ['token_embd.weight', [256, 1000], 1],
+    ['per_layer_token_embd.weight', [256, 2000], 1],
+    ['blk.0.attn_q.weight', [256, 256], 1],
+    ['blk.0.ffn_gate_exps.weight', [256, 64, 8], 1],
+    ['blk.0.ffn_up_exps.weight', [256, 64, 8], 1],
+    ['blk.0.ffn_down_exps.weight', [64, 256, 8], 1],
+    ['blk.0.ffn_gate_shexp.weight', [256, 64], 1],
+    ['blk.1.attn_q.weight', [256, 256], 1],
+    ['output_norm.weight', [256], 0]
+  ]
+  const common = { blockCount: 2, embeddingLength: 256, headCount: 4, headCountKv: 2, keyLength: 64, vocabSize: 1000, ssm: false }
+  const file = path.join(os.tmpdir(), `llmm-moe-${Date.now()}.gguf`)
+  fs.writeFileSync(file, buildGguf({
+    ...common,
+    tensors,
+    extraKv: [['qwen35.expert_count', 'u32', 8], ['qwen35.expert_used_count', 'u32', 2]]
+  }))
+  try {
+    const a = extractArchInfo(await readGguf(file))
+    const e = 256 * 64 * 8 * 2
+    check('routed experts are counted per block', a.layerExpertBytes[0] === 3 * e && a.layerExpertBytes[1] === 0,
+      JSON.stringify(a.layerExpertBytes))
+    check('the shared expert stays with the dense weights', a.layerDenseBytes[0] === 256 * 256 * 2 + 256 * 64 * 2)
+    check('the per-layer embedding table is input, not a block',
+      a.pleBytes === 256 * 2000 * 2 && a.inputBytes === 256 * 1000 * 2 + 256 * 2000 * 2)
+    check('a tied head costs the embedding again on the GPU', a.outputBytes === 256 * 4 + 256 * 1000 * 2, `${a.outputBytes}`)
+    check('expert usage is read', a.expertCount === 8 && a.expertUsedCount === 2)
+  } finally {
+    fs.rmSync(file, { force: true })
+  }
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-split-'))
+  const p1 = path.join(dir, 'M-00001-of-00002.gguf')
+  const p2 = path.join(dir, 'M-00002-of-00002.gguf')
+  fs.writeFileSync(p1, buildGguf({ ...common, tensors: [] }))
+  fs.writeFileSync(p2, Buffer.concat([
+    buildGguf({ ...common, tensors: [['blk.0.attn_q.weight', [256, 256], 1], ['blk.1.attn_q.weight', [256, 256], 1]] }),
+    Buffer.alloc(8192)
+  ]))
+  try {
+    const { meta, weightBytes } = await readGgufParts([p1, p2])
+    check('a split model joins every part\'s tensors', meta.tensors.length === 2)
+    check('its weights come from the parts that hold them', weightBytes > 0)
+    check('its metadata comes from the first part', extractArchInfo(meta, undefined, weightBytes).blockCount === 2)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 }
 
 section('Byte formatting')

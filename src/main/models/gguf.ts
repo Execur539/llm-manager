@@ -332,6 +332,40 @@ export async function readGguf(path: string): Promise<GgufMetadata> {
   }
 }
 
+/**
+ * Read a model split into several files as the one model it is.
+ *
+ * Only the first part carries the metadata, and each part carries the directory for its own
+ * tensors — Unsloth-style splits put no tensors in the first part at all, so reading it alone made
+ * a hundred-gigabyte model look like it held nothing. The parts' directories are joined under the
+ * first part's metadata, and the weight total is taken from every part's data section.
+ */
+export async function readGgufParts(paths: string[]): Promise<{ meta: GgufMetadata; weightBytes: number }> {
+  if (!paths.length) throw new Error('No parts to read')
+  const first = await readGguf(paths[0])
+  const tensors = [...first.tensors]
+  let weightBytes = Math.max(0, (await stat(paths[0])).size - first.dataOffset)
+  for (const partPath of paths.slice(1)) {
+    const part = await readGguf(partPath)
+    tensors.push(...part.tensors)
+    weightBytes += Math.max(0, (await stat(partPath)).size - part.dataOffset)
+  }
+  return { meta: { ...first, tensorCount: tensors.length, tensors }, weightBytes }
+}
+
+/*
+ * Where llama.cpp puts each tensor, by name.
+ *
+ * Its input layer is pinned to the CPU ("there is very little benefit to offloading the input
+ * layer, so always keep it on the CPU" — llama-model.cpp), and these are the tensors its arch table
+ * files under LLM_TENSOR_LAYER_INPUT. Everything else outside the blocks belongs to the output
+ * layer, which follows the last offloaded block onto a GPU.
+ */
+const INPUT_LAYER_RE = /^(token_embd|per_layer_token_embd|position_embd|token_types|masked_embd_centroids|masked_embd_ordering)\./
+/** Exactly what `--n-cpu-moe` matches (LLM_FFN_EXPS_REGEX), so the costing and the flag agree. */
+const ROUTED_EXPERT_RE = /^blk\.\d+\.ffn_(up|down|gate|gate_up)_(ch|)exps/
+const BLOCK_RE = /^blk\.(\d+)\./
+
 function num(kv: Record<string, GgufValue>, key: string): number | null {
   const v = kv[key]
   return typeof v === 'number' ? v : null
@@ -352,7 +386,7 @@ function num(kv: Record<string, GgufValue>, key: string): number | null {
  *   under-estimate, which is the dangerous direction: the fit engine would plan more context
  *   than fits and the load would OOM.
  */
-export function extractArchInfo(meta: GgufMetadata, fileSize?: number): ModelArchInfo {
+export function extractArchInfo(meta: GgufMetadata, fileSize?: number, actualWeightBytes?: number): ModelArchInfo {
   const kv = meta.kv
   const arch = typeof kv['general.architecture'] === 'string' ? (kv['general.architecture'] as string) : 'unknown'
   const p = (suffix: string) => num(kv, `${arch}.${suffix}`)
@@ -363,6 +397,7 @@ export function extractArchInfo(meta: GgufMetadata, fileSize?: number): ModelArc
   const headCountKv = p('attention.head_count_kv') ?? headCount
   const contextLength = p('context_length') ?? 0
   const expertCount = p('expert_count') ?? 0
+  const expertUsedCount = p('expert_used_count') ?? 0
 
   // head_dim is stated explicitly by newer converters; otherwise derive it.
   let headDim = p('attention.head_dim') ?? p('attention.key_length') ?? 0
@@ -381,35 +416,81 @@ export function extractArchInfo(meta: GgufMetadata, fileSize?: number): ModelArc
   // Weight accounting. Block tensors are named "blk.<n>." by convention across architectures.
   let perLayerBytes = 0
   let nonLayerBytes = 0
+  const layerDenseBytes = new Array<number>(blockCount).fill(0)
+  const layerExpertBytes = new Array<number>(blockCount).fill(0)
+  let inputBytes = 0
+  let pleBytes = 0
+  let outputBytes = 0
+  let tokenEmbdBytes = 0
+  let hasOutputHead = false
   const quantCounts = new Map<number, number>()
   const unknownTypes = new Set<number>()
   for (const t of meta.tensors) {
     if (!isKnownGgmlType(t.ggmlType)) unknownTypes.add(t.ggmlType)
-    if (/^blk\.\d+\./.test(t.name)) perLayerBytes += t.bytes
-    else nonLayerBytes += t.bytes
     // Only count 2D+ weight tensors toward "the" quant; 1D norms are always F32.
     if (t.dims.length >= 2) {
       quantCounts.set(t.ggmlType, (quantCounts.get(t.ggmlType) ?? 0) + t.bytes)
+    }
+
+    const block = BLOCK_RE.exec(t.name)
+    if (block) {
+      perLayerBytes += t.bytes
+      // A block numbered past block_count has nowhere better to go than the last block.
+      if (blockCount > 0) {
+        const il = Math.min(Number(block[1]), blockCount - 1)
+        if (ROUTED_EXPERT_RE.test(t.name)) layerExpertBytes[il] += t.bytes
+        else layerDenseBytes[il] += t.bytes
+      }
+      continue
+    }
+
+    nonLayerBytes += t.bytes
+    if (INPUT_LAYER_RE.test(t.name)) {
+      inputBytes += t.bytes
+      if (t.name.startsWith('per_layer_token_embd.')) pleBytes += t.bytes
+      if (t.name === 'token_embd.weight') tokenEmbdBytes = t.bytes
+    } else {
+      outputBytes += t.bytes
+      if (t.name === 'output.weight') hasOutputHead = true
     }
   }
 
   // Reconcile against the file. Tensor data runs from dataOffset to EOF, so that span is the
   // ground truth for how much weight there actually is. If our per-type arithmetic disagrees —
   // because of an unrecognised quantisation, or a layout change — scale to match rather than
-  // trusting a total we know is wrong.
-  if (fileSize && fileSize > meta.dataOffset) {
-    const actualWeightBytes = fileSize - meta.dataOffset
+  // trusting a total we know is wrong. A split model passes the total across all its parts.
+  const actual =
+    actualWeightBytes ?? (fileSize && fileSize > meta.dataOffset ? fileSize - meta.dataOffset : undefined)
+  if (actual !== undefined && actual > 0) {
     const computed = perLayerBytes + nonLayerBytes
-    const ratio = computed > 0 ? actualWeightBytes / computed : 0
+    const ratio = computed > 0 ? actual / computed : 0
     // Only correct a real discrepancy; small deltas are padding and alignment.
     if (computed > 0 && (ratio > 1.02 || ratio < 0.98)) {
       perLayerBytes *= ratio
       nonLayerBytes *= ratio
+      inputBytes *= ratio
+      pleBytes *= ratio
+      outputBytes *= ratio
+      tokenEmbdBytes *= ratio
+      for (let i = 0; i < blockCount; i++) {
+        layerDenseBytes[i] *= ratio
+        layerExpertBytes[i] *= ratio
+      }
     } else if (computed === 0) {
       // Nothing parsed at all: attribute everything to layers, which the fit engine can offload.
-      perLayerBytes = actualWeightBytes
+      perLayerBytes = actual
+      if (blockCount > 0) layerDenseBytes.fill(actual / blockCount)
     }
   }
+
+  /*
+   * A head tied to the token embedding is not shared with it at runtime.
+   *
+   * llama.cpp creates a second tensor for the output layer from the same data (TENSOR_DUPLICATED),
+   * on the output device — so a file with no separate head still costs its embedding matrix once
+   * in system RAM and once more on the last GPU.
+   */
+  if (!hasOutputHead && tokenEmbdBytes > 0) outputBytes += tokenEmbdBytes
 
   let dominant = 0
   let best = -1
@@ -470,7 +551,13 @@ export function extractArchInfo(meta: GgufMetadata, fileSize?: number): ModelArc
     ssmLayers,
     mtpLayers,
     ssmStateBytesPerLayer,
-    unknownTensorTypes: [...unknownTypes]
+    unknownTensorTypes: [...unknownTypes],
+    inputBytes,
+    pleBytes,
+    outputBytes,
+    layerDenseBytes,
+    layerExpertBytes,
+    expertUsedCount
   }
 }
 

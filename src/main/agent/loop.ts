@@ -66,6 +66,14 @@ export interface AgentOptions {
    * null leaves the template's own default alone.
    */
   reasoningChoice?: ReasoningChoice
+  /**
+   * Hand the model its own reasoning from earlier turns.
+   *
+   * Without it a past answer reached the model as its visible text alone: the thinking behind it
+   * was kept for the transcript and never shown to the model again, so it could not remember why
+   * it had decided something a few messages back.
+   */
+  preserveReasoning?: boolean
   /** true when the caller is a remote web-UI session */
   remote?: boolean
   remoteToolsEnabled?: boolean
@@ -415,10 +423,12 @@ Platform: Windows (PowerShell)${memoryBlock}`
      */
     const MEDIA_TOKENS = 1200
     const cost = (m: ChatMessage): number => {
-      if (typeof m.content === 'string') return estimateTokens(m.content)
+      // Reasoning handed back is sent like any other text, so it fills the window like it too.
+      const thought = estimateTokens(m.reasoning_content ?? '')
+      if (typeof m.content === 'string') return estimateTokens(m.content) + thought
       return m.content.reduce(
         (a, part) => a + (part.type === 'text' ? estimateTokens(part.text ?? '') : MEDIA_TOKENS),
-        0
+        thought
       )
     }
     let total = this.history.reduce((a, m) => a + cost(m), 0)
@@ -727,7 +737,18 @@ Platform: Windows (PowerShell)${memoryBlock}`
           if (m.role === 'tool') {
             return { role: 'user', content: `[tool result]\n${m.content}` }
           }
-          return { role: m.role as 'user' | 'assistant', content: m.content }
+          /*
+           * Past reasoning goes back with the answer it produced, so the model can remember why it
+           * decided what it did — not only what it said. `--reasoning-preserve` is what stops the
+           * template from dropping all but the latest.
+           */
+          return {
+            role: m.role as 'user' | 'assistant',
+            content: m.content,
+            ...(this.opts.preserveReasoning && m.role === 'assistant' && m.reasoning
+              ? { reasoning_content: m.reasoning }
+              : {})
+          }
         })
     ]
   }
@@ -918,11 +939,18 @@ Platform: Windows (PowerShell)${memoryBlock}`
             // The resumed turn is already the last entry in both lists; it grew rather than
             // gaining a sibling, so the entry is rewritten in place instead of a new one added.
             const tail = this.history.at(-1)
-            if (tail?.role === 'assistant') tail.content = assistant.content
+            if (tail?.role === 'assistant') {
+              tail.content = assistant.content
+              if (this.opts.preserveReasoning && assistant.reasoning) tail.reasoning_content = assistant.reasoning
+            }
             extending = undefined
           } else {
             session.messages.push(assistant)
-            this.history.push({ role: 'assistant', content: text })
+            this.history.push({
+              role: 'assistant',
+              content: text,
+              ...(this.opts.preserveReasoning && thinking.trim() ? { reasoning_content: thinking.trim() } : {})
+            })
           }
           this.emit('message', assistant)
           this.emit('done', 'complete')
@@ -954,15 +982,19 @@ Platform: Windows (PowerShell)${memoryBlock}`
          * carries the whole answer plus the calls it made. Leaving the original in place would
          * put the first half of the answer in the history twice.
          */
+        let thought = thinking.trim()
         if (extending) {
           if (this.history.at(-1)?.role === 'assistant') this.history.pop()
           text = extending.content
+          // The whole answer's reasoning, not just the part produced since it was resumed.
+          thought = extending.reasoning ?? ''
           extending = undefined
         }
 
         this.history.push({
           role: 'assistant',
           content: text,
+          ...(this.opts.preserveReasoning && thought ? { reasoning_content: thought } : {}),
           tool_calls: toolCalls.map((c) => ({
             id: c.id,
             type: 'function' as const,

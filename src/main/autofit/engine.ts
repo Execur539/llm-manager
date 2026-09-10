@@ -215,9 +215,21 @@ export function computeBufferBytes(
   flashAttention: boolean
 ): number {
   const activations = batchSize * arch.embeddingLength * 2 * 6
-  const logits = arch.vocabSize * 4
   const attention = flashAttention ? batchSize * arch.headDim * arch.headCount * 2 * 4 : batchSize * contextLength * arch.headCount * 2
-  return activations + logits + attention + BASE_GRAPH_OVERHEAD
+  return activations + attention + BASE_GRAPH_OVERHEAD
+}
+
+/**
+ * The logits buffer, which lives only on the device holding the output layer.
+ *
+ * llama.cpp reserves its worst-case graph with an output row for every token of the physical
+ * batch, so this is batch x vocabulary x 4 bytes — half a gigabyte for a 248K vocabulary. It was
+ * sized for a single token and charged to every device, which under-counted the card that
+ * actually holds it; that was one of the two errors behind the 1.2.0 plan that would not load.
+ */
+export function logitsBufferBytes(arch: ModelArchInfo, batchSize: number): number {
+  // The physical batch is llama.cpp's default 512 whatever the logical batch; this app never sets it.
+  return Math.min(batchSize, 512) * arch.vocabSize * 4
 }
 
 /**
@@ -264,15 +276,158 @@ export function proportionalSplit(budgets: number[]): number[] {
 interface Attempt {
   fits: boolean
   perGpu: number[]
+  /** Blocks per GPU, with the output layer counted on the card that takes the last block. */
+  layerSplit: number[]
   hostBytes: number
   kvBytes: number
   weightsOnGpu: number
   overhead: number
 }
 
+/** What each block weighs, and what always sits outside the blocks. */
+interface LayerCosts {
+  dense: number[]
+  experts: number[]
+  input: number
+  output: number
+}
+
+function layerCosts(arch: ModelArchInfo): LayerCosts {
+  const n = arch.blockCount
+  const dense = arch.layerDenseBytes
+  const experts = arch.layerExpertBytes
+  if (dense && experts && dense.length === n && experts.length === n) {
+    return {
+      dense,
+      experts,
+      input: arch.inputBytes ?? 0,
+      output: arch.outputBytes ?? Math.max(0, arch.nonLayerBytes - (arch.inputBytes ?? 0))
+    }
+  }
+  /*
+   * A record parsed before the per-block breakdown existed.
+   *
+   * Spread the block bytes evenly and charge everything outside the blocks to the output layer,
+   * which is what this engine always assumed — so an old record plans the way it always did until
+   * the library rescans it.
+   */
+  const per = n > 0 ? arch.perLayerBytes / n : 0
+  return {
+    dense: new Array<number>(n).fill(per),
+    experts: new Array<number>(n).fill(0),
+    input: 0,
+    output: arch.nonLayerBytes
+  }
+}
+
+/** Blocks that carry routed experts, and one past the last of them: the most `--n-cpu-moe` can usefully be. */
+function expertSpan(costs: LayerCosts): { blocks: number; end: number } {
+  let blocks = 0
+  let end = 0
+  costs.experts.forEach((bytes, il) => {
+    if (bytes > 0) {
+      blocks++
+      end = il + 1
+    }
+  })
+  return { blocks, end }
+}
+
 /**
- * Try to place `gpuLayers` of the model on the GPUs at a given context length.
- * Weights and KV both follow the layer placement, which is what llama.cpp actually does.
+ * Cut the offloaded items — blocks in order, then the output layer — into one run per GPU.
+ *
+ * In proportion to each card's free capacity (P2), but by what each item weighs rather than by
+ * how many there are. Counting blocks assumed they all weigh the same, which an MoE model with
+ * some experts in system RAM does not, and a vocabulary head several times a block's size breaks
+ * on whichever card receives it.
+ */
+function cutProportional(items: number[], caps: number[]): number[] {
+  const counts = new Array<number>(caps.length).fill(0)
+  const capTotal = caps.reduce((a, c) => a + Math.max(0, c), 0)
+  const total = items.reduce((a, b) => a + b, 0)
+  const ends: number[] = []
+  let acc = 0
+  for (const c of caps) {
+    acc += capTotal > 0 ? (Math.max(0, c) / capTotal) * total : total / caps.length
+    ends.push(acc)
+  }
+  let run = 0
+  let dev = 0
+  for (const item of items) {
+    // An item goes to the card its midpoint falls on, so a boundary splits the difference.
+    while (dev < caps.length - 1 && run + item / 2 > ends[dev]) dev++
+    counts[dev]++
+    run += item
+  }
+  return counts
+}
+
+/** Fill each card before starting the next: the fallback when the even cut overflows one of them. */
+function cutGreedy(items: number[], caps: number[]): number[] {
+  const counts = new Array<number>(caps.length).fill(0)
+  let dev = 0
+  let used = 0
+  for (const item of items) {
+    while (dev < caps.length - 1 && used + item > caps[dev]) {
+      dev++
+      used = 0
+    }
+    counts[dev]++
+    used += item
+  }
+  return counts
+}
+
+/**
+ * Put the offloaded items on the cards and work out what each card then needs.
+ *
+ * Every card holding at least one item also holds a compute buffer, and the card that ends up
+ * with the output layer holds the logits buffer too. A placement that fits matters more than an
+ * even one, so a front-loaded fill is used when the even cut does not fit.
+ */
+function placeItems(
+  items: number[],
+  budgets: number[],
+  compute: number,
+  logits: number
+): { counts: number[]; perGpu: number[] } {
+  const devices = budgets.length
+  const caps = budgets.map((b, d) => b - compute - (d === devices - 1 ? logits : 0))
+  const measure = (counts: number[]): number[] => {
+    const need = new Array<number>(devices).fill(0)
+    let k = 0
+    let outputDevice = 0
+    for (let d = 0; d < devices; d++) {
+      for (let j = 0; j < counts[d]; j++) need[d] += items[k++]
+      if (counts[d] > 0) {
+        need[d] += compute
+        outputDevice = d
+      }
+    }
+    need[outputDevice] += logits
+    return need
+  }
+  const fitsAll = (need: number[]): boolean => need.every((x, d) => x <= budgets[d])
+
+  const even = cutProportional(items, caps)
+  const evenNeed = measure(even)
+  if (devices === 1 || fitsAll(evenNeed)) return { counts: even, perGpu: evenNeed }
+
+  const filled = cutGreedy(items, caps)
+  const filledNeed = measure(filled)
+  return fitsAll(filledNeed) ? { counts: filled, perGpu: filledNeed } : { counts: even, perGpu: evenNeed }
+}
+
+/**
+ * Try a placement at a given context length.
+ *
+ * Mirrors what llama.cpp does rather than an idealised split:
+ *   - the input layer (token embedding, per-layer embedding tables) always stays in system RAM;
+ *   - blocks are offloaded from the *end* of the stack, so `gpuLayers` are the last ones;
+ *   - the output layer follows them onto the last card whenever any block is offloaded;
+ *   - `--n-cpu-moe N` keeps the routed experts of the *first* N blocks in system RAM, wherever the
+ *     rest of those blocks are;
+ *   - each block's slice of the KV cache lives with the block.
  */
 function attempt(
   arch: ModelArchInfo,
@@ -282,39 +437,111 @@ function attempt(
   kvType: KvChoice,
   gpuLayers: number,
   batchSize: number,
-  flashAttention: boolean
+  flashAttention: boolean,
+  cpuMoeLayers = 0
 ): Attempt {
   const totalLayers = arch.blockCount
-  const layerFraction = totalLayers > 0 ? gpuLayers / totalLayers : 0
-
-  const perLayerWeight = totalLayers > 0 ? arch.perLayerBytes / totalLayers : 0
-  const weightsOnGpu = perLayerWeight * gpuLayers + (gpuLayers >= totalLayers ? arch.nonLayerBytes : 0)
-  const weightsOnHost = arch.weightBytes - weightsOnGpu
-
+  const costs = layerCosts(arch)
   const kvTotal = kvCacheBytes(arch, contextLength, kvType)
-  const kvOnGpu = kvTotal * layerFraction
-  const kvOnHost = kvTotal - kvOnGpu
+  // Attention layers are interleaved through the stack, so an even spread is how the cache lands.
+  const kvPerBlock = totalLayers > 0 ? kvTotal / totalLayers : 0
+  const firstOnGpu = Math.max(0, totalLayers - gpuLayers)
+  const cpuMoe = Math.max(0, Math.min(cpuMoeLayers, totalLayers))
+
+  let hostBytes = costs.input
+  let weightsOnGpu = 0
+  const items: number[] = []
+  for (let il = 0; il < totalLayers; il++) {
+    const expertsOnHost = il < cpuMoe
+    if (il < firstOnGpu) {
+      hostBytes += costs.dense[il] + costs.experts[il] + kvPerBlock
+      continue
+    }
+    const onGpu = costs.dense[il] + (expertsOnHost ? 0 : costs.experts[il])
+    weightsOnGpu += onGpu
+    items.push(onGpu + kvPerBlock)
+    if (expertsOnHost) hostBytes += costs.experts[il]
+  }
 
   const compute = computeBufferBytes(arch, contextLength, batchSize, flashAttention)
+  const logits = logitsBufferBytes(arch, batchSize)
 
-  const split = proportionalSplit(budgets)
-  const perGpu = budgets.map((_, i) => {
-    const share = split[i]
-    // The compute buffer is allocated on every participating device, not split.
-    const computeShare = share > 0 ? compute : 0
-    return (weightsOnGpu + kvOnGpu) * share + computeShare
-  })
+  if (gpuLayers <= 0 || budgets.length === 0) {
+    return {
+      fits: true,
+      perGpu: budgets.map(() => 0),
+      layerSplit: budgets.map(() => 0),
+      hostBytes: hostBytes + costs.output + compute + logits,
+      kvBytes: kvTotal,
+      weightsOnGpu: 0,
+      overhead: compute
+    }
+  }
 
-  const fits = perGpu.every((need, i) => need <= budgets[i])
+  items.push(costs.output)
+  weightsOnGpu += costs.output
 
+  const { counts, perGpu } = placeItems(items, budgets, compute, logits)
   return {
-    fits,
+    fits: perGpu.every((need, i) => need <= budgets[i]),
     perGpu,
-    hostBytes: weightsOnHost + kvOnHost + (gpuLayers === 0 ? compute : 0),
+    layerSplit: counts,
+    hostBytes,
     kvBytes: kvTotal,
     weightsOnGpu,
     overhead: compute
   }
+}
+
+/*
+ * Relative decode speed, from how many bytes each token reads and from where.
+ *
+ * Generation is bound by memory bandwidth, and system RAM feeds a CPU roughly a tenth as fast as
+ * VRAM feeds a GPU. Counting only the bytes a token actually touches is what lets an MoE plan score
+ * sensibly: with ten of five hundred experts consulted per token, a block's experts in system RAM
+ * cost about a fiftieth of what their size would suggest.
+ */
+const HOST_SLOWDOWN = 10
+
+function speedScore(arch: ModelArchInfo, gpuLayers: number, cpuMoeLayers: number): number {
+  const costs = layerCosts(arch)
+  const totalLayers = arch.blockCount
+  const used = arch.expertUsedCount ?? 0
+  const share = arch.expertCount > 0 && used > 0 ? used / arch.expertCount : 1
+  const firstOnGpu = Math.max(0, totalLayers - gpuLayers)
+  let gpu = 0
+  let host = 0
+  for (let il = 0; il < totalLayers; il++) {
+    const experts = costs.experts[il] * share
+    if (il < firstOnGpu) {
+      host += costs.dense[il] + experts
+      continue
+    }
+    gpu += costs.dense[il]
+    if (il < cpuMoeLayers) host += experts
+    else gpu += experts
+  }
+  if (gpuLayers > 0) gpu += costs.output
+  else host += costs.output
+  const total = gpu + host
+  if (total <= 0) return 100
+  return Math.max(1, Math.round((total / (gpu + host * HOST_SLOWDOWN)) * 100))
+}
+
+/**
+ * llama.cpp's `-ngl` for a plan.
+ *
+ * llama.cpp counts its output layer as one more "layer" and offloads from the end, so asking for
+ * exactly the block count — which this app did — put the output head on the GPU and left block 0
+ * on the CPU: every token took a round trip through system RAM for its first layer. Full offload
+ * asks for more layers than any model has, which also covers anything llama.cpp counts beyond
+ * block_count (multi-token-prediction layers); a partial offload asks for one more than the blocks
+ * it means, for the output layer that goes with them.
+ */
+export function nglFor(plan: Pick<FitPlan, 'gpuLayers' | 'totalLayers'>): number {
+  if (plan.gpuLayers <= 0) return 0
+  if (plan.gpuLayers >= plan.totalLayers) return 999
+  return plan.gpuLayers + 1
 }
 
 /** Largest context that fits with the given layer placement, or 0 if even the minimum fails. */
@@ -326,14 +553,15 @@ function maxContextFor(
   gpuLayers: number,
   batchSize: number,
   flashAttention: boolean,
-  ceiling: number
+  ceiling: number,
+  cpuMoeLayers = 0
 ): number {
   const MIN_CTX = 512
   let lo = 0
   // A non-finite bound would never converge; a caller passing one means "as much as possible".
   let hi = Number.isFinite(ceiling) ? ceiling : 1_048_576
 
-  if (!attempt(arch, hw, budgets, MIN_CTX, kvType, gpuLayers, batchSize, flashAttention).fits) {
+  if (!attempt(arch, hw, budgets, MIN_CTX, kvType, gpuLayers, batchSize, flashAttention, cpuMoeLayers).fits) {
     return 0
   }
 
@@ -342,7 +570,7 @@ function maxContextFor(
   while (lo < hi) {
     const mid = Math.min(hi, Math.ceil((lo + hi + 1) / 2 / 512) * 512)
     if (mid === lo) break
-    if (attempt(arch, hw, budgets, mid, kvType, gpuLayers, batchSize, flashAttention).fits) lo = mid
+    if (attempt(arch, hw, budgets, mid, kvType, gpuLayers, batchSize, flashAttention, cpuMoeLayers).fits) lo = mid
     else hi = mid - 512
   }
   return Math.max(0, Math.floor(lo / 512) * 512)
@@ -358,14 +586,36 @@ function buildPlan(
   gpuLayers: number,
   batchSize: number,
   flashAttention: boolean,
-  rationale: string[]
+  rationale: string[],
+  cpuMoeLayers = 0,
+  overrideTensors?: string
 ): FitPlan {
-  const a = attempt(arch, hw, budgets, contextLength, kvType, gpuLayers, batchSize, flashAttention)
+  const a = attempt(arch, hw, budgets, contextLength, kvType, gpuLayers, batchSize, flashAttention, cpuMoeLayers)
   const totalLayers = arch.blockCount
-  const onGpuFraction = totalLayers > 0 ? gpuLayers / totalLayers : 0
+  const assigned = a.layerSplit.reduce((sum, c) => sum + c, 0)
 
-  // Speed heuristic: host layers are roughly an order of magnitude slower than GPU layers.
-  const speedScore = Math.round((onGpuFraction + (1 - onGpuFraction) * 0.08) * 100)
+  const lines = [...rationale]
+  /*
+   * System RAM is a budget too, once anything lives there.
+   *
+   * Weights llama.cpp keeps on the host are memory-mapped, so a shortfall does not fail the load:
+   * whatever does not fit is read from disk each time it is needed, which on a model spilling tens
+   * of gigabytes turns seconds per answer into minutes. Better said before loading than noticed after.
+   */
+  const freeRam = hw.freeRam ?? 0
+  if (freeRam > 0 && a.hostBytes > freeRam * 0.9) {
+    lines.push(
+      `About ${fmtBytes(a.hostBytes)} has to sit in system RAM and ${fmtBytes(freeRam)} is free. ` +
+        'What does not fit will be read from disk as it is needed, which is far slower — close other ' +
+        'programs or pick a smaller quantisation.'
+    )
+  }
+  if (overrideTensors) {
+    lines.push(
+      `Custom tensor overrides are passed to llama.cpp as given (${overrideTensors}); the memory ` +
+        'prediction above does not account for them.'
+    )
+  }
 
   return {
     label,
@@ -374,7 +624,10 @@ function buildPlan(
     kvTypeV: kvType.v,
     gpuLayers,
     totalLayers,
-    tensorSplit: proportionalSplit(budgets),
+    tensorSplit: assigned > 0 ? a.layerSplit.map((c) => c / assigned) : proportionalSplit(budgets),
+    layerSplit: a.layerSplit,
+    cpuMoeLayers,
+    ...(overrideTensors ? { overrideTensors } : {}),
     batchSize,
     flashAttention,
     predictedVramPerGpu: a.perGpu,
@@ -382,9 +635,9 @@ function buildPlan(
     kvBytes: a.kvBytes,
     weightsOnGpuBytes: a.weightsOnGpu,
     overheadBytes: a.overhead,
-    spillsToHost: gpuLayers < totalLayers,
-    speedScore,
-    rationale
+    spillsToHost: gpuLayers < totalLayers || cpuMoeLayers > 0,
+    speedScore: speedScore(arch, gpuLayers, cpuMoeLayers),
+    rationale: lines
   }
 }
 
@@ -393,7 +646,9 @@ function buildPlan(
  *
  * Never silently degrades: if we cannot reach targetContext with an acceptable KV type and
  * everything on GPU, we return needsUserChoice with the real tradeoffs rather than picking
- * one quietly.
+ * one quietly. The exception is a mixture-of-experts model, where keeping some routed experts in
+ * system RAM is the ordinary way to run it rather than a degradation, and is chosen automatically
+ * with the reason stated.
  */
 export function planFit(
   arch: ModelArchInfo,
@@ -497,10 +752,32 @@ export function planFit(
   const totalLayers = arch.blockCount
   const fullGpuLayers = o.gpuLayers ?? totalLayers
 
+  /*
+   * Mixture-of-experts: what can move to system RAM before whole layers have to.
+   *
+   * Most of an MoE model is routed experts, and only a handful are read for any one token — so
+   * keeping some of them in system RAM costs a small fraction of the speed that moving the same
+   * bytes of attention or shared weights would. llama.cpp's `--n-cpu-moe` does exactly that for
+   * the first N blocks. A user's explicit N is honoured as given, everywhere below.
+   */
+  const costs = layerCosts(arch)
+  const experts = expertSpan(costs)
+  const cpuMoeFixed =
+    o.cpuMoeLayers !== undefined ? Math.max(0, Math.min(Math.round(o.cpuMoeLayers), totalLayers)) : undefined
+  const cpuMoeBase = cpuMoeFixed ?? 0
+  const overrideTensors = o.overrideTensors?.trim() || undefined
+
+  if ((arch.pleBytes ?? 0) > 0) {
+    notes.push(
+      `The ${fmtBytes(arch.pleBytes ?? 0)} per-layer embedding table stays in system RAM, where llama.cpp ` +
+        'always keeps it: it is only ever looked up a few rows per token, so a GPU would hold a copy and add nothing.'
+    )
+  }
+
   if (totalBudget <= 0) {
     const plan = buildPlan('CPU only', arch, hw, budgets, Math.min(8192, ceiling), { k: constraints.preferredKvType, v: constraints.preferredKvType }, 0, batchSize, flashAttention, [
       'No usable GPU memory detected — running entirely on CPU.'
-    ])
+    ], 0, overrideTensors)
     return { chosen: plan, alternatives: [], needsUserChoice: false, hardware: hw, notes }
   }
 
@@ -523,8 +800,21 @@ export function planFit(
    */
   const floorIndex = clampToOrder(constraints.minKvType, KV_ORDER.length - 1)
   const kvCandidates: KvChoice[] = o.kvType
-    ? [{ k: o.kvType, v: o.kvType }]
+    ? [{ k: o.kvType, v: o.kvTypeV ?? o.kvType }]
     : kvLadder(constraints.preferredKvType, constraints.minKvType)
+
+  /*
+   * With everything on the GPU, an MoE model does not step its keys down to buy context.
+   *
+   * Four-bit keys are the one cache setting measured to break a model rather than blunt it, and
+   * the ladder only reaches them when nothing else fits. An MoE model always has something else:
+   * its experts can move to system RAM instead, which costs speed, not answers. So for those the
+   * full-GPU passes stop at the preferred key precision and leave the rest to pass 3.
+   */
+  const fullGpuCandidates =
+    experts.blocks > 0 && cpuMoeFixed === undefined && !o.kvType
+      ? kvCandidates.filter((c) => c.k === kvCandidates[0]?.k)
+      : kvCandidates
 
   const warnIfKeysPushed = (kv: KvChoice, into: string[]): void => {
     if (kv.k === 'q4_0') {
@@ -555,8 +845,8 @@ export function planFit(
    *
    * Quality is only traded away when the target cannot be met at all, which is pass 2.
    */
-  for (const kvType of kvCandidates) {
-    const maxCtx = maxContextFor(arch, hw, budgets, kvType, fullGpuLayers, batchSize, flashAttention, ceiling)
+  for (const kvType of fullGpuCandidates) {
+    const maxCtx = maxContextFor(arch, hw, budgets, kvType, fullGpuLayers, batchSize, flashAttention, ceiling, cpuMoeBase)
     /*
      * Clamped to the ceiling, which the target is not bound by.
      *
@@ -576,7 +866,9 @@ export function planFit(
       const ctx = Math.min(enough, maxCtx)
       const reachedIdeal = ctx >= Math.min(constraints.idealContext, ceiling)
       const rationale = [
-        `All ${totalLayers} layers on GPU.`,
+        cpuMoeBase > 0
+          ? `All ${totalLayers} layers on GPU, with the routed experts of the first ${cpuMoeBase} kept in system RAM as set.`
+          : `All ${totalLayers} layers on GPU.`,
         reachedIdeal
           ? `KV cache at ${kvLabel(kvType)} reaches ${ctx.toLocaleString()} tokens — the ideal target.`
           : `KV cache at ${kvLabel(kvType)} reaches ${ctx.toLocaleString()} tokens, the most this quality affords.`,
@@ -606,7 +898,7 @@ export function planFit(
       const longer: FitPlan[] = []
       for (const other of kvCandidates.slice(kvCandidates.indexOf(kvType) + 1)) {
         if (other.k !== kvType.k) continue
-        const otherMax = maxContextFor(arch, hw, budgets, other, fullGpuLayers, batchSize, flashAttention, ceiling)
+        const otherMax = maxContextFor(arch, hw, budgets, other, fullGpuLayers, batchSize, flashAttention, ceiling, cpuMoeBase)
         // Worth showing only if it is a step, not a rounding difference.
         if (otherMax < ctx * 1.1) continue
         longer.push(
@@ -616,7 +908,7 @@ export function planFit(
               `${Math.round((Math.min(otherMax, ceiling) / ctx - 1) * 100)}% more than the default plan.`,
             'Keys are unchanged, which is the half that carries the accuracy; coarser values ' +
               'measure at roughly one changed answer in five hundred.'
-          ])
+          ], cpuMoeBase, overrideTensors)
         )
         break
       }
@@ -624,7 +916,7 @@ export function planFit(
       return {
         chosen: buildPlan(
           reachedIdeal ? 'Ideal' : 'Best quality',
-          arch, hw, budgets, ctx, kvType, fullGpuLayers, batchSize, flashAttention, rationale
+          arch, hw, budgets, ctx, kvType, fullGpuLayers, batchSize, flashAttention, rationale, cpuMoeBase, overrideTensors
         ),
         alternatives: longer,
         needsUserChoice: false,
@@ -635,8 +927,8 @@ export function planFit(
   }
 
   // Pass 2: everything on GPU, accept the best context we can reach at or above target.
-  for (const kvType of kvCandidates) {
-    const maxCtx = maxContextFor(arch, hw, budgets, kvType, fullGpuLayers, batchSize, flashAttention, ceiling)
+  for (const kvType of fullGpuCandidates) {
+    const maxCtx = maxContextFor(arch, hw, budgets, kvType, fullGpuLayers, batchSize, flashAttention, ceiling, cpuMoeBase)
     if (maxCtx >= Math.min(constraints.targetContext, ceiling)) {
       const rationale = [
         `All ${totalLayers} layers on GPU.`,
@@ -646,8 +938,85 @@ export function planFit(
           : 'KV kept at the preferred quality.'
       ]
       return {
-        chosen: buildPlan('Balanced', arch, hw, budgets, maxCtx, kvType, fullGpuLayers, batchSize, flashAttention, rationale),
+        chosen: buildPlan('Balanced', arch, hw, budgets, maxCtx, kvType, fullGpuLayers, batchSize, flashAttention, rationale, cpuMoeBase, overrideTensors),
         alternatives: [],
+        needsUserChoice: false,
+        hardware: hw,
+        notes
+      }
+    }
+  }
+
+  /*
+   * Pass 3: an MoE model that fits once some of its experts are in system RAM.
+   *
+   * Every block stays on the GPU — attention, shared expert, norms — and routed experts move to
+   * the host a block at a time from the front, only as many as it takes to reach the target
+   * context. That is llama.cpp's `--n-cpu-moe`, with N found for this machine rather than guessed.
+   * The cache ladder is walked best-first, as in pass 1: the first rung that reaches the target
+   * with some N wins, and whatever VRAM that leaves goes to context.
+   */
+  if (experts.blocks > 0 && cpuMoeFixed === undefined && o.gpuLayers === undefined) {
+    const targetCtx = Math.min(constraints.targetContext, ceiling)
+    for (const kvType of kvCandidates) {
+      if (!attempt(arch, hw, budgets, targetCtx, kvType, totalLayers, batchSize, flashAttention, experts.end).fits) continue
+
+      // The fewest blocks whose experts have to leave: each one more costs speed, so find the edge.
+      let lo = 1
+      let hi = experts.end
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi) / 2)
+        if (attempt(arch, hw, budgets, targetCtx, kvType, totalLayers, batchSize, flashAttention, mid).fits) hi = mid
+        else lo = mid + 1
+      }
+      const cpuMoe = lo
+
+      const enough = Math.min(ceiling, Math.max(constraints.targetContext, Math.min(constraints.idealContext, ceiling)))
+      const ctx = Math.min(
+        enough,
+        maxContextFor(arch, hw, budgets, kvType, totalLayers, batchSize, flashAttention, ceiling, cpuMoe)
+      )
+      const moved = costs.experts.slice(0, cpuMoe)
+      const movedBlocks = moved.filter((b) => b > 0).length
+      const movedBytes = moved.reduce((a, b) => a + b, 0)
+      const expertTotal = costs.experts.reduce((a, b) => a + b, 0)
+      const rationale = [
+        `All ${totalLayers} layers on GPU, with the routed experts of ${movedBlocks} of ${experts.blocks} expert ` +
+          `layers kept in system RAM (${fmtBytes(movedBytes)} of ${fmtBytes(expertTotal)}).`,
+        (arch.expertUsedCount ?? 0) > 0 && arch.expertCount > 0
+          ? `Attention, the shared expert and the output head stay on the GPU. Only ${arch.expertUsedCount} of ` +
+            `${arch.expertCount} experts are read for each token, so experts in system RAM cost far less speed than their size suggests.`
+          : 'Attention, the shared expert and the output head stay on the GPU, which is where every token needs them.',
+        `KV cache at ${kvLabel(kvType)} reaches ${ctx.toLocaleString()} tokens.`,
+        'Full context KV is reserved up front, so the load cannot OOM as the chat grows.'
+      ]
+      warnIfKeysPushed(kvType, rationale)
+
+      /*
+       * Offer the rest of the context, at the price of more experts in system RAM.
+       *
+       * With every block's experts on the host, what is left of VRAM goes to the cache — slower
+       * generation for a longer window, which is the trade someone feeding it long documents wants
+       * to be offered rather than to have made for them.
+       */
+      const alternatives: FitPlan[] = []
+      const allOut = maxContextFor(arch, hw, budgets, kvType, totalLayers, batchSize, flashAttention, ceiling, experts.end)
+      if (experts.end > cpuMoe && allOut >= ctx * 1.1) {
+        const longer = Math.min(allOut, ceiling)
+        alternatives.push(
+          buildPlan('More context', arch, hw, budgets, longer, kvType, totalLayers, batchSize, flashAttention, [
+            `All ${totalLayers} layers on GPU, with every routed expert in system RAM (${fmtBytes(expertTotal)}).`,
+            `KV cache at ${kvLabel(kvType)} reaches ${longer.toLocaleString()} tokens — ` +
+              `${Math.round((longer / ctx - 1) * 100)}% more than the default plan, for slower generation.`
+          ], experts.end, overrideTensors)
+        )
+      }
+
+      return {
+        chosen: buildPlan(
+          'Experts in RAM', arch, hw, budgets, ctx, kvType, totalLayers, batchSize, flashAttention, rationale, cpuMoe, overrideTensors
+        ),
+        alternatives,
         needsUserChoice: false,
         hardware: hw,
         notes
@@ -667,11 +1036,14 @@ export function planFit(
     k: constraints.minKvType,
     v: constraints.minKvType
   }
+  // An MoE model's experts all leave the GPU before any whole block does.
+  const cpuMoeAlt = cpuMoeFixed ?? experts.end
+  const expertsNote = cpuMoeAlt > 0 ? ', with every routed expert in system RAM' : ''
 
   // (a) Keep the target context, offload layers to host.
   let layersForTarget = 0
   for (let l = totalLayers; l >= 0; l--) {
-    if (attempt(arch, hw, budgets, constraints.targetContext, floorKv, l, batchSize, flashAttention).fits) {
+    if (attempt(arch, hw, budgets, constraints.targetContext, floorKv, l, batchSize, flashAttention, cpuMoeAlt).fits) {
       layersForTarget = l
       break
     }
@@ -682,36 +1054,48 @@ export function planFit(
         `Keep ${constraints.targetContext.toLocaleString()} context`,
         arch, hw, budgets, constraints.targetContext, floorKv, layersForTarget, batchSize, flashAttention,
         [
-          `${layersForTarget} of ${totalLayers} layers on GPU, the rest on CPU.`,
+          `${layersForTarget} of ${totalLayers} layers on GPU${expertsNote}, the rest on CPU.`,
           `Preserves the ${constraints.targetContext.toLocaleString()}-token context you asked for.`,
           'Generation will be slower in proportion to the layers running on CPU.'
-        ]
+        ],
+        cpuMoeAlt,
+        overrideTensors
       )
     )
   }
 
   // (b) Keep all layers on GPU, shrink context.
-  const maxCtxFloor = maxContextFor(arch, hw, budgets, floorKv, fullGpuLayers, batchSize, flashAttention, ceiling)
+  const maxCtxFloor = maxContextFor(arch, hw, budgets, floorKv, fullGpuLayers, batchSize, flashAttention, ceiling, cpuMoeAlt)
   if (maxCtxFloor > 0) {
     alternatives.push(
       buildPlan(
-        'Max speed',
+        cpuMoeAlt > 0 ? 'Shorter context' : 'Max speed',
         arch, hw, budgets, maxCtxFloor, floorKv, fullGpuLayers, batchSize, flashAttention,
         [
-          `All ${totalLayers} layers on GPU — fastest generation.`,
+          cpuMoeAlt > 0
+            ? `All ${totalLayers} layers on GPU${expertsNote}.`
+            : `All ${totalLayers} layers on GPU — fastest generation.`,
           `Context limited to ${maxCtxFloor.toLocaleString()} tokens, below your ${constraints.targetContext.toLocaleString()} target.`,
-          `KV at ${floorKv} (the floor) to stretch context as far as possible.`
-        ]
+          `KV at ${kvLabel(floorKv)} (the floor) to stretch context as far as possible.`
+        ],
+        cpuMoeAlt,
+        overrideTensors
       )
     )
   }
 
   // (c) A smaller quant would fix the root cause rather than degrading the load.
-  const deficit = arch.weightBytes + kvCacheBytes(arch, constraints.targetContext, floorKv) - totalBudget
+  const gpuNeeded =
+    experts.blocks > 0
+      ? costs.dense.reduce((a, b) => a + b, 0) + costs.output
+      : Math.max(0, arch.weightBytes - costs.input)
+  const deficit = gpuNeeded + kvCacheBytes(arch, constraints.targetContext, floorKv) - totalBudget
   if (deficit > 0) {
     notes.push(
       `This model needs roughly ${fmtBytes(deficit)} more VRAM to hit ${constraints.targetContext.toLocaleString()} tokens ` +
-        `with everything on GPU. A smaller quantisation of the same model would fit properly.`
+        (experts.blocks > 0
+          ? 'even with every routed expert in system RAM. A smaller quantisation of the same model would fit properly.'
+          : 'with everything on GPU. A smaller quantisation of the same model would fit properly.')
     )
   }
 

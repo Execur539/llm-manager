@@ -83,6 +83,40 @@ export interface ModelArchInfo {
    * per tensor. The fit is still sound, but the per-layer split is approximate.
    */
   unknownTensorTypes: number[]
+  /*
+   * Where llama.cpp will actually put the weights.
+   *
+   * Optional because records cached before this breakdown existed do not carry it; the fit
+   * engine falls back to spreading `perLayerBytes` evenly and treating everything outside the
+   * blocks as the output layer, which is what it always assumed.
+   */
+  /**
+   * The input layer: the token embedding, and any per-layer embedding table.
+   *
+   * llama.cpp keeps its input layer in system RAM unconditionally — it is only ever read a row at
+   * a time, so there is nothing for a GPU to accelerate. Charging it to VRAM, as this engine used
+   * to, overstated a model's footprint by the size of its vocabulary matrix, and for a model with
+   * a large per-layer embedding table by tens of gigabytes.
+   */
+  inputBytes?: number
+  /** Of `inputBytes`, the per-layer embedding (PLE / n-gram lookup) table specifically. */
+  pleBytes?: number
+  /**
+   * The output layer — output head and final norm — which lands on the last GPU whenever any
+   * block is offloaded. Includes a copy of the token embedding when the head is tied to it,
+   * because llama.cpp duplicates the tensor onto the output device rather than sharing it.
+   */
+  outputBytes?: number
+  /** Non-expert bytes of each repeating block, by block index. */
+  layerDenseBytes?: number[]
+  /**
+   * Routed-expert bytes of each block, by block index — exactly the tensors llama.cpp's
+   * `--n-cpu-moe` moves. Zero for dense blocks, and for a block's shared expert, which is used on
+   * every token and stays with the rest of the block.
+   */
+  layerExpertBytes?: number[]
+  /** Experts consulted per token (`{arch}.expert_used_count`); 0 for dense models. */
+  expertUsedCount?: number
 }
 
 export type ReasoningKind = 'none' | 'toggle' | 'effort'
@@ -150,6 +184,13 @@ export interface ModelRecord {
   mixedQuant: boolean
   /** set when the file could not be parsed */
   error?: string
+  /**
+   * Every file of a model split into parts, in order; `path` is the first.
+   *
+   * llama.cpp opens a split model through its first part and finds the rest by name, so only the
+   * first is ever passed to it — but all of them are the model, for sizing and for deleting.
+   */
+  parts?: string[]
 }
 
 // ---------------------------------------------------------------- hardware
@@ -216,6 +257,17 @@ export interface FitConstraints {
     batchSize: number
     flashAttention: boolean
     tensorSplit: number[]
+    /** Precision of the value cache, when it should differ from the keys. */
+    kvTypeV: KvType
+    /** Blocks whose routed experts stay in system RAM, as llama.cpp's `--n-cpu-moe`. */
+    cpuMoeLayers: number
+    /**
+     * Raw llama.cpp tensor overrides (`--override-tensor`), passed through as given.
+     *
+     * The escape hatch for a placement this engine does not model. The memory prediction cannot
+     * account for it, and the plan says so.
+     */
+    overrideTensors: string
   }>
 }
 
@@ -238,11 +290,32 @@ export interface FitPlan {
    * Carried on the plan rather than read at spawn time so a plan is loaded the way it was costed.
    */
   draftMax?: number
-  /** how many of the model's blocks are offloaded to GPU */
+  /**
+   * How many of the model's blocks are offloaded to GPU.
+   *
+   * llama.cpp offloads from the end and counts its output layer as one more, so these are the
+   * *last* `gpuLayers` blocks, and the output head goes with them whenever this is above zero.
+   * See `nglFor` for how that becomes `-ngl`.
+   */
   gpuLayers: number
   totalLayers: number
   /** proportional split across devices, summing to 1 */
   tensorSplit: number[]
+  /**
+   * Blocks per GPU in order, the output layer counted on the last one.
+   *
+   * llama.cpp assigns layers by cumulative fraction, so passing these counts as the split
+   * reproduces exactly the ranges that were costed — where a rounded fraction could move a
+   * boundary block to the other card.
+   */
+  layerSplit?: number[]
+  /**
+   * Blocks whose routed experts are kept in system RAM (llama.cpp `--n-cpu-moe`), counted from
+   * the first block. Zero for dense models and for plans where every expert fits on the GPUs.
+   */
+  cpuMoeLayers?: number
+  /** Raw tensor overrides passed straight through to llama.cpp. */
+  overrideTensors?: string
   batchSize: number
   flashAttention: boolean
   /** predicted bytes per GPU */
@@ -430,6 +503,15 @@ export interface AppSettings {
     enabled: boolean
     /** Tokens drafted per step. */
     nMax: number
+  }
+  reasoning: {
+    /**
+     * Show the model its own reasoning from earlier turns, not only from the current one.
+     *
+     * Lets it remember why it decided what it did a few messages back. Costs context in
+     * proportion to how much it thinks, and takes effect on the next model load.
+     */
+    preserve: boolean
   }
   agent: {
     enabled: boolean

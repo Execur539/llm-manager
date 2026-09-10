@@ -30,7 +30,15 @@ export function buildGguf(opts = {}) {
     fullAttentionInterval = 4,
     ssm = true,
     tensorCount = 4,
-    chatTemplateMentionsTools = true
+    chatTemplateMentionsTools = true,
+    /**
+     * An explicit tensor directory, as [name, dims, ggmlType] triples, in place of the default
+     * four. What placement tests need: real expert, shared-expert and embedding tensors with
+     * sizes the parser computes itself.
+     */
+    tensors: explicitTensors = null,
+    /** Extra metadata, as [key, 'u32' | 'str', value] triples — expert counts, split headers. */
+    extraKv = []
   } = opts
 
   const chunks = []
@@ -90,6 +98,12 @@ export function buildGguf(opts = {}) {
     none: ''
   }
 
+  for (const [k, kind, v] of extraKv) {
+    if (kind === 'u32') addU32(k, v)
+    else if (kind === 'str') addStr(k, v)
+    else throw new Error(`buildGguf: unsupported extraKv kind ${kind}`)
+  }
+
   const reasoningTemplate = REASONING_TEMPLATES[opts.reasoning ?? 'none'] ?? ''
 
   addStr(
@@ -105,15 +119,17 @@ export function buildGguf(opts = {}) {
   for (let i = 0; i < vocabSize; i++) tokenEntries.push(str(`t${i}`))
   kv.push(Buffer.concat([str('tokenizer.ggml.tokens'), u32(9), u32(8), u64(vocabSize), ...tokenEntries]))
 
-  chunks.push(u32(0x46554747), u32(3), u64(tensorCount), u64(kv.length), ...kv)
+  // Tensor directory: a couple of block tensors plus embeddings and output, unless given one.
+  const tensors =
+    explicitTensors ??
+    [
+      ['blk.0.attn_q.weight', [embeddingLength, embeddingLength], 12],
+      ['blk.1.attn_q.weight', [embeddingLength, embeddingLength], 12],
+      ['token_embd.weight', [embeddingLength, vocabSize], 12],
+      ['output.weight', [embeddingLength, vocabSize], 14]
+    ].slice(0, tensorCount)
 
-  // Tensor directory: a couple of block tensors plus embeddings and output.
-  const tensors = [
-    ['blk.0.attn_q.weight', [embeddingLength, embeddingLength], 12],
-    ['blk.1.attn_q.weight', [embeddingLength, embeddingLength], 12],
-    ['token_embd.weight', [embeddingLength, vocabSize], 12],
-    ['output.weight', [embeddingLength, vocabSize], 14]
-  ].slice(0, tensorCount)
+  chunks.push(u32(0x46554747), u32(3), u64(tensors.length), u64(kv.length), ...kv)
 
   let offset = 0
   for (const [tname, dims, type] of tensors) {

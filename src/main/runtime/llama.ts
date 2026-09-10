@@ -22,6 +22,8 @@ import path from 'node:path'
 import { app } from 'electron'
 import { childEnv, llamaServerPath } from './binaries'
 import { TOOL_OUTPUT_DIR } from '../storage/paths'
+import { loadSettings } from '../storage/settings'
+import { nglFor } from '../autofit/engine'
 import { logger } from '../log'
 
 /** Location of the stand-in server used when LLMM_MOCK_LLAMA=1. */
@@ -83,6 +85,15 @@ export interface ChatMessage {
   tool_call_id?: string
   name?: string
   tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[]
+  /**
+   * What the model thought on a past turn, handed back so it can remember it.
+   *
+   * Reasoning models return their thinking separately from the answer, and templates that support
+   * it render a past turn with its thinking included. Leaving it off meant the model saw only what
+   * it had said, never why. It costs context in proportion to how much the model thinks, which is
+   * why it follows a setting.
+   */
+  reasoning_content?: string
 }
 
 export interface CompletionOptions {
@@ -286,7 +297,7 @@ export class LlamaRuntime extends EventEmitter {
       '--host', '127.0.0.1',
       '--port', String(port),
       '--ctx-size', String(plan.contextLength),
-      '--n-gpu-layers', String(plan.gpuLayers),
+      '--n-gpu-layers', String(nglFor(plan)),
       '--batch-size', String(plan.batchSize),
       // llama-server defaults to 4 parallel slots. One is deliberate: slots divide the context
       // budget between them, and on hybrid models the recurrent-state cache is allocated *per
@@ -372,10 +383,45 @@ export class LlamaRuntime extends EventEmitter {
       )
     }
     if (plan.flashAttention) args.push('--flash-attn', 'on')
-    if (plan.tensorSplit.length > 1) {
+    /*
+     * Exact block counts, where the plan has them.
+     *
+     * llama.cpp assigns layers by cumulative fraction of the split, so the counts reproduce the
+     * ranges the planner costed, where a fraction rounded to three places can move a boundary
+     * block — and a block's worth of VRAM — onto the other card.
+     */
+    const blocksPerCard = plan.layerSplit ?? []
+    if (blocksPerCard.length > 1) {
+      args.push('--tensor-split', blocksPerCard.join(','))
+    } else if (plan.tensorSplit.length > 1) {
       args.push('--tensor-split', plan.tensorSplit.map((s) => s.toFixed(3)).join(','))
     }
+
+    /*
+     * The placement the planner chose, and nothing decided behind its back.
+     *
+     * `--n-cpu-moe` keeps the routed experts of the first N blocks in system RAM, which is how an
+     * MoE model larger than VRAM runs at a usable speed. `--fit` would otherwise adjust whatever
+     * this leaves unset; it already stands down once `-ngl` is given, and turning it off outright
+     * means the plan on screen and the process that runs cannot disagree.
+     */
+    // A plan can come from the renderer, so these are checked for shape rather than trusted.
+    const cpuMoe = Math.max(0, Math.floor(Number(plan.cpuMoeLayers) || 0))
+    if (cpuMoe > 0) args.push('--n-cpu-moe', String(cpuMoe))
+    if (typeof plan.overrideTensors === 'string' && plan.overrideTensors.trim()) {
+      args.push('--override-tensor', plan.overrideTensors.trim())
+    }
+    args.push('--fit', 'off')
     if (model.caps.mmprojPath) args.push('--mmproj', model.caps.mmprojPath)
+
+    /*
+     * Keep reasoning from every earlier turn in the rendered prompt, not just the latest.
+     *
+     * The app hands each past answer's thinking back; a template that knows how to render it
+     * (Qwen's among them) still drops all but the most recent unless told otherwise. On a template
+     * without the capability llama.cpp says so and carries on.
+     */
+    if (loadSettings().reasoning.preserve) args.push('--reasoning-preserve')
 
     /*
      * Diagnostics for the one class of bug that cannot be reasoned about from outside.

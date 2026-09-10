@@ -235,6 +235,29 @@ function compareVersions(a, b) {
  * Their binary releases are all flagged as prereleases, which /releases/latest ignores.
  */
 async function latestLlamaBuild() {
+  /*
+   * A specific build when asked for one, the newest otherwise.
+   *
+   * "Newest" is a moving target that ships a new binary several times a day, and every runtime
+   * upgrade needs checking against the app — so an upgrade that has been checked should be
+   * reproducible rather than whatever happened to be published at the moment of fetching:
+   *
+   *   LLAMA_BUILD=b10900 node scripts/fetch-vendor.mjs llama
+   */
+  const pinned = process.env.LLAMA_BUILD
+  if (pinned) {
+    if (!/^b\d+$/.test(pinned)) throw new Error(`LLAMA_BUILD must look like b10900, not ${pinned}`)
+    const tagged = await fetch(`https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/${pinned}`, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'llm-manager-fetch-vendor',
+        ...(process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {})
+      }
+    })
+    if (!tagged.ok) throw new Error(`GitHub API ${tagged.status} looking up llama.cpp ${pinned}`)
+    return tagged.json()
+  }
+
   const res = await fetch('https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20', {
     headers: {
       Accept: 'application/vnd.github+json',

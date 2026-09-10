@@ -8,7 +8,7 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import type { ModelCapabilities, ModelRecord, ReasoningSupport } from '@shared/types'
-import { extractArchInfo, readGguf, templateSupportsTools } from './gguf'
+import { extractArchInfo, readGguf, readGgufParts, templateSupportsTools } from './gguf'
 import { detectReasoning, NO_REASONING } from './reasoning'
 import { APPDATA_DIR } from '../storage/paths'
 
@@ -22,7 +22,7 @@ const INDEX_FILE = path.join(APPDATA_DIR, 'model-index.json')
  * a schema version, adding a capability leaves every already-scanned model with that field
  * missing, and the gap only shows up wherever the UI happens to read it.
  */
-const INDEX_SCHEMA = 2
+const INDEX_SCHEMA = 3
 
 interface IndexEntry {
   path: string
@@ -99,6 +99,63 @@ async function findGgufFiles(root: string): Promise<string[]> {
     }
   }
   await walk(root)
+  return out
+}
+
+/** `<name>-00001-of-00004.gguf`: the naming llama.cpp's gguf-split writes, and finds the other parts by. */
+const SHARD_RE = /-(\d{5})-of-(\d{5})\.gguf$/i
+
+/*
+ * A speculative-decoding module shipped beside a model — Unsloth's `mtp-*.gguf` for
+ * Qwen3.8-Flash-Next, for one. It holds only the prediction head, so it is part of a model rather
+ * than one, and listed as a model it would only fail to load.
+ */
+const DRAFT_MODULE_RE = /^mtp[-_]/i
+
+interface ModelEntry {
+  /** What llama.cpp is given: the file itself, or the first part of a split model. */
+  head: string
+  /** Every part present, in order. */
+  parts: string[]
+  /** Part numbers the split names that are not on disk. */
+  missing: number[]
+  total: number
+}
+
+/**
+ * The models in a list of GGUF files: one entry per model, however many files it spans.
+ *
+ * Every file used to be its own entry, so a model in eight parts appeared eight times — part one
+ * holding no tensors at all and reporting its size as a few megabytes, the other seven with no
+ * architecture and an error each.
+ */
+function modelEntries(files: string[]): ModelEntry[] {
+  const out: ModelEntry[] = []
+  const groups = new Map<string, { total: number; byIndex: Map<number, string> }>()
+  for (const file of files) {
+    const base = path.basename(file)
+    // Companions, not models: projectors pair with a model, and draft modules are a piece of one.
+    if (/mmproj/i.test(base) || DRAFT_MODULE_RE.test(base)) continue
+    const shard = SHARD_RE.exec(base)
+    if (!shard) {
+      out.push({ head: file, parts: [file], missing: [], total: 1 })
+      continue
+    }
+    const key = path.join(path.dirname(file), base.slice(0, shard.index)).toLowerCase()
+    const group = groups.get(key) ?? { total: Number(shard[2]), byIndex: new Map<number, string>() }
+    group.byIndex.set(Number(shard[1]), file)
+    groups.set(key, group)
+  }
+  for (const group of groups.values()) {
+    const parts: string[] = []
+    const missing: number[] = []
+    for (let i = 1; i <= group.total; i++) {
+      const part = group.byIndex.get(i)
+      if (part) parts.push(part)
+      else missing.push(i)
+    }
+    out.push({ head: group.byIndex.get(1) ?? parts[0], parts, missing, total: group.total })
+  }
   return out
 }
 
@@ -180,22 +237,26 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
 
   const index = await loadIndex()
   const files = await findGgufFiles(modelsDir)
-  // mmproj files are companions, not standalone entries.
-  const modelFiles = files.filter((f) => !/mmproj/i.test(path.basename(f)))
 
   const records: ModelRecord[] = []
   const nextIndex: IndexEntry[] = []
 
-  for (const file of modelFiles) {
-    let st: fs.Stats
+  for (const entry of modelEntries(files)) {
+    const file = entry.head
+    const split = entry.total > 1
+    const stats: fs.Stats[] = []
     try {
-      st = await fsp.stat(file)
+      for (const part of entry.parts) stats.push(await fsp.stat(part))
     } catch {
       continue
     }
+    // One signature for the whole set, so a part landing or changing re-parses the model.
+    const size = stats.reduce((a, s) => a + s.size, 0)
+    const mtimeMs = Math.max(...stats.map((s) => s.mtimeMs))
+    const st = stats[0]
 
     const cached = index.get(file)
-    if (cached && cached.size === st.size && cached.mtimeMs === st.mtimeMs) {
+    if (cached && cached.size === size && cached.mtimeMs === mtimeMs) {
       records.push(cached.record)
       nextIndex.push(cached)
       continue
@@ -204,8 +265,16 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
     const mmproj = findMmproj(file, files)
     let record: ModelRecord
     try {
-      const meta = await readGguf(file)
-      const arch = extractArchInfo(meta, st.size)
+      if (entry.missing.length) {
+        throw new Error(
+          `Part${entry.missing.length === 1 ? '' : 's'} ${entry.missing.join(', ')} of ${entry.total} ` +
+            `${entry.missing.length === 1 ? 'is' : 'are'} missing — the download may still be in progress.`
+        )
+      }
+      const { meta, weightBytes } = split
+        ? await readGgufParts(entry.parts)
+        : { meta: await readGguf(file), weightBytes: undefined }
+      const arch = extractArchInfo(meta, split ? undefined : st.size, weightBytes)
       const caps = await detectCapabilities(
         file,
         arch.architecture,
@@ -220,7 +289,8 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
         repo: null,
         filename: path.basename(file),
         path: file,
-        bytes: st.size,
+        bytes: size,
+        ...(split ? { parts: entry.parts } : {}),
         arch,
         caps,
         addedAt: st.birthtimeMs || Date.now(),
@@ -230,7 +300,7 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
         // Mixed-precision quants advertise one thing and are mostly another; flag the mismatch
         // rather than silently showing whichever we happened to compute.
         mixedQuant: !!quantLabel && !quantLabel.includes(arch.quant) && !arch.quant.includes(quantLabel),
-        tags: autoTags(quantLabel ?? arch.quant, arch.contextLength, caps, st.size)
+        tags: autoTags(quantLabel ?? arch.quant, arch.contextLength, caps, size)
       }
     } catch (err) {
       record = {
@@ -238,7 +308,8 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
         repo: null,
         filename: path.basename(file),
         path: file,
-        bytes: st.size,
+        bytes: size,
+        ...(split ? { parts: entry.parts } : {}),
         arch: null,
         caps: {
           vision: false,
@@ -268,7 +339,7 @@ export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
     }
 
     records.push(record)
-    nextIndex.push({ path: file, size: st.size, mtimeMs: st.mtimeMs, record })
+    nextIndex.push({ path: file, size, mtimeMs, record })
   }
 
   await saveIndex(nextIndex)

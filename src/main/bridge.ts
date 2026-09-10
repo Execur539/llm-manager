@@ -14,9 +14,11 @@ import fsp from 'node:fs/promises'
 import type {
   AppSettings,
   Backend,
+  FitConstraints,
   FitPlan,
   FitResult,
   HardwareSnapshot,
+  KvType,
   ModelRecord,
   AgentQuestion,
   PermissionDecision,
@@ -38,7 +40,7 @@ import { closeBrowser } from './agent/tools/browser'
 import { listCheckpoints, rewindTo, discardCheckpoints } from './agent/checkpoints'
 import { mcpManager } from './agent/mcp'
 import { addMemory, allMemory, deleteMemory, updateMemory } from './agent/memory'
-import { searchModels, listFiles, recommendQuant, findMmprojFor } from './downloads/hf'
+import { searchModels, listFiles, groupVariants, recommendQuant, findMmprojFor, peekVariantArch } from './downloads/hf'
 import { downloadQueue } from './downloads/queue'
 import { apiServer, requestQueue } from './api/server'
 import { tunnel } from './remote/tunnel'
@@ -335,6 +337,7 @@ function syncAgentOptions(): void {
     hardBlocksDisabled: s.agent.hardBlocksDisabled,
     compaction: s.agent.compaction,
     remoteToolsEnabled: s.agent.remoteToolsEnabled,
+    preserveReasoning: s.reasoning.preserve,
     backend: hardware?.backend,
     hfToken: getHfToken()
   })
@@ -365,6 +368,31 @@ function companionSize(model: ModelRecord): number {
 }
 
 /** Load a model by id using a plan, or auto-fit one if no plan is supplied. */
+/**
+ * Placement overrides arrive from the renderer — or from a remote tab — and the planner hands
+ * them on to a llama-server command line, so only well-formed values get through.
+ */
+function sanitizeOverrides(raw: Record<string, unknown> | undefined): FitConstraints['overrides'] {
+  const o = raw ?? {}
+  const int = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined
+  const kv = (v: unknown): KvType | undefined => (v === 'f16' || v === 'q8_0' || v === 'q4_0' ? v : undefined)
+  const out: FitConstraints['overrides'] = {}
+  if (int(o.contextLength)) out.contextLength = int(o.contextLength)
+  if (int(o.gpuLayers) !== undefined) out.gpuLayers = int(o.gpuLayers)
+  if (int(o.cpuMoeLayers) !== undefined) out.cpuMoeLayers = int(o.cpuMoeLayers)
+  if (int(o.batchSize)) out.batchSize = int(o.batchSize)
+  if (typeof o.flashAttention === 'boolean') out.flashAttention = o.flashAttention
+  if (kv(o.kvType)) out.kvType = kv(o.kvType)
+  if (kv(o.kvTypeV)) out.kvTypeV = kv(o.kvTypeV)
+  if (typeof o.overrideTensors === 'string') {
+    // One argv element to llama.cpp, so no control characters and nothing absurdly long.
+    const t = o.overrideTensors.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 2000)
+    if (t) out.overrideTensors = t
+  }
+  return out
+}
+
 async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: number; plan: FitPlan }> {
   const model = library.find((m) => m.id === modelId || m.filename === modelId)
   if (!model) throw new Error(`Model not found: ${modelId}`)
@@ -681,7 +709,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const m = library.find((x) => x.id === modelId)
     if (!m) throw new Error('Model not found')
     if (llama.loaded?.model.id === modelId) await llama.unload()
-    await fsp.rm(m.path, { force: true })
+    // Every part of a split model, not only the one llama.cpp is pointed at.
+    for (const part of m.parts ?? [m.path]) await fsp.rm(part, { force: true })
     if (m.caps.mmprojPath) await fsp.rm(m.caps.mmprojPath, { force: true }).catch(() => undefined)
     library = library.filter((x) => x.id !== modelId)
     return true
@@ -767,7 +796,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
       allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
-      overrides: (overrides ?? {}) as never
+      overrides: sanitizeOverrides(overrides)
     })
   },
 
@@ -821,18 +850,44 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   'hf:search': async (query: string) => searchModels(query, getHfToken()),
   'hf:files': async (repo: string) => {
     const files = await listFiles(repo, getHfToken())
+    const variants = groupVariants(files)
     const hw = await getHardware()
     const s = loadSettings()
-    return { files, recommendation: recommendQuant(files, hw, s.autoFit.targetContext) }
+    // No header peeks here: this answers as soon as the file tree is known, and a peek per
+    // variant is a range request per variant. `hf:variant-info` fills in MoE-awareness (and the
+    // recommendation improves with it) once the renderer asks, a few at a time.
+    return { files, variants, recommendation: recommendQuant(variants, hw, s.autoFit.targetContext) }
   },
-  'hf:download': async (repo: string, filename: string) => {
+  /**
+   * A variant's own architecture facts, read from its header rather than assumed — specifically
+   * whether it is a mixture-of-experts model (worth recommending even past free VRAM, since its
+   * routed experts can live in system RAM) and whether it carries its own speculative-decoding
+   * head. Split out from `hf:files` so opening a repo never blocks on N range requests before the
+   * list of variants appears at all.
+   */
+  'hf:variant-info': async (repo: string, variantId: string) => {
     const files = await listFiles(repo, getHfToken())
-    const file = files.find((f) => f.filename === filename)
-    if (!file) throw new Error(`${filename} not found in ${repo}`)
+    const variant = groupVariants(files).find((v) => v.id === variantId)
+    if (!variant) throw new Error(`${variantId} not found in ${repo}`)
+    return peekVariantArch(variant, getHfToken())
+  },
+  'hf:download': async (repo: string, variantId: string) => {
+    const files = await listFiles(repo, getHfToken())
+    const variant = groupVariants(files).find((v) => v.id === variantId)
+    if (!variant) throw new Error(`${variantId} not found in ${repo}`)
+    if (!variant.complete) {
+      throw new Error(
+        `Part${variant.missing.length === 1 ? '' : 's'} ${variant.missing.join(', ')} of ${variant.parts.length + variant.missing.length} ` +
+          `${variant.missing.length === 1 ? 'is' : 'are'} missing from ${repo} — the upload may still be in progress.`
+      )
+    }
 
     const dir = path.join(modelsDir(), repo.replace('/', '__'))
     downloadQueue.setToken(getHfToken())
-    const queued = [
+    // Every part of the variant, not just the one a caller happened to click — this is the fix
+    // for "part 1 of 8" being its own downloadable-looking row with no indication that seven more
+    // were needed before the model would actually load.
+    const queued = variant.parts.map((file) =>
       downloadQueue.enqueue({
         repo,
         filename: path.basename(file.filename),
@@ -841,7 +896,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         bytesTotal: file.bytes,
         sha256: file.sha256
       })
-    ]
+    )
 
     // Multimodal models are useless without their projector, so fetch it automatically.
     const mmproj = findMmprojFor(files)
@@ -925,9 +980,17 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const effort = sendableChoice(loaded.model.caps.reasoning, reasoning ?? null)
 
     const history = chats.loadMessages(chatId)
+    /*
+     * Rebuilt from storage every turn, so this is the only way past reasoning can come back.
+     *
+     * With the setting on, each earlier answer carries the thinking that produced it, and
+     * `--reasoning-preserve` keeps the template from dropping all but the latest.
+     */
+    const preserveReasoning = loadSettings().reasoning.preserve
     const messages = history.map((m) => ({
       role: m.role === 'tool' ? ('user' as const) : (m.role as 'user' | 'assistant' | 'system'),
-      content: m.content
+      content: m.content,
+      ...(preserveReasoning && m.role === 'assistant' && m.reasoning ? { reasoning_content: m.reasoning } : {})
     }))
 
     let userContent: string | Awaited<ReturnType<typeof buildContent>>['parts'] = text

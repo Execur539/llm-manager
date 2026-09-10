@@ -24,6 +24,12 @@ function CapBadges({ model }: { model: ModelRecord }): JSX.Element {
         model.caps.videoPossible && <span className="badge">video via frames</span>
       )}
       {model.caps.tools && <span className="badge">tools</span>}
+      {(model.arch?.mtpLayers ?? 0) > 0 && (
+        <span className="badge good" title="Built-in multi-token prediction: drafts ahead of itself for faster generation">
+          MTP
+        </span>
+      )}
+      {(model.parts?.length ?? 0) > 1 && <span className="badge">{model.parts?.length} parts</span>}
     </>
   )
 }
@@ -33,6 +39,14 @@ function FitBadge({ fit }: { fit: FitResult | { error: string } | null }): JSX.E
   if ('error' in fit) return <span className="badge bad">unreadable</span>
   if (fit.chosen && !fit.chosen.spillsToHost) {
     return <span className="badge good">fits · {(fit.chosen.contextLength / 1024).toFixed(0)}K ctx</span>
+  }
+  // Every block on the GPU with some routed experts in RAM is how an MoE model normally runs, not a degraded one.
+  if (fit.chosen && fit.chosen.gpuLayers >= fit.chosen.totalLayers && (fit.chosen.cpuMoeLayers ?? 0) > 0) {
+    return (
+      <span className="badge" title="Attention and shared weights on the GPU; some routed experts in system RAM">
+        {(fit.chosen.contextLength / 1024).toFixed(0)}K ctx · experts in RAM
+      </span>
+    )
   }
   if (fit.chosen?.spillsToHost) return <span className="badge warn">partial offload</span>
   if (fit.needsUserChoice) return <span className="badge warn">tradeoff needed</span>
@@ -50,9 +64,18 @@ function PlanCard({ plan, onLoad, busy }: { plan: FitPlan; onLoad: (p: FitPlan) 
         <dt>Context</dt>
         <dd>{plan.contextLength.toLocaleString()} tokens</dd>
         <dt>KV cache</dt>
-        <dd>{plan.kvType} · {fmtBytes(plan.kvBytes)}</dd>
+        <dd>
+          {plan.kvTypeV && plan.kvTypeV !== plan.kvType ? `${plan.kvType} keys / ${plan.kvTypeV} values` : plan.kvType} ·{' '}
+          {fmtBytes(plan.kvBytes)}
+        </dd>
         <dt>GPU layers</dt>
         <dd>{plan.gpuLayers} / {plan.totalLayers}</dd>
+        {(plan.cpuMoeLayers ?? 0) > 0 && (
+          <>
+            <dt>Experts in RAM</dt>
+            <dd>first {plan.cpuMoeLayers} layers (--n-cpu-moe)</dd>
+          </>
+        )}
         <dt>Flash attention</dt>
         <dd>{plan.flashAttention ? 'on' : 'off'}</dd>
         <dt>Predicted VRAM</dt>
@@ -60,7 +83,11 @@ function PlanCard({ plan, onLoad, busy }: { plan: FitPlan; onLoad: (p: FitPlan) 
         {plan.tensorSplit.length > 1 && (
           <>
             <dt>Split</dt>
-            <dd>{plan.tensorSplit.map((s) => `${(s * 100).toFixed(0)}%`).join(' / ')}</dd>
+            <dd>
+              {plan.layerSplit && plan.layerSplit.length > 1
+                ? plan.layerSplit.join(' + ') + ' layers'
+                : plan.tensorSplit.map((s) => `${(s * 100).toFixed(0)}%`).join(' / ')}
+            </dd>
           </>
         )}
         {plan.spillsToHost && (
@@ -83,6 +110,150 @@ function PlanCard({ plan, onLoad, busy }: { plan: FitPlan; onLoad: (p: FitPlan) 
   )
 }
 
+interface PlacementOverrides {
+  contextLength?: number
+  gpuLayers?: number
+  cpuMoeLayers?: number
+  kvType?: 'f16' | 'q8_0' | 'q4_0'
+  kvTypeV?: 'f16' | 'q8_0' | 'q4_0'
+  overrideTensors?: string
+}
+
+/**
+ * The manual escape hatch for placement.
+ *
+ * The planner decides all of this on its own and should be right; this is for when someone knows
+ * better for their machine, or wants to try a placement it does not model. Empty means "let the
+ * planner decide", and anything set is honoured exactly rather than adjusted.
+ */
+function AdvancedPlacement({
+  model,
+  value,
+  onApply,
+  busy
+}: {
+  model: ModelRecord
+  value: PlacementOverrides
+  onApply: (o: PlacementOverrides) => void
+  busy: boolean
+}): JSX.Element {
+  const [draft, setDraft] = useState<PlacementOverrides>(value)
+  useEffect(() => setDraft(value), [value])
+  const num = (s: string): number | undefined => {
+    const n = Number(s)
+    return s.trim() === '' || !Number.isFinite(n) ? undefined : Math.max(0, Math.round(n))
+  }
+  const moe = (model.arch?.expertCount ?? 0) > 0
+  const active = Object.values(value).some((v) => v !== undefined && v !== '')
+  const kvOptions = (
+    <>
+      <option value="f16">f16</option>
+      <option value="q8_0">q8_0</option>
+      <option value="q4_0">q4_0</option>
+    </>
+  )
+  return (
+    <details className="card advanced-placement" open={active}>
+      <summary>
+        Advanced placement {active && <span className="badge warn">overrides on</span>}
+      </summary>
+      <p className="faint" style={{ fontSize: 11, margin: '8px 0' }}>
+        Leave a field empty to let the planner decide. Anything set is passed to llama.cpp exactly as given.
+      </p>
+      <dl className="kv kv-wide">
+        <dt>Context</dt>
+        <dd>
+          <input
+            type="number"
+            min={512}
+            placeholder="auto"
+            value={draft.contextLength ?? ''}
+            onChange={(e) => setDraft({ ...draft, contextLength: num(e.target.value) })}
+          />
+        </dd>
+        <dt>GPU layers</dt>
+        <dd>
+          <input
+            type="number"
+            min={0}
+            max={model.arch?.blockCount}
+            placeholder="auto"
+            value={draft.gpuLayers ?? ''}
+            onChange={(e) => setDraft({ ...draft, gpuLayers: num(e.target.value) })}
+          />
+          <span className="faint">blocks on the GPU, counted from the last</span>
+        </dd>
+        {moe && (
+          <>
+            <dt>Experts in RAM</dt>
+            <dd>
+              <input
+                type="number"
+                min={0}
+                max={model.arch?.blockCount}
+                placeholder="auto"
+                value={draft.cpuMoeLayers ?? ''}
+                onChange={(e) => setDraft({ ...draft, cpuMoeLayers: num(e.target.value) })}
+                data-testid="override-cpu-moe"
+              />
+              <span className="faint">--n-cpu-moe: routed experts of the first N layers stay in system RAM</span>
+            </dd>
+          </>
+        )}
+        <dt>Key cache</dt>
+        <dd>
+          <select
+            className="kv-select"
+            value={draft.kvType ?? ''}
+            onChange={(e) => {
+              const k = (e.target.value || undefined) as PlacementOverrides['kvType']
+              setDraft({ ...draft, kvType: k, kvTypeV: k ? draft.kvTypeV : undefined })
+            }}
+          >
+            <option value="">auto</option>
+            {kvOptions}
+          </select>
+          <span className="faint">--cache-type-k</span>
+        </dd>
+        <dt>Value cache</dt>
+        <dd>
+          <select
+            className="kv-select"
+            disabled={!draft.kvType}
+            value={draft.kvTypeV ?? ''}
+            onChange={(e) =>
+              setDraft({ ...draft, kvTypeV: (e.target.value || undefined) as PlacementOverrides['kvTypeV'] })
+            }
+          >
+            <option value="">same as keys</option>
+            {kvOptions}
+          </select>
+          <span className="faint">--cache-type-v</span>
+        </dd>
+        <dt>Tensor overrides</dt>
+        <dd>
+          <input
+            type="text"
+            placeholder="e.g. blk\.(4[0-7])\.ffn_.*_exps=CPU"
+            value={draft.overrideTensors ?? ''}
+            onChange={(e) => setDraft({ ...draft, overrideTensors: e.target.value || undefined })}
+            data-testid="override-tensors"
+          />
+          <span className="faint">--override-tensor, not counted in the memory prediction</span>
+        </dd>
+      </dl>
+      <div className="row" style={{ marginTop: 10 }}>
+        <button className="primary" disabled={busy} onClick={() => onApply(draft)} data-testid="override-apply">
+          Re-plan
+        </button>
+        <button disabled={busy || !active} onClick={() => onApply({})}>
+          Reset to automatic
+        </button>
+      </div>
+    </details>
+  )
+}
+
 export default function Library({
   models,
   onRefresh,
@@ -99,6 +270,7 @@ export default function Library({
   const [error, setError] = useState<string | null>(null)
   const [pendingDelete, setPendingDelete] = useState<ModelRecord | null>(null)
   const [scanning, setScanning] = useState(false)
+  const [overrides, setOverrides] = useState<PlacementOverrides>({})
 
   const rescan = async (): Promise<void> => {
     setScanning(true)
@@ -138,10 +310,21 @@ export default function Library({
   const select = async (m: ModelRecord): Promise<void> => {
     setSelected(m)
     setError(null)
+    setOverrides({})
     setFit(fits[m.id] ?? null)
     const result = await invoke<FitResult | { error: string }>('autofit:plan', m.id)
     setFit(result)
     setFits((prev) => ({ ...prev, [m.id]: result }))
+  }
+
+  // A plan with overrides is for this dialog only; the library badge stays the automatic one.
+  const replan = async (o: PlacementOverrides): Promise<void> => {
+    if (!selected) return
+    setOverrides(o)
+    setFit(null)
+    setError(null)
+    const clean = Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== ''))
+    setFit(await invoke<FitResult | { error: string }>('autofit:plan', selected.id, clean))
   }
 
   /*
@@ -452,6 +635,8 @@ export default function Library({
                       </ul>
                     </div>
                   )}
+
+                  <AdvancedPlacement model={selected} value={overrides} onApply={(o) => void replan(o)} busy={busy} />
 
                   {fit.chosen && <PlanCard plan={fit.chosen} onLoad={(p) => void load(p)} busy={busy} />}
 

@@ -74,6 +74,16 @@ export const DEFAULT_SETTINGS: AppSettings = {
      */
     nMax: 3
   },
+  reasoning: {
+    /*
+     * On, because the model forgetting its own earlier reasoning is the surprising behaviour.
+     *
+     * Past turns' thinking was dropped from everything sent back to the model, so it could not
+     * refer to why it had decided something two messages ago. The cost is context: thinking is
+     * often longer than the answer, and it now stays in the window.
+     */
+    preserve: true
+  },
   agent: {
     enabled: true,
     planMode: false,
