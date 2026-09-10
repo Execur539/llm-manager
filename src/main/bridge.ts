@@ -909,9 +909,17 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const effort = sendableChoice(loaded.model.caps.reasoning, reasoning ?? null)
 
     const history = chats.loadMessages(chatId)
+    /*
+     * Rebuilt from storage each turn, so what is stored has to be everything the model was shown.
+     *
+     * Reasoning included: the template renders past assistant turns with their thinking, and a
+     * history that omits it produces a prompt that stops matching the cache at the start of every
+     * turn the model thought on — which for a reasoning model is all of them.
+     */
     const messages = history.map((m) => ({
       role: m.role === 'tool' ? ('user' as const) : (m.role as 'user' | 'assistant' | 'system'),
-      content: m.content
+      content: m.content,
+      ...(m.role === 'assistant' && m.reasoning ? { reasoning_content: m.reasoning } : {})
     }))
 
     let userContent: string | Awaited<ReturnType<typeof buildContent>>['parts'] = text
