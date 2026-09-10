@@ -21,6 +21,8 @@ import ConversationList, { type ChatSummary } from '../components/ConversationLi
 import Icon from '../components/Icon'
 import Markdown from '../components/Markdown'
 import MessageRow from '../components/MessageRow'
+import MessageActions from '../components/MessageActions'
+import MessageEditor from '../components/MessageEditor'
 import MessageMedia, { stripAttachmentLine } from '../components/MessageMedia'
 import ThinkingBlock from '../components/ThinkingBlock'
 import UltraSamples from '../components/UltraSamples'
@@ -82,6 +84,8 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   const [cwd, setCwd] = useState('')
   const [planMode, setPlanMode] = useState(false)
   const [showTools, setShowTools] = useState(false)
+  /** The message currently open for rewriting, at most one at a time. */
+  const [editing, setEditing] = useState<string | null>(null)
   const attachments = useAttachments()
 
   const stream = useStream()
@@ -166,6 +170,8 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
       if (cancelled) return
       setMessages(session?.messages ?? [])
       setCwd(session?.cwd ?? '')
+      // An id from the previous conversation would otherwise match nothing and edit nothing.
+      setEditing(null)
       // So the meter reads correctly on reopening rather than staying blank until the next turn.
       seedContext(activeId, session?.contextUsed, loaded?.plan.contextLength ?? 0)
       dropPending(activeId)
@@ -252,6 +258,45 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
     }
   }
 
+  /**
+   * Rewrite a turn that has already been said.
+   *
+   * The stored message is replaced and the agent's rolling history dropped, so the next turn is
+   * built from the edited transcript rather than from the words the model actually produced.
+   * Nothing is re-run: an edit changes what happened, it does not ask for it to happen again.
+   */
+  const saveEdit = async (id: string, content: string, reasoning?: string): Promise<void> => {
+    if (!activeId) return
+    try {
+      const edited = await invoke<AgentMessage>('agent:edit-message', activeId, id, content, reasoning)
+      setMessages((prev) => prev.map((m) => (m.id === id ? edited : m)))
+      setEditing(null)
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), 'error')
+    }
+  }
+
+  /**
+   * Pick the last answer back up where it stopped.
+   *
+   * Offered only when the model's own turn is the last thing in the transcript — with a message
+   * of yours after it there is nothing to continue, and the composer is what you want.
+   */
+  const continueAnswer = async (): Promise<void> => {
+    if (!activeId || busy || !loaded) return
+    const effort = sendableChoice(loaded?.caps?.reasoning, stream.reasoning[effortId] ?? null)
+    setRunning(activeId, true)
+    try {
+      const session = await invoke<{ messages: AgentMessage[] }>('agent:continue', activeId, effort)
+      setMessages(session.messages)
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), 'error')
+    } finally {
+      setRunning(activeId, false)
+      await refreshSessions()
+    }
+  }
+
   const togglePlanMode = async (): Promise<void> => {
     const next = !planMode
     setPlanMode(next)
@@ -267,6 +312,17 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   // Tool calls already saved as messages, plus any still streaming this turn.
   const persistedCallIds = new Set(messages.flatMap((m) => (m.toolCalls ?? []).map((c) => c.id)))
   const unsavedCalls = liveToolCalls.filter((entry) => !persistedCallIds.has(entry.call.id))
+
+  /*
+   * There is an answer to continue when the transcript ends on something the model produced.
+   *
+   * A tool result counts: the model was cut off between deciding what to do and saying anything
+   * about it, which is exactly the case where carrying on is worth offering. A message of your
+   * own after it does not — that is a question waiting to be sent, not an answer waiting to be
+   * finished.
+   */
+  const canContinue =
+    !!activeId && !!loaded && !busy && !editing && messages.length > 0 && messages.at(-1)?.role !== 'user'
 
   return (
     <div className="split">
@@ -395,8 +451,32 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             m.role === 'tool' && m.toolCalls?.[0] ? (
               <ToolCard key={m.id} call={m.toolCalls[0]} result={m.toolResult} />
             ) : (
-              <MessageRow role={m.role} key={m.id}>
-                {m.role === 'assistant' ? (
+              <MessageRow
+                role={m.role}
+                key={m.id}
+                actions={
+                  editing === m.id ? undefined : (
+                    <MessageActions
+                      onCopy={() => void navigator.clipboard.writeText(m.content)}
+                      /*
+                       * Not while the model is working, and not on a turn that is only a tool
+                       * call. Editing rewrites the history the running turn is reading from, and
+                       * a turn with no words in it has nothing to rewrite.
+                       */
+                      onEdit={busy || !(m.content || m.reasoning) ? undefined : () => setEditing(m.id)}
+                    />
+                  )
+                }
+              >
+                {editing === m.id ? (
+                <MessageEditor
+                  content={m.content}
+                  /* Present, and separately editable, only where the model actually thought. */
+                  reasoning={m.role === 'assistant' ? (m.reasoning ?? '') : undefined}
+                  onSave={(content, reasoning) => void saveEdit(m.id, content, reasoning)}
+                  onCancel={() => setEditing(null)}
+                />
+              ) : m.role === 'assistant' ? (
                 <>
                   {m.reasoning && <ThinkingBlock text={m.reasoning} />}
                   {/* A turn can be reasoning only — the model thought, then called a tool
@@ -425,6 +505,22 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
               )}
               </MessageRow>
             )
+          )}
+
+          {/*
+            * Where the answer stopped, and an offer to carry on from it.
+            *
+            * Under the last message rather than beside the composer, because that is what it
+            * acts on — and it goes before the live rows below, which only exist while a turn is
+            * running and the offer is therefore hidden.
+            */}
+          {canContinue && (
+            <div className="msg-aside continue-row">
+              <button className="continue-button" onClick={() => void continueAnswer()} data-testid="agent-continue">
+                <Icon name="resume" size={13} />
+                Continue this answer
+              </button>
+            </div>
           )}
 
           {unsavedCalls.map((entry) => (

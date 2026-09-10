@@ -34,6 +34,8 @@ export type IconName =
   | 'chip'
   | 'user'
   | 'chevron'
+  | 'copy'
+  | 'resume'
 
 /** Path data only — the wrapper supplies sizing, colour and stroke. */
 const PATHS: Record<IconName, JSX.Element> = {
@@ -127,6 +129,19 @@ const PATHS: Record<IconName, JSX.Element> = {
     </>
   ),
   chevron: <path d="m6 9 6 6 6-6" />,
+  copy: (
+    <>
+      <rect x="9" y="9" width="11" height="11" rx="2" />
+      <path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" />
+    </>
+  ),
+  /* Play, with the bar of a pause on its left: picking a thing back up, not starting it. */
+  resume: (
+    <>
+      <path d="M5 5v14" />
+      <path d="M10 6.5v11l9-5.5-9-5.5Z" />
+    </>
+  ),
   chip: (
     <>
       <rect x="7" y="7" width="10" height="10" rx="2" />

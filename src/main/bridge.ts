@@ -1395,6 +1395,82 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     return true
   },
   'agent:checkpoints': (sessionId: string) => listCheckpoints(sessionId),
+  /**
+   * Rewrite what the model said, and make the model believe it.
+   *
+   * Editing a transcript that the model does not share would be theatre: the next turn is built
+   * from the rolling history, so a change that only reaches storage is a change the model never
+   * sees. Dropping the history forces it to be rebuilt from the edited session, which is the
+   * only version that then exists.
+   *
+   * Reasoning is edited alongside the reply because the two are one message. Passing `undefined`
+   * leaves it as it was; passing an empty string removes it, which is how a thinking block gets
+   * deleted rather than blanked.
+   */
+  'agent:edit-message': (sessionId: string, messageId: string, content: string, reasoning?: string) => {
+    const session = chats.loadSession(sessionId)
+    if (!session) throw new Error(`No session ${sessionId}`)
+    const message = session.messages.find((m) => m.id === messageId)
+    if (!message) throw new Error('That message is no longer in this conversation.')
+
+    const edited: AgentMessage = {
+      ...message,
+      content,
+      reasoning: reasoning === undefined ? message.reasoning : reasoning.trim() || undefined
+    }
+    chats.appendMessage(sessionId, edited)
+    getAgent().resetHistory()
+    return edited
+  },
+
+  /**
+   * Carry on from where the last answer stopped.
+   *
+   * Only meaningful when the transcript ends with the model's own turn: with a user message after
+   * it there is nothing to continue, and the ordinary send path is what is wanted.
+   */
+  'agent:continue': async (sessionId: string, reasoning?: ReasoningChoice) => {
+    const session = chats.loadSession(sessionId)
+    if (!session) throw new Error(`No session ${sessionId}`)
+    const last = session.messages.at(-1)
+    if (!last || last.role === 'user') {
+      throw new Error("There is nothing to continue — the last message is not from the model.")
+    }
+
+    const effort = sendableChoice(llama.loaded?.model.caps.reasoning, reasoning ?? null)
+    const a = getAgent()
+    syncAgentOptions()
+    a.updateOptions({ cwd: session.cwd, reasoningChoice: effort })
+
+    activeAgentSessionId = sessionId
+    const turnAbort = new AbortController()
+    agentTurnAbort = turnAbort
+    /*
+     * Hydrated deliberately, unlike the ordinary send path, which reuses the rolling window.
+     * Continuing usually follows an edit, and the point of an edit is that the window is stale.
+     */
+    a.hydrate(session)
+    drainPendingPermissions()
+
+    const before = session.messages.length
+    try {
+      await a.run(session, '', [], '', { continueTurn: true })
+    } finally {
+      /*
+       * From the resumed message onward, not from the end.
+       *
+       * A continuation usually adds no message at all: the loop folds the new text into the
+       * answer it is continuing, so `messages.length` is unchanged and a slice from `before`
+       * would store nothing. Starting one earlier catches the grown message, and re-storing an
+       * untouched one costs nothing — appendMessage is an upsert keyed on the id.
+       */
+      for (const m of session.messages.slice(Math.max(0, before - 1))) chats.appendMessage(sessionId, m)
+      persistPermissionRules()
+      if (agentTurnAbort === turnAbort) agentTurnAbort = null
+    }
+    return session
+  },
+
   'agent:rewind': async (sessionId: string, checkpointId: string, messageId?: string) => {
     const result = await rewindTo(sessionId, checkpointId)
     if (messageId) chats.truncateFrom(sessionId, messageId)

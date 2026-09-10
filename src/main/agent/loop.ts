@@ -678,6 +678,31 @@ Platform: Windows (PowerShell)${memoryBlock}`
    * to a checkpoint can remove the messages it described, and a summary of work that has been
    * undone tells the model about things that did not happen.
    */
+  /**
+   * Fold a resumed answer's new text back into the message it continues.
+   *
+   * Mutated in place rather than replaced, because the same object is the one the bridge
+   * persists and the one the renderer already has on screen under this id — a copy would leave
+   * the transcript showing the half that existed before.
+   *
+   * The content is joined without a separator: the server resumed from the exact characters of
+   * `message.content`, so whatever spacing belongs between the two halves is already at the
+   * start of what came back. Reasoning is a different matter — the two passes thought
+   * separately, and running them together would read as one train of thought.
+   *
+   * This relies on the turn being *streamed*, which llama.cpp treats differently from a blocking
+   * call: measured against build 10599, `/v1/chat/completions` with `continue_final_message`
+   * returns the resumed message in full when `stream` is false, and only the newly generated
+   * text when it is true. Appending a blocking response's content would repeat the first half of
+   * the answer.
+   */
+  private absorb(message: AgentMessage, text: string, thinking: string): AgentMessage {
+    message.content += text
+    const more = thinking.trim()
+    if (more) message.reasoning = message.reasoning ? `${message.reasoning}\n\n${more}` : more
+    return message
+  }
+
   hydrate(session: AgentSessionState): void {
     const all = session.messages.filter((m) => m.role !== 'system')
     let rest = all
@@ -737,7 +762,18 @@ Platform: Windows (PowerShell)${memoryBlock}`
      * The caller emits it up front and passes the id here so the stored message is the same one
      * rather than a second copy appearing when the loop finally begins.
      */
-    turnMeta: { userMessageId?: string; plan?: string } = {}
+    turnMeta: {
+      userMessageId?: string
+      plan?: string
+      /**
+       * Pick up where the last answer stopped, rather than starting a new turn.
+       *
+       * No user message is added in either the model's history or the transcript, so the model
+       * sees exactly what it saw before and simply keeps going. Anything else — an empty user
+       * turn, a "continue" instruction — changes what it was asked and shows up in the answer.
+       */
+      continueTurn?: boolean
+    } = {}
   ): Promise<void> {
     this.abort = new AbortController()
     const signal = this.abort.signal
@@ -747,21 +783,42 @@ Platform: Windows (PowerShell)${memoryBlock}`
     if (!this.history.length) this.hydrate(session)
     else this.history[0] = { role: 'system', content: this.buildSystemPrompt() }
 
-    this.history.push(
-      media.length
-        ? { role: 'user', content: [...media, { type: 'text', text: userInput }] }
-        : { role: 'user', content: userInput }
-    )
+    if (!turnMeta.continueTurn) {
+      this.history.push(
+        media.length
+          ? { role: 'user', content: [...media, { type: 'text', text: userInput }] }
+          : { role: 'user', content: userInput }
+      )
 
-    const userMsg: AgentMessage = {
-      id: turnMeta.userMessageId ?? crypto.randomBytes(6).toString('hex'),
-      role: 'user',
-      content: displayText,
-      plan: turnMeta.plan,
-      createdAt: Date.now()
+      const userMsg: AgentMessage = {
+        id: turnMeta.userMessageId ?? crypto.randomBytes(6).toString('hex'),
+        role: 'user',
+        content: displayText,
+        plan: turnMeta.plan,
+        createdAt: Date.now()
+      }
+      session.messages.push(userMsg)
+      this.emit('message', userMsg)
     }
-    session.messages.push(userMsg)
-    this.emit('message', userMsg)
+
+    /*
+     * Resuming the last answer, when there is one to resume.
+     *
+     * Only the assistant's own turn can be continued mid-sentence. A transcript ending on a tool
+     * result is a different situation — the model was interrupted between deciding and speaking,
+     * so it wants an ordinary generation prompt and simply no new user message, which is what
+     * `continueTurn` alone already gives it.
+     *
+     * `extending` is the transcript message the new text belongs to. Without it a continuation
+     * would arrive as a second assistant bubble directly under the first, which is not what
+     * continuing an answer looks like.
+     */
+    let continueFinal = turnMeta.continueTurn === true && this.history.at(-1)?.role === 'assistant'
+    let extending = continueFinal ? session.messages.at(-1) : undefined
+    if (extending?.role !== 'assistant') {
+      extending = undefined
+      continueFinal = false
+    }
 
     let calls = 0
     try {
@@ -777,10 +834,15 @@ Platform: Windows (PowerShell)${memoryBlock}`
         let thinking = ''
         const toolCalls: ToolCall[] = []
 
+        const resuming = continueFinal
+        // Spent on the first step: whatever follows is new text of its own, not a resumption.
+        continueFinal = false
+
         for await (const ev of llama.streamEvents({
           messages: this.history,
           tools: this.availableTools(),
           signal,
+          continueFinal: resuming,
           temperature: this.samplingTemperature ?? 0.6,
           ...reasoningRequestFields(llama.loaded?.model.caps.reasoning, this.opts.reasoningChoice ?? null)
         })) {
@@ -839,18 +901,29 @@ Platform: Windows (PowerShell)${memoryBlock}`
         }
 
         if (!toolCalls.length) {
-          const assistant: AgentMessage = {
-            id: crypto.randomBytes(6).toString('hex'),
-            role: 'assistant',
-            content: text.trim(),
-            // Carried on the message, not just streamed. The UI drops its live reasoning buffer
-            // the moment the message arrives, so thinking that is not stored here disappears
-            // from the transcript as soon as the turn ends — and is gone entirely on reload.
-            reasoning: thinking.trim() || undefined,
-            createdAt: Date.now()
+          const assistant: AgentMessage = extending
+            ? this.absorb(extending, text, thinking)
+            : {
+                id: crypto.randomBytes(6).toString('hex'),
+                role: 'assistant',
+                content: text.trim(),
+                // Carried on the message, not just streamed. The UI drops its live reasoning
+                // buffer the moment the message arrives, so thinking that is not stored here
+                // disappears from the transcript as soon as the turn ends — and is gone
+                // entirely on reload.
+                reasoning: thinking.trim() || undefined,
+                createdAt: Date.now()
+              }
+          if (extending) {
+            // The resumed turn is already the last entry in both lists; it grew rather than
+            // gaining a sibling, so the entry is rewritten in place instead of a new one added.
+            const tail = this.history.at(-1)
+            if (tail?.role === 'assistant') tail.content = assistant.content
+            extending = undefined
+          } else {
+            session.messages.push(assistant)
+            this.history.push({ role: 'assistant', content: text })
           }
-          session.messages.push(assistant)
-          this.history.push({ role: 'assistant', content: text })
           this.emit('message', assistant)
           this.emit('done', 'complete')
           return
@@ -861,15 +934,30 @@ Platform: Windows (PowerShell)${memoryBlock}`
         // for the same reason, and on its own: a model that thinks at length and then calls a
         // tool without a word of prose would otherwise leave no record of why.
         if (text.trim() || thinking.trim()) {
-          const assistant: AgentMessage = {
-            id: crypto.randomBytes(6).toString('hex'),
-            role: 'assistant',
-            content: text.trim(),
-            reasoning: thinking.trim() || undefined,
-            createdAt: Date.now()
-          }
-          session.messages.push(assistant)
+          const assistant: AgentMessage = extending
+            ? this.absorb(extending, text, thinking)
+            : {
+                id: crypto.randomBytes(6).toString('hex'),
+                role: 'assistant',
+                content: text.trim(),
+                reasoning: thinking.trim() || undefined,
+                createdAt: Date.now()
+              }
+          if (!extending) session.messages.push(assistant)
           this.emit('message', assistant)
+        }
+
+        /*
+         * A resumed answer that ended in a tool call replaces its own history entry.
+         *
+         * The turn being continued is the last thing in the history, and the entry pushed below
+         * carries the whole answer plus the calls it made. Leaving the original in place would
+         * put the first half of the answer in the history twice.
+         */
+        if (extending) {
+          if (this.history.at(-1)?.role === 'assistant') this.history.pop()
+          text = extending.content
+          extending = undefined
         }
 
         this.history.push({

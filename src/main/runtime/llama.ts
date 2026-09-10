@@ -21,6 +21,7 @@ import type { Backend, FitPlan, ModelRecord, ToolDefinition } from '@shared/type
 import path from 'node:path'
 import { app } from 'electron'
 import { childEnv, llamaServerPath } from './binaries'
+import { TOOL_OUTPUT_DIR } from '../storage/paths'
 import { logger } from '../log'
 
 /** Location of the stand-in server used when LLMM_MOCK_LLAMA=1. */
@@ -117,6 +118,19 @@ export interface CompletionOptions {
    * like Qwen3.8's: they enumerate levels and provide no way to say "none".
    */
   reasoningBudget?: number
+  /**
+   * Resume the last assistant message rather than starting a new one.
+   *
+   * The template is rendered without a generation prompt, so the model picks up from the exact
+   * character its previous answer stopped at instead of opening a fresh turn. Continuing any
+   * other way — an empty user turn, a "carry on" instruction — changes what the model was asked
+   * and shows up in what it writes.
+   *
+   * Requires the final message in `messages` to be the assistant's. llama.cpp rejects the pair
+   * `add_generation_prompt` and `continue_final_message` both being true, hence the explicit
+   * false alongside it.
+   */
+  continueFinal?: boolean
   signal?: AbortSignal
 }
 
@@ -364,6 +378,24 @@ export class LlamaRuntime extends EventEmitter {
     if (model.caps.mmprojPath) args.push('--mmproj', model.caps.mmprojPath)
 
     /*
+     * Diagnostics for the one class of bug that cannot be reasoned about from outside.
+     *
+     * When the server re-reads a conversation it has already seen, the cause is always that the
+     * prompt it was given differs from the one it cached — and every attempt to guess where has
+     * been wrong, because the difference lives in what this app sends rather than in anything
+     * reproducible with a hand-written request. Two consecutive prompts on disk answer it in one
+     * diff.
+     *
+     * Off unless asked for: the dump contains the whole conversation in clear text, which is not
+     * something to write to disk by default.
+     */
+    if (process.env.LLMM_DEBUG_PROMPTS) {
+      const dir = path.join(TOOL_OUTPUT_DIR, 'prompts')
+      args.push('--log-prompts-dir', dir, '-lv', '4')
+      logger.info('model', `prompt logging enabled, writing to ${dir}`)
+    }
+
+    /*
      * Speculative decoding, using the model's own multi-token-prediction head.
      *
      * The model proposes the next few tokens itself and then verifies them in the same pass, so
@@ -602,6 +634,10 @@ export class LlamaRuntime extends EventEmitter {
     if (opts.reasoningBudget !== undefined) {
       body.reasoning_budget = opts.reasoningBudget
       body.thinking_budget = opts.reasoningBudget
+    }
+    if (opts.continueFinal) {
+      body.add_generation_prompt = false
+      body.continue_final_message = true
     }
     if (opts.grammar) body.grammar = opts.grammar
     if (opts.tools?.length) {

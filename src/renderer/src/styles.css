@@ -779,6 +779,8 @@ pre {
   grid-template-columns: 26px 1fr;
   gap: 11px;
   margin-bottom: 18px;
+  /* The containing block for .msg-actions, which floats over the turn on hover. */
+  position: relative;
 }
 
 /*
@@ -2160,6 +2162,153 @@ h6.md-heading { font-size: 13px; color: var(--text-dim); }
   grid-column: 2;
   margin: 0;
   min-width: 0;
+}
+
+/* ------------------------------------------------------- acting on a turn */
+
+/*
+ * The actions float over the turn instead of sitting in it.
+ *
+ * Anything that takes space on hover pushes every message below it down, and a transcript that
+ * shifts as the pointer crosses it cannot be read. Same treatment as the conversation rail's row
+ * actions, for the same reason and so the two feel like one gesture.
+ */
+.msg-actions {
+  position: absolute;
+  top: -4px;
+  right: 0;
+  z-index: 2;
+  display: flex;
+  gap: 1px;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.34);
+  opacity: 0;
+  /* Not reachable while invisible: a keyboard tab must not stop on a hidden control. */
+  pointer-events: none;
+  transform: translateX(3px) scale(0.96);
+  transition:
+    opacity 120ms ease,
+    transform 140ms cubic-bezier(0.2, 0, 0.2, 1);
+}
+
+.msg:hover > .msg-actions,
+.msg:focus-within > .msg-actions {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(0) scale(1);
+}
+
+/*
+ * Rewriting a turn.
+ *
+ * The panes are separated by their surfaces rather than by their labels: a reasoning model's
+ * turn is two texts that read completely differently, and having to check a caption to know
+ * which one the cursor is in is exactly the confusion this is meant to remove.
+ */
+.msg-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.msg-editor-pane textarea {
+  display: block;
+  width: 100%;
+  min-height: 64px;
+  padding: 9px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--bg-inset);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.55;
+  resize: vertical;
+}
+
+.msg-editor-pane textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: transparent;
+}
+
+/*
+ * The thinking pane wears the collapsed ThinkingBlock's clothes: quieter text, a smaller size
+ * and a dashed edge saying this is working, not writing.
+ */
+/* `cot`, not `thinking`: that class is already the animated ellipsis, and it is a flex row 20px
+   tall — inherited here, it flattened the editor into a strip. */
+.msg-editor-pane.cot textarea {
+  border-style: dashed;
+  border-color: var(--border);
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.6;
+  min-height: 52px;
+}
+
+.msg-editor-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.msg-editor-pane.cot .msg-editor-label {
+  color: var(--accent);
+  opacity: 0.85;
+}
+
+/* The aside on the label is context, not a heading — it steps back from it. */
+.msg-editor-label .faint {
+  font-weight: 400;
+  font-size: 10.5px;
+}
+
+.msg-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.msg-editor-actions .tiny-note {
+  margin-right: auto;
+}
+
+/*
+ * Picking the last answer back up.
+ *
+ * Aligned to the message column rather than the page, so it reads as belonging to the turn above
+ * it rather than as a control of the transcript as a whole.
+ */
+.continue-row {
+  margin-bottom: 18px;
+}
+
+.continue-button {
+  grid-column: 2;
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: var(--r-md);
+  border: 1px dashed var(--border-strong);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.continue-button:hover {
+  border-style: solid;
+  border-color: var(--accent-dim);
+  background: var(--accent-wash);
+  color: var(--accent);
 }
 
 /* ---------------------------------------------------------------- model cards */

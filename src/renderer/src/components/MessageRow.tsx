@@ -19,16 +19,25 @@ const LABELS: Record<string, string> = {
 export default function MessageRow({
   role,
   children,
+  actions,
   testId
 }: {
   role: string
   children: React.ReactNode
+  /**
+   * Controls floated over the top-right of the turn.
+   *
+   * A slot rather than a fixed set of buttons, because what can be done to a turn depends on
+   * which transcript it is in — and because it is floated, an empty slot costs nothing.
+   */
+  actions?: React.ReactNode
   testId?: string
 }): JSX.Element {
   const label = LABELS[role] ?? role
 
   return (
     <div className={`msg from-${role}`} data-testid={testId}>
+      {actions}
       <div className="msg-avatar" aria-hidden="true">
         <Icon name={role === 'user' ? 'user' : role === 'tool' ? 'chip' : 'sparkle'} size={13} />
       </div>
