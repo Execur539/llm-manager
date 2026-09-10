@@ -759,6 +759,19 @@ pre {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  /*
+   * Explicit, not left to default.
+   *
+   * Per spec, when one axis is a scrolling value (auto/scroll) and the other is `visible`, the
+   * `visible` one is computed as `auto` too — so without this, `overflow-y: auto` alone quietly
+   * made this element scroll horizontally as well. `.msg-actions` used to be flush with the
+   * message's right edge and slide 3px further out as part of its hidden-state transform, which
+   * pushed it past that edge and was enough to trip the forced `auto` on its own — fixed at the
+   * source by giving that cluster room to slide into instead of past. Kept here anyway: nothing
+   * in this column is meant to scroll sideways, and a future addition that overflows should be
+   * clipped rather than quietly turning this into a second scrollbar.
+   */
+  overflow-x: hidden;
   /* Stable gutter, so the text does not shift sideways when a scrollbar appears. */
   scrollbar-gutter: stable;
   padding: 4px 0 8px;
@@ -2176,7 +2189,16 @@ h6.md-heading { font-size: 13px; color: var(--text-dim); }
 .msg-actions {
   position: absolute;
   top: -4px;
-  right: 0;
+  /*
+   * 6px in, not flush with the edge — the same inset the conversation rail's cluster uses, and
+   * for the reason it uses it: the hidden state below slides the cluster 3px further right as
+   * part of its entrance animation. Flush with the edge, that slide pushed the cluster past the
+   * message's own right boundary, which was ink outside any element's box and forced this
+   * scrolling container into showing a horizontal scrollbar for it (`overflow-y: auto` computes
+   * `overflow-x` to `auto` as well unless that axis is set explicitly — see `.messages` below).
+   * With headroom to slide into, the cluster never crosses the edge in the first place.
+   */
+  right: 6px;
   z-index: 2;
   display: flex;
   gap: 1px;
@@ -2195,7 +2217,9 @@ h6.md-heading { font-size: 13px; color: var(--text-dim); }
 }
 
 .msg:hover > .msg-actions,
-.msg:focus-within > .msg-actions {
+.msg:focus-within > .msg-actions,
+/* A pending delete confirmation outlives the pointer, so it cannot depend on hover. */
+.msg-actions.confirming {
   opacity: 1;
   pointer-events: auto;
   transform: translateX(0) scale(1);

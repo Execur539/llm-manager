@@ -261,18 +261,111 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   /**
    * Rewrite a turn that has already been said.
    *
-   * The stored message is replaced and the agent's rolling history dropped, so the next turn is
-   * built from the edited transcript rather than from the words the model actually produced.
-   * Nothing is re-run: an edit changes what happened, it does not ask for it to happen again.
+   * An assistant turn is corrected in place: the stored message is replaced and the agent's
+   * rolling history is dropped, so the next turn is built from the edited transcript rather than
+   * from the words the model actually produced. Nothing is re-run — an edit changes what
+   * happened, it does not ask for it to happen again.
+   *
+   * Editing your own turn means something different: the reply that followed was an answer to
+   * words that no longer exist, so it goes with it, and the model answers the new wording fresh.
+   * That is a full turn, not an instant round trip, so it goes through the same running state as
+   * sending a message — the composer disables, the stop button appears, and the whole updated
+   * tail of the conversation (not just the one edited bubble) replaces what is on screen.
    */
-  const saveEdit = async (id: string, content: string, reasoning?: string): Promise<void> => {
+  const saveEdit = async (id: string, content: string, role: string, reasoning?: string): Promise<void> => {
     if (!activeId) return
+    /*
+     * Not while the model is busy, and not with no model to answer.
+     *
+     * The edit button that opens this editor is already hidden while busy, but the editor itself
+     * has no such guard once open — start a turn elsewhere while it is sitting there, or open it
+     * when nothing is loaded, and Save is still clickable. Checked here rather than trusting the
+     * caller: this is the one place that actually knows whether it is about to run a turn.
+     */
+    if (busy) {
+      toast('The model is busy — wait for it to finish first.', 'info')
+      return
+    }
+    if (role === 'user' && !loaded) {
+      toast('Load a model before rewinding a message.', 'info')
+      return
+    }
+    setEditing(null)
+    if (role === 'user') {
+      /*
+       * Rewound on screen before the network round trip, not after.
+       *
+       * The new reply streams in live through the same pending-message plumbing any other turn
+       * uses — but nothing removes a message from that plumbing, so the stale reply and tool
+       * calls this edit is about to erase would sit on screen next to the new one arriving until
+       * the whole turn finished. Cutting the tail locally the moment the edit is confirmed is
+       * what makes it look like what it is: the conversation being rewound, then answered again.
+       */
+      setMessages((prev) => {
+        const idx = prev.findIndex((m) => m.id === id)
+        if (idx === -1) return prev
+        return [...prev.slice(0, idx), { ...prev[idx], content }]
+      })
+
+      const effort = sendableChoice(loaded?.caps?.reasoning, stream.reasoning[effortId] ?? null)
+      setRunning(activeId, true)
+      try {
+        const session = await invoke<{ messages: AgentMessage[] }>(
+          'agent:rewind-and-regenerate',
+          activeId,
+          id,
+          content,
+          effort
+        )
+        // The authoritative final shape, reconciling anything the streamed events did not carry.
+        setMessages(session.messages)
+      } catch (err) {
+        toast(err instanceof Error ? err.message : String(err), 'error')
+        /*
+         * The cut above already happened on screen before the server ever saw the request, so a
+         * rejection — no model loaded, another turn using the agent, the session having vanished
+         * — leaves the transcript showing fewer messages than storage actually has. Reloading is
+         * what `deleteMessage` does for the same reason: the server is the only source of truth
+         * once the optimistic guess and reality can have parted ways.
+         */
+        const restored = await invoke<{ messages: AgentMessage[] } | null>('chat:load', activeId)
+        if (restored) setMessages(restored.messages)
+      } finally {
+        setRunning(activeId, false)
+        await refreshSessions()
+      }
+      return
+    }
     try {
       const edited = await invoke<AgentMessage>('agent:edit-message', activeId, id, content, reasoning)
       setMessages((prev) => prev.map((m) => (m.id === id ? edited : m)))
-      setEditing(null)
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), 'error')
+    }
+  }
+
+  /**
+   * Remove a message, and everything the transcript shows after it.
+   *
+   * The row is gone from the screen the moment the confirm click lands — there is nothing to
+   * stream back and wait for here, unlike an edit that regenerates. If the message being open
+   * for editing is one of the ones removed, that editor has nothing left to edit.
+   */
+  const deleteMessage = async (id: string): Promise<void> => {
+    if (!activeId) return
+    const idx = messages.findIndex((m) => m.id === id)
+    if (idx === -1) return
+    setMessages((prev) => prev.slice(0, idx))
+    if (editing && messages.slice(idx).some((m) => m.id === editing)) setEditing(null)
+    try {
+      await invoke('agent:delete-message', activeId, id)
+    } catch (err) {
+      toast(err instanceof Error ? err.message : String(err), 'error')
+      // The optimistic cut was wrong if the server refused it — put the transcript back.
+      const session = await invoke<{ messages: AgentMessage[] } | null>('chat:load', activeId)
+      if (session) setMessages(session.messages)
+    } finally {
+      await refreshSessions()
     }
   }
 
@@ -464,6 +557,12 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                        * a turn with no words in it has nothing to rewrite.
                        */
                       onEdit={busy || !(m.content || m.reasoning) ? undefined : () => setEditing(m.id)}
+                      /*
+                       * Deleting mid-turn would race the running turn's own writes back to
+                       * storage once it finishes, so it waits for the same quiet moment editing
+                       * does.
+                       */
+                      onDelete={busy ? undefined : () => void deleteMessage(m.id)}
                     />
                   )
                 }
@@ -473,8 +572,22 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                   content={m.content}
                   /* Present, and separately editable, only where the model actually thought. */
                   reasoning={m.role === 'assistant' ? (m.reasoning ?? '') : undefined}
-                  onSave={(content, reasoning) => void saveEdit(m.id, content, reasoning)}
+                  onSave={(content, reasoning) => void saveEdit(m.id, content, m.role, reasoning)}
                   onCancel={() => setEditing(null)}
+                  /*
+                   * The editor can outlive the moment it was safe to open: a turn can start
+                   * elsewhere in this session while it sits open, or the model can be unloaded
+                   * from under a rewind. Re-evaluated on every render rather than fixed at open
+                   * time, so Save disables itself the instant either happens.
+                   */
+                  disabled={busy || (m.role === 'user' && !loaded)}
+                  disabledReason={
+                    busy
+                      ? 'The model is busy — wait for it to finish first.'
+                      : m.role === 'user' && !loaded
+                        ? 'Load a model before rewinding a message.'
+                        : undefined
+                  }
                 />
               ) : m.role === 'assistant' ? (
                 <>

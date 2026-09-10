@@ -1310,6 +1310,166 @@ const scenarios = {
     })
   },
 
+  /**
+   * The three message-level handlers behind hover actions in the Agent tab: rewriting a turn in
+   * place, rewriting your own and having it answered again, and deleting a turn together with
+   * everything after it. Driven through `window.api.invoke` the same way `checkpoints` drives
+   * `agent:rewind` — these are backend contracts, and the UI that calls them was already
+   * verified separately.
+   */
+  async messageActions() {
+    await withApp('message-actions', async ({ page }) => {
+      await loadModel(page)
+      await goTo(page, 'Agent')
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+
+      const sessionId = await page.evaluate(() => {
+        const el =
+          document.querySelector('[data-testid="conversation-item"].active') ??
+          document.querySelector('[data-testid="conversation-item"]')
+        return el?.getAttribute('data-id') ?? null
+      })
+      report.check('message-actions', 'the new session has an id', !!sessionId, String(sessionId))
+      if (!sessionId) return
+
+      /** Fetch the stored transcript straight from storage — the source of truth for every check below. */
+      const load = () => page.evaluate((id) => window.api.invoke('chat:load', id), sessionId)
+
+      /** One exchange, waited out to completion. `[[mock:prompt]]` echoes the message back, so the
+       *  reply always says what the model was actually asked — which is what regenerate needs to prove. */
+      const sendAndWait = async (text, expectedCount) => {
+        await page.getByTestId('agent-input').fill(`[[mock:prompt]] ${text}`)
+        await page.getByTestId('agent-send').click()
+        // Confirmed to have started, not just "not currently visible" — a fast enough reply can
+        // stream and finish between two polls, and `state: 'detached'` on its own does not tell
+        // the difference between "never appeared" and "appeared, then left".
+        await page.waitForSelector('[data-testid="streaming-message"]', { timeout: 20000 }).catch(() => undefined)
+        await page.waitForSelector('[data-testid="streaming-message"]', { state: 'detached', timeout: 20000 }).catch(() => undefined)
+        // The running total, not a fixed "at least 2" — reused across several exchanges in the
+        // same conversation, a fixed threshold is already satisfied by the first one and the
+        // second call's wait does nothing at all.
+        await page.waitForFunction((n) => document.querySelectorAll('.messages .msg').length >= n, expectedCount, { timeout: 20000 }).catch(() => undefined)
+        // The DOM settling is not quite the same moment the bridge's own turn-tracking clears —
+        // `agentTurnAbort` is nulled in a `finally` a tick after the loop's last emit, and the
+        // very next thing this test does needs that to be done.
+        await page.waitForTimeout(300)
+      }
+
+      // Two exchanges: alpha then beta, four stored messages.
+      await sendAndWait('alpha', 2)
+      await sendAndWait('beta', 4)
+      const afterTwo = await load()
+      report.check('message-actions', 'two exchanges landed four messages',
+        (afterTwo?.messages ?? []).length === 4, `${(afterTwo?.messages ?? []).length} messages`)
+
+      const [u1, , u2] = afterTwo?.messages ?? []
+
+      // ---- delete: removes the message and everything after it, nothing before.
+      const deleted = await page.evaluate(
+        ([id, mid]) => window.api.invoke('agent:delete-message', id, mid),
+        [sessionId, u2.id]
+      )
+      report.check('message-actions', 'delete reports how many rows it removed', deleted?.removed === 2, JSON.stringify(deleted))
+      const afterDelete = await load()
+      const remaining = afterDelete?.messages ?? []
+      report.check('message-actions', 'the second exchange is gone, the first is not',
+        remaining.length === 2 && remaining[0].id === u1.id,
+        remaining.map((m) => m.id).join(','))
+
+      // The open view must catch up too, not just storage — round-trip through another view so
+      // the session is reloaded rather than trusting stale state already in memory.
+      await goTo(page, 'Dashboard')
+      await goTo(page, 'Agent')
+      await page.waitForFunction(() => document.querySelectorAll('.messages .msg').length <= 2, undefined, { timeout: 10000 }).catch(() => undefined)
+      const domAfterDelete = await page.locator('.messages .msg').count()
+      report.check('message-actions', 'the transcript on screen matches what delete left behind',
+        domAfterDelete === 2, `${domAfterDelete} rows on screen`)
+
+      // ---- edit-message: rewrites a turn in place, no turn is run.
+      const assistantId = remaining[1].id
+      const editedInPlace = await page.evaluate(
+        ([id, mid, content]) => window.api.invoke('agent:edit-message', id, mid, content),
+        [sessionId, assistantId, 'rewritten by hand']
+      )
+      report.check('message-actions', 'edit-message returns the edited row',
+        editedInPlace?.content === 'rewritten by hand', JSON.stringify(editedInPlace))
+      const afterInPlaceEdit = await load()
+      report.check('message-actions', 'the edit reached storage, and nothing else moved',
+        afterInPlaceEdit?.messages?.length === 2 && afterInPlaceEdit.messages[1].content === 'rewritten by hand',
+        JSON.stringify(afterInPlaceEdit?.messages?.map((m) => m.content)))
+
+      // ---- rewind-and-regenerate: the reply must reflect the EDITED words, not the original ones —
+      // proof the model was actually asked again rather than the stale answer being kept.
+      const regenerated = await page.evaluate(
+        ([id, mid, content]) => window.api.invoke('agent:rewind-and-regenerate', id, mid, content),
+        [sessionId, u1.id, '[[mock:prompt]] gamma']
+      )
+      const regeneratedMessages = regenerated?.messages ?? []
+      report.check('message-actions', 'regenerate leaves exactly one exchange behind',
+        regeneratedMessages.length === 2, `${regeneratedMessages.length} messages`)
+      report.check('message-actions', 'the new reply answers the edited words',
+        (regeneratedMessages[1]?.content ?? '').includes('gamma') && !regeneratedMessages[1]?.content.includes('alpha'),
+        regeneratedMessages[1]?.content ?? '(none)')
+
+      // ---- rewind-and-regenerate refuses to run with nothing to answer with, and must not have
+      // touched anything by the time it refuses: the whole point is the destructive half never runs.
+      await page.evaluate(() => window.api.invoke('model:unload'))
+      const noModel = await page.evaluate(
+        ([id, mid, content]) => window.api.invoke('agent:rewind-and-regenerate', id, mid, content)
+          .then((value) => ({ ok: true, value }))
+          .catch((err) => ({ ok: false, error: String(err?.message ?? err) })),
+        [sessionId, u1.id, '[[mock:prompt]] delta']
+      )
+      report.check('message-actions', 'regenerating with no model loaded is refused',
+        noModel.ok === false, JSON.stringify(noModel))
+      const afterRefusedRegenerate = await load()
+      report.check('message-actions', 'a refused regenerate left the transcript untouched',
+        JSON.stringify(afterRefusedRegenerate?.messages) === JSON.stringify(regeneratedMessages),
+        JSON.stringify(afterRefusedRegenerate?.messages?.map((m) => m.content)))
+
+      // ---- edit, delete and regenerate all refuse to touch the shared agent's history while a
+      // turn — even one belonging to this same session — is actually using it.
+      // loadModel leaves off on "My models", where it did its clicking — back to Agent first.
+      await loadModel(page)
+      await goTo(page, 'Agent')
+      await page.getByTestId('agent-input').fill('[[mock:stall]] never answers')
+      await page.getByTestId('agent-send').click()
+      await page.waitForTimeout(1000)
+
+      const beforeGuardChecks = await load()
+      const stillRunning = await page.getByTestId('agent-stop').count()
+      report.check('message-actions', 'a stalled turn is actually in flight before testing the guard',
+        stillRunning > 0, `${stillRunning} stop buttons visible`)
+
+      const guardCases = [
+        ['agent:delete-message', [sessionId, u1.id]],
+        ['agent:edit-message', [sessionId, regeneratedMessages[1].id, 'sneaked in mid-turn']],
+        ['agent:rewind-and-regenerate', [sessionId, u1.id, '[[mock:prompt]] epsilon']]
+      ]
+      for (const [channel, callArgs] of guardCases) {
+        const result = await page.evaluate(
+          ([ch, a]) => window.api.invoke(ch, ...a)
+            .then((value) => ({ ok: true, value }))
+            .catch((err) => ({ ok: false, error: String(err?.message ?? err) })),
+          [channel, callArgs]
+        )
+        report.check('message-actions', `${channel} refuses to run while another turn is in flight`,
+          result.ok === false && /busy/i.test(result.error ?? ''), JSON.stringify(result))
+      }
+
+      // Compared before the stall is stopped, not after — stopping it is its own operation with
+      // its own effect on storage, and folding that into this comparison would leave it unclear
+      // which of the two was actually responsible for anything that changed.
+      const afterGuardChecks = await load()
+      report.check('message-actions', 'none of the refused calls changed anything',
+        JSON.stringify(afterGuardChecks?.messages) === JSON.stringify(beforeGuardChecks?.messages),
+        `${afterGuardChecks?.messages?.length} messages now vs ${beforeGuardChecks?.messages?.length} before`)
+
+      await stopTurn(page, 'agent-input')
+    })
+  },
+
   /** The OpenAI- and Anthropic-shaped HTTP surface, exercised by a real client. */
   async apiSurface() {
     await withApp('api-surface', async ({ page }) => {

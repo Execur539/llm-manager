@@ -37,13 +37,24 @@ export default function MessageEditor({
   content,
   reasoning,
   onSave,
-  onCancel
+  onCancel,
+  disabled,
+  disabledReason
 }: {
   content: string
   /** Absent when the turn had no chain of thought — then there is only one thing to edit. */
   reasoning?: string
   onSave: (content: string, reasoning?: string) => void
   onCancel: () => void
+  /*
+   * Saving can no longer be answered — a turn started elsewhere in this session while the
+   * editor sat open, or nothing is loaded to answer with. `saving` alone does not cover this:
+   * that flag only guards against a second click on this same button, not against the ground
+   * having shifted under an editor that was opened before either became true.
+   */
+  disabled?: boolean
+  /** Shown on the Save button when `disabled` is set, so the reason is not just a dead click. */
+  disabledReason?: string
 }): JSX.Element {
   const [body, setBody] = useState(content)
   const [thought, setThought] = useState(reasoning ?? '')
@@ -61,7 +72,7 @@ export default function MessageEditor({
   }, [])
 
   const save = (): void => {
-    if (saving) return
+    if (saving || disabled) return
     setSaving(true)
     onSave(body, reasoning === undefined ? undefined : thought)
   }
@@ -122,7 +133,13 @@ export default function MessageEditor({
         <button onClick={onCancel} data-testid="edit-cancel">
           Cancel
         </button>
-        <button className="primary" onClick={save} disabled={saving} data-testid="edit-save">
+        <button
+          className="primary"
+          onClick={save}
+          disabled={saving || disabled}
+          title={disabled ? disabledReason : undefined}
+          data-testid="edit-save"
+        >
           Save
         </button>
       </div>

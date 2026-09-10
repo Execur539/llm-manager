@@ -112,6 +112,22 @@ const inFlightChats = new Map<string, AbortController>()
 let agentTurnAbort: AbortController | null = null
 
 /**
+ * Refuse to rewrite the shared agent's history while a turn is actually using it.
+ *
+ * There is one `Agent` instance for every session (`getAgent()`), and its rolling history is
+ * mutated in place by `resetHistory()` and `hydrate()`. Calling either while `agentTurnAbort` is
+ * set does not just affect the session being edited — it pulls the history out from under
+ * whichever turn is running, in any conversation, since it is the same object either way. Editing
+ * or deleting a message in a conversation that is currently idle is still refused if a *different*
+ * conversation is generating, because there is no way to tell the two apart at this level.
+ */
+function assertAgentIdle(): void {
+  if (agentTurnAbort) {
+    throw new Error('The model is busy with another turn right now — wait for it to finish first.')
+  }
+}
+
+/**
  * Settle every outstanding approval prompt as a denial.
  *
  * The agent blocks on `ask()` until the renderer answers, and nothing else can unblock it. If
@@ -1408,6 +1424,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
    * deleted rather than blanked.
    */
   'agent:edit-message': (sessionId: string, messageId: string, content: string, reasoning?: string) => {
+    assertAgentIdle()
     const session = chats.loadSession(sessionId)
     if (!session) throw new Error(`No session ${sessionId}`)
     const message = session.messages.find((m) => m.id === messageId)
@@ -1421,6 +1438,101 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     chats.appendMessage(sessionId, edited)
     getAgent().resetHistory()
     return edited
+  },
+
+  /**
+   * Rewrite something you said, and have the model answer it again.
+   *
+   * Unlike `agent:edit-message`, this is not "correct the record" — it is "I meant to ask this
+   * instead." Everything that followed the original wording was an answer to words that no
+   * longer exist, so it goes with it: the old reply, any tool calls it made, all of it.
+   *
+   * The new answer is produced by running a turn with `continueTurn: true` on a history that
+   * hydrate() ends on the edited user message. That flag's actual job is "don't push another
+   * user turn" — the loop only chooses to *resume* generation (`continue_final_message`) when
+   * the history it hydrated also *ends* on an assistant turn, which this one does not. So the
+   * model is asked a fresh question, not asked to keep talking, and the edited words are asked
+   * exactly once rather than twice.
+   */
+  'agent:rewind-and-regenerate': async (sessionId: string, messageId: string, content: string, reasoning?: ReasoningChoice) => {
+    assertAgentIdle()
+    /*
+     * Checked before anything is touched, not after.
+     *
+     * Everything below this line is destructive — the edit is saved and the old reply deleted
+     * before the new one exists. Discovering only afterwards that there is nothing to answer with
+     * would leave exactly the damage this ordering avoids: the words changed, the old answer
+     * gone, and nothing in its place.
+     */
+    if (!llama.loaded) throw new Error('No model is loaded')
+
+    const before0 = chats.loadSession(sessionId)
+    if (!before0) throw new Error(`No session ${sessionId}`)
+    const idx = before0.messages.findIndex((m) => m.id === messageId)
+    if (idx === -1) throw new Error('That message is no longer in this conversation.')
+    const target = before0.messages[idx]
+    if (target.role !== 'user') throw new Error('Only your own messages can be rewound like this.')
+
+    chats.appendMessage(sessionId, { ...target, content })
+
+    const next = before0.messages[idx + 1]
+    if (next) {
+      chats.truncateFrom(sessionId, next.id)
+      // Same reasoning as agent:rewind: a summary describing turns that no longer exist is
+      // worse than none, and rebuilding it costs only the room it was saving.
+      chats.clearSummary(sessionId)
+    }
+
+    // Reloaded rather than trimmed in memory: the edit and the truncation both happened in
+    // storage above, and this is the one place both are reflected without recomputing either.
+    const session = chats.loadSession(sessionId)
+    if (!session) throw new Error(`No session ${sessionId}`)
+
+    const effort = sendableChoice(llama.loaded?.model.caps.reasoning, reasoning ?? null)
+    const a = getAgent()
+    syncAgentOptions()
+    a.updateOptions({ cwd: session.cwd, reasoningChoice: effort })
+
+    activeAgentSessionId = sessionId
+    const turnAbort = new AbortController()
+    agentTurnAbort = turnAbort
+    a.hydrate(session)
+    drainPendingPermissions()
+
+    const beforeRun = session.messages.length
+    try {
+      await a.run(session, '', [], '', { continueTurn: true })
+    } finally {
+      for (const m of session.messages.slice(beforeRun)) chats.appendMessage(sessionId, m)
+      persistPermissionRules()
+      if (agentTurnAbort === turnAbort) agentTurnAbort = null
+    }
+    return session
+  },
+
+  /**
+   * Delete a message, and everything that came after it.
+   *
+   * Not just that one row: a later message can be an answer to this one, or a tool result this
+   * one's call produced, and leaving those behind would show a transcript that no longer makes
+   * sense — a reply with no question, a result with no call. `truncateFrom` already deletes a
+   * message together with everything ordered after it, which is exactly this.
+   *
+   * The agent's rolling history is dropped rather than edited in place, same as an edit: the
+   * next turn is built fresh from what storage now holds, and a stale summary describing turns
+   * that no longer exist is worse than none.
+   */
+  'agent:delete-message': (sessionId: string, messageId: string) => {
+    assertAgentIdle()
+    const session = chats.loadSession(sessionId)
+    if (!session) throw new Error(`No session ${sessionId}`)
+    if (!session.messages.some((m) => m.id === messageId)) {
+      throw new Error('That message is no longer in this conversation.')
+    }
+    const removed = chats.truncateFrom(sessionId, messageId)
+    chats.clearSummary(sessionId)
+    getAgent().resetHistory()
+    return { removed }
   },
 
   /**
