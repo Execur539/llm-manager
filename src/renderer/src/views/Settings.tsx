@@ -222,6 +222,36 @@ export default function Settings(): JSX.Element {
               onCommit={(n) => void patch({ autoFit: { ...settings.autoFit, headroomMb: n } })}
             />
           </dd>
+          {/*
+            * Only matters once part of a model lives in system RAM, which for a large
+            * mixture-of-experts model is most of it.
+            */}
+          <dt>Weight loading</dt>
+          <dd>
+            <select
+              className="kv-select"
+              value={settings.runtime.loadMode}
+              onChange={(e) =>
+                void patch({ runtime: { ...settings.runtime, loadMode: e.target.value as 'auto' | 'ram' | 'mmap' } })
+              }
+              data-testid="load-mode"
+            >
+              <option value="auto">automatic — load into RAM when it fits</option>
+              <option value="ram">always load into RAM</option>
+              <option value="mmap">always memory-map</option>
+            </select>
+            <span className="faint">mapped pages can fault to disk mid-answer</span>
+          </dd>
+          <dt>CPU threads</dt>
+          <dd>
+            <NumberField
+              value={settings.runtime.threads}
+              min={0}
+              max={256}
+              hint="0 = automatic, which counts real cores rather than hyper-threads"
+              onCommit={(n) => void patch({ runtime: { ...settings.runtime, threads: n } })}
+            />
+          </dd>
         </dl>
       </div>
 
@@ -393,6 +423,18 @@ export default function Settings(): JSX.Element {
             Save
           </button>
         </div>
+        <dl className="kv" style={{ marginTop: 12 }}>
+          <dt>Connections per file</dt>
+          <dd>
+            <NumberField
+              value={settings.downloads.connections}
+              min={1}
+              max={16}
+              hint="one connection rarely fills a fast line; more helps up to what it can carry"
+              onCommit={(n) => void patch({ downloads: { ...settings.downloads, connections: n } })}
+            />
+          </dd>
+        </dl>
       </div>
 
       <div className="card">

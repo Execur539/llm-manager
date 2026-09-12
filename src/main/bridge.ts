@@ -19,6 +19,7 @@ import type {
   FitResult,
   HardwareSnapshot,
   KvType,
+  ModelArchInfo,
   ModelRecord,
   AgentQuestion,
   PermissionDecision,
@@ -393,6 +394,98 @@ function sanitizeOverrides(raw: Record<string, unknown> | undefined): FitConstra
   return out
 }
 
+/** The auto-fit constraints as the user's settings define them. */
+function constraintsFromSettings(s: AppSettings): FitConstraints {
+  return {
+    ...DEFAULT_CONSTRAINTS,
+    minKvType: s.autoFit.minKvType,
+    preferredKvType: s.autoFit.preferredKvType,
+    targetContext: s.autoFit.targetContext,
+    idealContext: s.autoFit.idealContext,
+    headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
+    allowRopeScaling: s.autoFit.allowRopeScaling,
+    overrides: {}
+  }
+}
+
+/**
+ * The next plan to try when one did not fit: routed experts to the host first, whole layers after.
+ *
+ * Experts are the cheap thing to give up — a token reads ten of five hundred — so they move
+ * before anything that is read on every token. Returns null when there is nothing left to move.
+ */
+function moreConservative(
+  plan: FitPlan,
+  arch: ModelArchInfo,
+  hw: HardwareSnapshot,
+  companionBytes: number
+): FitPlan | null {
+  const base = { ...constraintsFromSettings(loadSettings()), companionBytes }
+  const keep = { contextLength: plan.contextLength, kvType: plan.kvType, kvTypeV: plan.kvTypeV }
+  const take = (result: FitResult): FitPlan | null => {
+    const next = result.chosen ?? result.alternatives[0]
+    return next ? { ...next, draftMax: plan.draftMax } : null
+  }
+
+  const cpuMoe = plan.cpuMoeLayers ?? 0
+  if (arch.expertCount > 0 && cpuMoe < arch.blockCount) {
+    // A tenth of the stack at a time: small enough not to give away speed needlessly, large
+    // enough that three retries cover a badly wrong estimate rather than inching towards it.
+    const step = Math.max(2, Math.round(arch.blockCount / 10))
+    const next = Math.min(arch.blockCount, cpuMoe + step)
+    const replanned = take(planFit(arch, hw, { ...base, overrides: { ...keep, cpuMoeLayers: next } }))
+    if (replanned) return replanned
+  }
+
+  const layers = Math.floor(plan.gpuLayers * 0.9)
+  if (layers > 0 && layers < plan.gpuLayers) {
+    return take(
+      planFit(arch, hw, {
+        ...base,
+        overrides: {
+          ...keep,
+          gpuLayers: layers,
+          ...(arch.expertCount > 0 ? { cpuMoeLayers: arch.blockCount } : {})
+        }
+      })
+    )
+  }
+  return null
+}
+
+/**
+ * Load, and give ground rather than give up when the card turns out to be fuller than predicted.
+ *
+ * The plan is an estimate of what llama.cpp will allocate, and on an architecture the engine
+ * models imperfectly it can be a few hundred megabytes optimistic on one device — which surfaced
+ * as a failed load and nothing else. A Qwen3.8-Flash-Next plan sized at 12.3 GB against 13.4 GB
+ * free died on a 103 MiB recurrent-state cache, twice, with no way forward from the UI.
+ */
+async function loadWithBackoff(
+  model: ModelRecord,
+  plan: FitPlan,
+  hw: HardwareSnapshot
+): Promise<{ loaded: Awaited<ReturnType<typeof llama.load>>; plan: FitPlan }> {
+  const arch = model.arch
+  let current = plan
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return { loaded: await llama.load(model, current, hw.backend), plan: current }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const outOfVram = /out of memory|failed to allocate|unable to allocate/i.test(message)
+      const next = outOfVram && arch && attempt < 3 ? moreConservative(current, arch, hw, companionSize(model)) : null
+      if (!next) throw err
+      logger.warn('model', `${model.filename}: load ran out of VRAM, retrying with more of it in system RAM`, {
+        attempt: attempt + 1,
+        from: { cpuMoeLayers: current.cpuMoeLayers ?? 0, gpuLayers: current.gpuLayers, context: current.contextLength },
+        to: { cpuMoeLayers: next.cpuMoeLayers ?? 0, gpuLayers: next.gpuLayers, context: next.contextLength }
+      })
+      current = next
+    }
+  }
+}
+
 async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: number; plan: FitPlan }> {
   const model = library.find((m) => m.id === modelId || m.filename === modelId)
   if (!model) throw new Error(`Model not found: ${modelId}`)
@@ -430,8 +523,16 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
   const spec = loadSettings().speculative
   chosen = { ...chosen, draftMax: spec.enabled ? spec.nMax : 0 }
 
-  const loaded = await llama.load(model, chosen, fresh.backend)
-  logger.info('model', `loaded ${model.filename}`, { ctx: chosen.contextLength, layers: chosen.gpuLayers })
+  const attempted = await loadWithBackoff(model, chosen, fresh)
+  const loaded = attempted.loaded
+  // What actually loaded, which after a backoff is not what was planned — and is what gets
+  // verified against real VRAM, stored, and shown.
+  chosen = attempted.plan
+  logger.info('model', `loaded ${model.filename}`, {
+    ctx: chosen.contextLength,
+    layers: chosen.gpuLayers,
+    cpuMoeLayers: chosen.cpuMoeLayers ?? 0
+  })
 
   // Verify prediction against reality and feed the delta back into the headroom margin.
   const after = await refreshFreeVram(fresh)

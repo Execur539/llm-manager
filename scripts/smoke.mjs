@@ -158,19 +158,21 @@ section('Hybrid attention/SSM models cache only on attention layers')
    * the exact figure would only record today's fixture.
    */
   /*
-   * The ceiling used to be a hardcoded 131,072 regardless of hardware or model. It is now
-   * computed, and computing it honestly costs a little: the logits buffer (batch x vocab x 4
-   * bytes) is charged to whichever GPU holds the output layer, where it used to be missing
-   * entirely. That is a real fix — a plan that omitted it could OOM the moment the server
-   * actually reserved that buffer — so the new context is expected to land a little under the
-   * old number, not to match it. Bounded below so a regression elsewhere is still caught.
+   * Asserted against the naive accounting rather than against a number.
+   *
+   * This used to pin 131,072 — the hardcoded ceiling the engine replaced — and every later
+   * correction that cost a little context had to move it: the logits buffer charged to the card
+   * holding the output layer, then the per-device reserve for the recurrent-state cache. Both
+   * were real memory that loads were dying on, so a test that has to be relaxed each time one is
+   * found is measuring the wrong thing. What must not regress is the gain itself: counting only
+   * the layers that actually hold a cache buys multiples of what counting all of them does.
    */
-  const logits = logitsBufferBytes(hybrid, 512)
-  check(
-    'hybrid 27B still reaches nearly the old fixed ceiling once the logits buffer is honestly charged',
-    (result.chosen?.contextLength ?? 0) >= 131072 - 8192,
-    `${result.chosen?.contextLength} (logits buffer costs ${fmtBytes(logits)} on the GPU holding the output layer)`
-  )
+  const naiveKv = { ...hybrid, attentionLayers: hybrid.blockCount, ssmLayers: 0, ssmStateBytesPerLayer: 0 }
+  const naiveCtx = planFit(naiveKv, rig, DEFAULT_CONSTRAINTS).chosen?.contextLength ?? 0
+  const hybridCtx = result.chosen?.contextLength ?? 0
+  check('hybrid accounting buys multiples of the context the naive count allows', hybridCtx >= naiveCtx * 2,
+    `${hybridCtx} vs ${naiveCtx} (logits ${fmtBytes(logitsBufferBytes(hybrid, 512))} on the output card)`)
+  check('and still clears the default target comfortably', hybridCtx >= DEFAULT_CONSTRAINTS.targetContext, `${hybridCtx}`)
   check('and does not exceed what the model was trained for', (result.chosen?.contextLength ?? 0) <= hybrid.contextLength)
   check('at the preferred KV quality, not the floor', result.chosen?.kvType === 'q8_0', `${result.chosen?.kvType}/${result.chosen?.kvTypeV}`)
   /*

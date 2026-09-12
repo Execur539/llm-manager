@@ -101,7 +101,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
     maxContinuations: 4
   },
   downloads: {
-    connections: 4
+    connections: 8,
+    version: 2
+  },
+  runtime: {
+    loadMode: 'auto',
+    threads: 0
   },
   video: {
     /*
@@ -190,6 +195,7 @@ const NUMERIC_BOUNDS: { path: [keyof AppSettings, string]; min: number; max: num
   { path: ['ultra', 'maxContinuations'], min: 0, max: 20 },
   { path: ['server', 'port'], min: 1, max: 65_535 },
   { path: ['downloads', 'connections'], min: 1, max: 16 },
+  { path: ['runtime', 'threads'], min: 0, max: 256 },
   // A video may not take the whole window: the question about it has to fit too.
   { path: ['video', 'contextShare'], min: 0.05, max: 0.8 },
   // Below a quarter frame per second a two-minute clip is eight pictures; above four the model
@@ -216,13 +222,31 @@ function clampNumerics(settings: AppSettings): AppSettings {
   return settings
 }
 
+/*
+ * Connections per download were 4, with no control for them anywhere, so a stored 4 is the old
+ * default rather than anybody's choice. One HuggingFace connection measured about 15 MB/s here,
+ * which left a gigabit line more than half idle. Raised once and marked, so a value chosen later
+ * is left alone.
+ */
+function migrateDownloads(s: AppSettings, raw: { downloads?: { version?: number } } | null): AppSettings {
+  if (raw?.downloads?.version === 2) return s
+  return {
+    ...s,
+    downloads: {
+      ...s.downloads,
+      connections: Math.max(s.downloads.connections, DEFAULT_SETTINGS.downloads.connections),
+      version: 2
+    }
+  }
+}
+
 let cache: AppSettings | null = null
 
 export function loadSettings(): AppSettings {
   if (cache) return cache
   try {
     const raw = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
-    cache = clampNumerics(merge(DEFAULT_SETTINGS, raw))
+    cache = migrateDownloads(clampNumerics(merge(DEFAULT_SETTINGS, raw)), raw)
   } catch {
     cache = { ...DEFAULT_SETTINGS }
   }

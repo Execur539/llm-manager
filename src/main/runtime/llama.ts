@@ -292,6 +292,7 @@ export class LlamaRuntime extends EventEmitter {
   }
 
   private buildArgs(model: ModelRecord, plan: FitPlan, port: number): string[] {
+    const fmtGb = (n: number): string => `${(n / 1024 ** 3).toFixed(1)} GB`
     const args = [
       '--model', model.path,
       '--host', '127.0.0.1',
@@ -412,6 +413,39 @@ export class LlamaRuntime extends EventEmitter {
       args.push('--override-tensor', plan.overrideTensors.trim())
     }
     args.push('--fit', 'off')
+
+    /*
+     * How the weights are read, and by how many threads.
+     *
+     * Memory mapping is llama.cpp's default and is the right one when the weights end up on the
+     * GPU. It is the wrong one for an MoE model whose experts live in system RAM and are read on
+     * every token: a mapped page the operating system has reclaimed turns into a fault and a disk
+     * read in the middle of an answer. Loading them into ordinary memory avoids that, but only
+     * when they genuinely fit, so it is asked for when the plan says so and left alone otherwise.
+     *
+     * The per-layer embedding table stays file-backed either way. It is the largest single thing
+     * in a model like Qwen3.8-Flash-Next and only a few of its rows are read per token, so lazy
+     * reads cost nothing and holding it in memory would cost tens of gigabytes.
+     */
+    const settings = loadSettings()
+    if (settings.runtime.threads > 0) args.push('--threads', String(settings.runtime.threads))
+
+    const pleBytes = model.arch?.pleBytes ?? 0
+    const residentHost = Math.max(0, plan.predictedHostBytes - pleBytes)
+    // A margin, because the figure is a prediction and the rest of the machine is still running.
+    const fitsInRam = residentHost > 0 && residentHost * 1.15 < os.freemem()
+    const loadMode = settings.runtime.loadMode === 'auto' ? (fitsInRam ? 'ram' : 'default') : settings.runtime.loadMode
+    if (loadMode === 'ram') {
+      args.push('--load-mode', 'none', '--lazy-mode', 'on')
+      logger.info('model', `loading ${fmtGb(residentHost)} of weights into system RAM rather than mapping them`, {
+        freeRam: os.freemem(),
+        pleBytes
+      })
+    } else if (loadMode === 'mmap') {
+      args.push('--load-mode', 'mmap')
+    } else if (residentHost > 0) {
+      logger.info('model', `memory-mapping weights: ${fmtGb(residentHost)} on the host, ${fmtGb(os.freemem())} RAM free`)
+    }
     if (model.caps.mmprojPath) args.push('--mmproj', model.caps.mmprojPath)
 
     /*

@@ -15,6 +15,7 @@ import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { all, get, run } from '../storage/db'
+import { logger } from '../log'
 
 export type DownloadStatus =
   | 'queued'
@@ -85,7 +86,10 @@ const MAX_CONCURRENT = 2
  * So it is on, at a modest number: it costs nothing measurable when the line is the limit, and
  * it is the whole win when it is not.
  */
-const DEFAULT_CONNECTIONS = 4
+const DEFAULT_CONNECTIONS = 8
+
+/** Reconnects one range gets, without progress in between, before its file's attempt fails. */
+const PART_ATTEMPTS = 5
 
 /**
  * Smallest slice worth giving its own connection.
@@ -254,6 +258,8 @@ class DownloadQueue extends EventEmitter {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       const outcome = await this.attempt(item, attempt)
       if (outcome.settled) return
+      // The reason was only ever shown in the row, where the next attempt overwrote it.
+      logger.warn('download', `${item.filename}: attempt ${attempt} of ${MAX_ATTEMPTS} failed`, { error: outcome.error })
 
       // Back off, but stay responsive to a cancel arriving mid-wait.
       const delay = Math.min(30_000, 2 ** (attempt - 1) * 1000)
@@ -331,7 +337,8 @@ class DownloadQueue extends EventEmitter {
       await this.finalise(item, partial, partsFile)
       return { settled: true, error: '' }
     } catch (err) {
-      this.active.delete(item.id)
+      // Only if this attempt is still the registered one: a pause may have replaced it already.
+      if (this.active.get(item.id) === controller) this.active.delete(item.id)
       this.speeds.delete(item.id)
 
       if (controller.signal.aborted) {
@@ -383,6 +390,19 @@ class DownloadQueue extends EventEmitter {
       .catch(() => null)
 
     if (saved && saved.url === item.url && saved.parts.length) {
+      /*
+       * The record is only as good as the data beside it.
+       *
+       * One that outlived its file — a cancel that deleted the partial while a stream was still
+       * writing the record — would otherwise resume into holes, and the holes would only surface
+       * as a checksum failure at the end of a hundred-gigabyte download.
+       */
+      const size = await fsp.stat(partial).then((st) => st.size).catch(() => -1)
+      const furthest = Math.max(...saved.parts.map((p) => p.start + p.done))
+      if (size < furthest) {
+        await fsp.rm(partsFile, { force: true }).catch(() => undefined)
+        return this.planTransfer(item, partial, partsFile, headers, signal)
+      }
       const have = saved.parts.reduce((a, p) => a + p.done, 0)
       if (have >= saved.total) return { total: saved.total, parts: saved.parts, resumeAt: have, alreadyComplete: true }
       return { total: saved.total, parts: saved.parts, resumeAt: have, alreadyComplete: false }
@@ -471,37 +491,96 @@ class DownloadQueue extends EventEmitter {
       }
     }
 
-    await Promise.all(
-      parts.map(async (part) => {
-        if (part.done > part.end - part.start) return
+    /*
+     * Every range stops when this attempt stops.
+     *
+     * A failed range used to fail the attempt while its siblings carried on: nothing aborted
+     * them, so the retry's streams and the abandoned ones downloaded the same bytes side by side,
+     * each writing its own progress and speed into the same row — which is what made the numbers
+     * flicker — and Pause and Cancel only ever reached the newest set. Every retry added four
+     * more, and a cancelled download kept filling the disk.
+     */
+    const local = new AbortController()
+    const onAbort = (): void => local.abort()
+    if (signal.aborted) local.abort()
+    else signal.addEventListener('abort', onAbort, { once: true })
 
-        const from = part.start + part.done
-        if (from > part.end) return
-
-        const res = await fetch(item.url, {
-          headers: { ...headers, Range: `bytes=${from}-${part.end}` },
-          signal,
-          redirect: 'follow'
-        })
-
-        // A server that ignores the range would send the whole file down every part.
-        if (res.status !== 206) throw new Error(`HTTP ${res.status} (expected a partial response)`)
-        if (!res.body) throw new Error('No response body')
-
-        const handle = await fsp.open(partial, 'r+')
-        try {
-          let position = from
-          for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
-            await handle.write(chunk, 0, chunk.length, position)
-            position += chunk.length
-            part.done += chunk.length
-            await report()
-          }
-        } finally {
-          await handle.close()
-        }
+    const fetchRange = async (part: PartState): Promise<void> => {
+      const from = part.start + part.done
+      const res = await fetch(item.url, {
+        headers: { ...headers, Range: `bytes=${from}-${part.end}` },
+        signal: local.signal,
+        redirect: 'follow'
       })
-    )
+
+      // A server that ignores the range would send the whole file down every part.
+      if (res.status !== 206) {
+        await res.body?.cancel().catch(() => undefined)
+        throw new Error(`HTTP ${res.status} (expected a partial response)`)
+      }
+      if (!res.body) throw new Error('No response body')
+
+      const handle = await fsp.open(partial, 'r+')
+      try {
+        let position = from
+        for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+          await handle.write(chunk, 0, chunk.length, position)
+          position += chunk.length
+          part.done += chunk.length
+          await report()
+        }
+      } finally {
+        await handle.close()
+      }
+    }
+
+    /*
+     * A dropped connection costs one range a reconnect, not the whole file a restart.
+     *
+     * A CDN resets long transfers now and then, and any one of those used to send every range of
+     * the file back through a full retry. The count resets whenever a range makes progress, so a
+     * connection that moved a gigabyte before dropping reads as a flaky line, not a dead range.
+     */
+    const runPart = async (part: PartState): Promise<void> => {
+      let failures = 0
+      while (part.start + part.done <= part.end) {
+        const before = part.done
+        try {
+          await fetchRange(part)
+        } catch (err) {
+          if (local.signal.aborted) throw err
+          const message = err instanceof Error ? err.message : String(err)
+          failures = part.done > before ? 1 : failures + 1
+          const refused = /HTTP 4\d\d/.test(message) && !/HTTP (408|425|429)/.test(message)
+          if (refused || failures >= PART_ATTEMPTS) throw err
+          logger.warn('download', `${item.filename}: range at ${part.start + part.done} dropped, reconnecting`, { message })
+          const wait = Math.min(8000, 500 * 2 ** failures)
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, wait)
+            local.signal.addEventListener(
+              'abort',
+              () => {
+                clearTimeout(timer)
+                resolve()
+              },
+              { once: true }
+            )
+          })
+        }
+      }
+    }
+
+    const tasks = parts.map(runPart)
+    try {
+      await Promise.all(tasks)
+    } catch (err) {
+      // Stop the siblings and wait for them to let go of the file before anything retries.
+      local.abort()
+      await Promise.allSettled(tasks)
+      throw err
+    } finally {
+      signal.removeEventListener('abort', onAbort)
+    }
 
     const done = totalDone()
     this.setProgress(item.id, done)

@@ -106,12 +106,21 @@ function groupDownloads(list: DownloadItem[]): DownloadGroup[] {
     const key = downloadGroupKey(d)
     groups.set(key, [...(groups.get(key) ?? []), d])
   }
-  const live = ['queued', 'downloading', 'verifying', 'paused']
+  // A failed part keeps its model on screen: the row is the only place to resume it from.
+  const live = ['queued', 'downloading', 'verifying', 'paused', 'failed']
   const out: DownloadGroup[] = []
   for (const [key, items] of groups) {
     if (!items.some((d) => live.includes(d.status))) continue
     const has = (st: string): boolean => items.some((d) => d.status === st)
-    const status = has('downloading') ? 'downloading' : has('verifying') ? 'verifying' : has('queued') ? 'queued' : 'paused'
+    const status = has('downloading')
+      ? 'downloading'
+      : has('verifying')
+        ? 'verifying'
+        : has('queued')
+          ? 'queued'
+          : has('paused')
+            ? 'paused'
+            : 'failed'
     out.push({
       key,
       label: key.split('::')[1] ?? key,
@@ -302,11 +311,11 @@ export default function Discover({ onDownloaded }: { onDownloaded: () => Promise
                       {g.partsDone} of {g.parts} parts
                     </span>
                   )}
-                  {g.status !== 'paused' && (
+                  {['downloading', 'queued', 'verifying'].includes(g.status) && (
                     <button onClick={() => act(g, 'downloads:pause', ['downloading', 'queued'])}>Pause</button>
                   )}
-                  {g.items.some((d) => d.status === 'paused') && (
-                    <button onClick={() => act(g, 'downloads:resume', ['paused'])}>Resume</button>
+                  {g.items.some((d) => d.status === 'paused' || d.status === 'failed') && (
+                    <button onClick={() => act(g, 'downloads:resume', ['paused', 'failed'])}>Resume</button>
                   )}
                   <button
                     className="danger"

@@ -504,6 +504,19 @@ export interface AppSettings {
     /** Tokens drafted per step. */
     nMax: number
   }
+  runtime: {
+    /**
+     * How model weights are read.
+     *
+     * llama.cpp memory-maps by default, which is right when the weights end up on the GPU and
+     * wrong when a mixture-of-experts model reads gigabytes of experts from system RAM on every
+     * token: a mapped page the OS has reclaimed becomes a fault and a disk read mid-answer.
+     * 'auto' loads them into ordinary memory when the plan says they fit and maps them otherwise.
+     */
+    loadMode: 'auto' | 'ram' | 'mmap'
+    /** CPU threads for generation; 0 lets llama.cpp choose, which counts physical cores. */
+    threads: number
+  }
   reasoning: {
     /**
      * Show the model its own reasoning from earlier turns, not only from the current one.
@@ -550,6 +563,8 @@ export interface AppSettings {
      * the line.
      */
     connections: number
+    /** Settings migration marker; see migrateDownloads. */
+    version?: number
   }
   video: {
     /**

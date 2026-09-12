@@ -232,6 +232,46 @@ export function logitsBufferBytes(arch: ModelArchInfo, batchSize: number): numbe
   return Math.min(batchSize, 512) * arch.vocabSize * 4
 }
 
+/** How full a plan may leave a device on a routed model. See `attempt` for why it is not 1. */
+const MOE_FIT_MARGIN = 0.92
+
+/**
+ * Compute-buffer cost of one block whose routed experts run on the CPU.
+ *
+ * A block placed on a GPU with its experts in system RAM has to hand each token's hidden state
+ * across to the host and take the result back, and llama.cpp reserves room for that in the
+ * compute buffer of the device holding the block — so the cost scales with how many such blocks
+ * a card ends up with, which is why it is charged per block rather than per device.
+ *
+ * Measured on Qwen3.8-Flash-Next at batch 512: 1,913 MiB of compute buffer on a card holding 43
+ * such blocks against 527 MiB on one holding 5, which is 36.5 MiB per block over a fixed base.
+ * That works out at about seven copies of a batch of hidden states, which is the shape the graph
+ * has — so it is expressed that way rather than as the raw megabytes, and follows the batch size
+ * and embedding width to other models.
+ */
+function hostExpertStaging(arch: ModelArchInfo, batchSize: number): number {
+  if (arch.expertCount <= 0) return 0
+  return 7 * batchSize * arch.embeddingLength * 4
+}
+
+/**
+ * What each participating device needs beyond the graph estimate above.
+ *
+ * Measured, not derived: a Qwen3.8-Flash-Next load that the planner sized at 12.3 GB against
+ * 13.4 GB of free VRAM died twice — once on the KV cache, once on the recurrent-state cache with
+ * 103 MiB left to find. Recurrent models allocate that state cache per device on top of the
+ * graph, and a routed model stages expert rows through buffers this estimate does not model at
+ * all. Both are charged here so a plan leaves room for them instead of discovering them at load.
+ *
+ * Erring high costs a little context or one expert layer. Erring low costs the whole load, which
+ * is why these round up rather than down.
+ */
+function deviceReserve(arch: ModelArchInfo): number {
+  const recurrent = (arch.ssmLayers ?? 0) > 0 ? 256 * MB : 0
+  const routed = arch.expertCount > 0 ? 384 * MB : 0
+  return recurrent + routed
+}
+
 /**
  * Can this device actually participate under the selected backend?
  *
@@ -459,11 +499,12 @@ function attempt(
     }
     const onGpu = costs.dense[il] + (expertsOnHost ? 0 : costs.experts[il])
     weightsOnGpu += onGpu
-    items.push(onGpu + kvPerBlock)
+    // Staging travels with the block, because that is where llama.cpp allocates it.
+    items.push(onGpu + kvPerBlock + (expertsOnHost ? hostExpertStaging(arch, batchSize) : 0))
     if (expertsOnHost) hostBytes += costs.experts[il]
   }
 
-  const compute = computeBufferBytes(arch, contextLength, batchSize, flashAttention)
+  const compute = computeBufferBytes(arch, contextLength, batchSize, flashAttention) + deviceReserve(arch)
   const logits = logitsBufferBytes(arch, batchSize)
 
   if (gpuLayers <= 0 || budgets.length === 0) {
@@ -482,8 +523,18 @@ function attempt(
   weightsOnGpu += costs.output
 
   const { counts, perGpu } = placeItems(items, budgets, compute, logits)
+  /*
+   * A routed model does not get to fill a card to the last megabyte.
+   *
+   * Its two largest allocations are the ones this engine models least well — the staging buffers
+   * above, and a compute buffer that has to be found in one contiguous piece after ten gigabytes
+   * of weights are already down. Plans that cleared the budget by a hundred megabytes failed at
+   * load repeatedly on exactly those. The margin costs one expert layer and turns a failed load
+   * into a slightly slower one.
+   */
+  const margin = arch.expertCount > 0 ? MOE_FIT_MARGIN : 1
   return {
-    fits: perGpu.every((need, i) => need <= budgets[i]),
+    fits: perGpu.every((need, i) => need <= budgets[i] * margin),
     perGpu,
     layerSplit: counts,
     hostBytes,
@@ -971,9 +1022,19 @@ export function planFit(
       }
       const cpuMoe = lo
 
-      const enough = Math.min(ceiling, Math.max(constraints.targetContext, Math.min(constraints.idealContext, ceiling)))
+      /*
+       * Context stops at the target here, where the other passes grow it to fill the card.
+       *
+       * What is left over is margin, on purpose. This is the path for a model whose experts are
+       * already in system RAM, so the VRAM that more cache would take is the same VRAM that keeps
+       * expert layers on the GPU — and the search above has spent as much of it on those as it
+       * can. Growing the cache into the rest sized a plan to the last megabyte of an estimate,
+       * which is how a 195,584-token plan for Qwen3.8-Flash-Next came to die on a 2 GB cache
+       * allocation on a card the planner believed had room. The longer-context trade is offered
+       * below instead of taken.
+       */
       const ctx = Math.min(
-        enough,
+        targetCtx,
         maxContextFor(arch, hw, budgets, kvType, totalLayers, batchSize, flashAttention, ceiling, cpuMoe)
       )
       const moved = costs.experts.slice(0, cpuMoe)
