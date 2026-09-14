@@ -52,6 +52,7 @@ import * as chats from '../chat/repo'
 import { APPDATA_DIR } from '../storage/paths'
 import { type CompactionHelper, type TranscriptItem } from './compaction'
 import { summariseTranscript } from './summarise'
+import { continuedMessage } from '@shared/continuation'
 
 export interface AgentOptions {
   cwd: string
@@ -684,9 +685,9 @@ Platform: Windows (PowerShell)${memoryBlock}`
    * the answer.
    */
   private absorb(message: AgentMessage, text: string, thinking: string): AgentMessage {
-    message.content += text
-    const more = thinking.trim()
-    if (more) message.reasoning = message.reasoning ? `${message.reasoning}\n\n${more}` : more
+    const grown = continuedMessage(message, text, thinking)
+    message.content = grown.content
+    message.reasoning = grown.reasoning
     return message
   }
 
@@ -822,7 +823,35 @@ Platform: Windows (PowerShell)${memoryBlock}`
      * belongs to. Without it the stream looks like any other reply and was drawn as a second
      * bubble under the first, snapping back into one only when the finished message arrived.
      */
-    if (extending) this.emit('continuing', { messageId: extending.id })
+    if (extending) {
+      this.emit('continuing', { messageId: extending.id })
+      /*
+       * A message stopped mid-thought takes its thinking with it, whatever the reasoning setting.
+       *
+       * llama.cpp resumes inside the thought when the final message has reasoning and no answer:
+       * it reopens the thinking block with that reasoning in it and leaves it open. Sent without
+       * the reasoning, the same message is an empty answer, and the model would start one instead.
+       */
+      const tail = this.history.at(-1)
+      if (tail?.role === 'assistant' && !extending.content && extending.reasoning) {
+        tail.reasoning_content = extending.reasoning
+      }
+    }
+
+    /**
+     * A stream's events until it ends, or until the turn is stopped.
+     *
+     * Stopping aborts the request, which makes the stream throw. That used to fall straight through
+     * to the turn's error handling and lose everything the step had written; ending quietly instead
+     * lets the step keep it.
+     */
+    const untilStopped = async function* <T>(events: AsyncIterable<T>): AsyncGenerator<T> {
+      try {
+        for await (const ev of events) yield ev
+      } catch (err) {
+        if (!signal.aborted) throw err
+      }
+    }
 
     let calls = 0
     try {
@@ -842,14 +871,16 @@ Platform: Windows (PowerShell)${memoryBlock}`
         // Spent on the first step: whatever follows is new text of its own, not a resumption.
         continueFinal = false
 
-        for await (const ev of llama.streamEvents({
-          messages: this.history,
-          tools: this.availableTools(),
-          signal,
-          continueFinal: resuming,
-          temperature: this.samplingTemperature ?? 0.6,
-          ...reasoningRequestFields(llama.loaded?.model.caps.reasoning, this.opts.reasoningChoice ?? null)
-        })) {
+        for await (const ev of untilStopped(
+          llama.streamEvents({
+            messages: this.history,
+            tools: this.availableTools(),
+            signal,
+            continueFinal: resuming,
+            temperature: this.samplingTemperature ?? 0.6,
+            ...reasoningRequestFields(llama.loaded?.model.caps.reasoning, this.opts.reasoningChoice ?? null)
+          })
+        )) {
           /*
            * Reported before anything else, and worth more here than in chat: an agent turn
            * carries the whole tool-result history, so re-reading the prompt is often the
@@ -896,6 +927,44 @@ Platform: Windows (PowerShell)${memoryBlock}`
           } else if (ev.type === 'tool_call') {
             toolCalls.push({ id: ev.call.id, name: ev.call.name, args: ev.call.args })
           }
+        }
+
+        /*
+         * Stopped part-way through: keep what had been written, thinking included.
+         *
+         * Unfinished tool calls are dropped — half a call cannot be run — but the words and the
+         * thought so far are saved as they stood, untrimmed, so Continue can pick them up exactly
+         * where they stopped, down to the middle of a word.
+         */
+        if (signal.aborted) {
+          if (text || thinking) {
+            const partial: AgentMessage = extending
+              ? this.absorb(extending, text, thinking)
+              : {
+                  id: crypto.randomBytes(6).toString('hex'),
+                  role: 'assistant',
+                  content: text,
+                  reasoning: thinking || undefined,
+                  createdAt: Date.now()
+                }
+            if (extending) {
+              const tail = this.history.at(-1)
+              if (tail?.role === 'assistant') {
+                tail.content = partial.content
+                if (this.opts.preserveReasoning && partial.reasoning) tail.reasoning_content = partial.reasoning
+              }
+            } else {
+              session.messages.push(partial)
+              this.history.push({
+                role: 'assistant',
+                content: text,
+                ...(this.opts.preserveReasoning && thinking ? { reasoning_content: thinking } : {})
+              })
+            }
+            this.emit('message', partial)
+          }
+          this.emit('done', 'aborted')
+          return
         }
 
         // A model that ignored the tools API but emitted JSON as prose still counts.

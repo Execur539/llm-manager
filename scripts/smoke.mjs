@@ -48,6 +48,7 @@ const {
   instructionsFor
 } = await import('./built/compaction.js')
 const { isVirtualAdapter, classifyProbeError, verdictFor, mergeDetection, parseNvidiaCsv } = await import('./built/gpu.js')
+const { continuedMessage } = await import('./built/continuation.js')
 const { exportFilename, uniquePath } = await import('./built/filenames.js')
 const { detectReasoning, reasoningRequestFields } = await import('./built/reasoning.js')
 
@@ -979,6 +980,23 @@ section('Compaction helper: chunks, progress, loops and placement')
   check('an empty conversation keeps nothing', keepRecent([], 100) === 0)
   check('a chat is summarised as a conversation, not as a log of work',
     /conversation/i.test(instructionsFor('chat').chunk) && instructionsFor('chat').merge !== instructionsFor('agent').merge)
+}
+
+section('Continue: picking up exactly where it stopped')
+{
+  const mid = continuedMessage({ content: '', reasoning: 'The user wants a sched' }, '', 'ule, so I will')
+  check('a thought stopped mid-word carries straight on', mid.reasoning === 'The user wants a schedule, so I will' && mid.content === '',
+    JSON.stringify(mid))
+  const thenAnswer = continuedMessage({ content: '', reasoning: 'Thinking' }, 'The answer.', ' more.')
+  check('the answer after a resumed thought becomes the content', thenAnswer.content === 'The answer.' && thenAnswer.reasoning === 'Thinking more.',
+    JSON.stringify(thenAnswer))
+  const answer = continuedMessage({ content: 'Half an ans', reasoning: 'Earlier thought' }, 'wer.', '')
+  check('an answer stopped mid-word carries straight on, its thinking untouched',
+    answer.content === 'Half an answer.' && answer.reasoning === 'Earlier thought')
+  const again = continuedMessage({ content: 'Answer.', reasoning: 'First thought' }, ' More.', '  Second thought  ')
+  check('new thinking after an existing answer is a new paragraph', again.reasoning === 'First thought\n\nSecond thought')
+  const none = continuedMessage({ content: 'Answer.' }, ' More.', '')
+  check('no thinking stays no thinking', none.reasoning === undefined && none.content === 'Answer. More.')
 }
 
 section('Batch and micro-batch sizes')

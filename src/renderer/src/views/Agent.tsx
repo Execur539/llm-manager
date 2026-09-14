@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AgentMessage, ToolCall, ToolResult } from '@shared/types'
+import { continuedMessage } from '@shared/continuation'
 import { invoke, fmtDuration } from '../lib/api'
 import {
   select,
@@ -38,6 +39,43 @@ import PendingToolCall from '../components/PendingToolCall'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
+
+/**
+ * An answer being continued, drawn with what has arrived so far folded in.
+ *
+ * Folded exactly as the main process folds it (see continuedMessage), so nothing moves when the
+ * finished copy replaces this one. A message stopped mid-thought resumes inside its thinking block,
+ * which stays live until the answer starts.
+ */
+function ContinuingMessage({
+  message,
+  partial,
+  reasoning,
+  progress
+}: {
+  message: AgentMessage
+  partial: string
+  reasoning: string
+  progress: Parameters<typeof PromptProgress>[0] | null
+}): JSX.Element {
+  const grown = continuedMessage(message, partial, reasoning)
+  const insideThinking = !message.content && !!message.reasoning
+  return (
+    <>
+      {grown.reasoning && (
+        <ThinkingBlock
+          text={grown.reasoning}
+          streaming={insideThinking || !!reasoning}
+          answerStarted={!!grown.content}
+        />
+      )}
+      <div className="continuing" data-testid="continuing-message">
+        <Markdown source={grown.content} caret />
+      </div>
+      {progress && !partial && !reasoning && <PromptProgress {...progress} />}
+    </>
+  )
+}
 
 /** Collapsed by default; one line of summary, expanding to arguments and full output. */
 function ToolCard({ call, result }: { call: ToolCall; result?: ToolResult }): JSX.Element {
@@ -592,25 +630,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                   }
                 />
               ) : m.role === 'assistant' && m.id === extendingId ? (
-                /*
-                 * An answer being continued, with the new text written onto its end as it arrives.
-                 *
-                 * The same joins the main process makes when it folds the text in, so the message
-                 * does not shift when the finished copy replaces this one.
-                 */
-                <>
-                  {(m.reasoning || reasoning) && (
-                    <ThinkingBlock
-                      text={m.reasoning && reasoning ? `${m.reasoning}\n\n${reasoning}` : m.reasoning || reasoning}
-                      streaming={!!reasoning}
-                      answerStarted={!!partial}
-                    />
-                  )}
-                  <div className="continuing" data-testid="continuing-message">
-                    <Markdown source={m.content + partial} caret />
-                  </div>
-                  {progress && !partial && <PromptProgress {...progress} />}
-                </>
+                <ContinuingMessage message={m} partial={partial} reasoning={reasoning} progress={progress} />
               ) : m.role === 'assistant' ? (
                 <>
                   {m.reasoning && <ThinkingBlock text={m.reasoning} />}

@@ -22,7 +22,8 @@ await build({
     workflow: path.join(ROOT, 'src/main/agent/tools/workflow.ts'),
     queue: path.join(ROOT, 'src/main/downloads/queue.ts'),
     ultra: path.join(ROOT, 'src/main/ultra/index.ts'),
-    markdown: path.join(ROOT, 'src/renderer/src/lib/markdown.ts')
+    markdown: path.join(ROOT, 'src/renderer/src/lib/markdown.ts'),
+    continuation: path.join(ROOT, 'src/shared/continuation.ts')
   },
   outdir: path.join(ROOT, 'scripts/built'),
   bundle: true,
