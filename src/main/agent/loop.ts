@@ -52,7 +52,8 @@ import * as chats from '../chat/repo'
 import { APPDATA_DIR } from '../storage/paths'
 import { type CompactionHelper, type TranscriptItem } from './compaction'
 import { summariseTranscript } from './summarise'
-import { continuedMessage } from '@shared/continuation'
+// Relative, not `@shared`: the main-process bundle has no such alias, so only type imports can use it.
+import { continuedMessage } from '../../shared/continuation'
 
 export interface AgentOptions {
   cwd: string
