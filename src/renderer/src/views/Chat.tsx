@@ -401,7 +401,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               className="attach-button"
               onClick={() => void attachments.pick()}
               disabled={locked || attachments.busy}
-              title="Attach images, video, audio, or text files"
+              title="Attach images, video, audio, or text files — or paste them into the message box"
               aria-label="Attach files"
               data-testid="attach-button"
             >
@@ -410,6 +410,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              onPaste={attachments.paste}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()

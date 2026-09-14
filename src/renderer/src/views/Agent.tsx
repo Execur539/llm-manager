@@ -753,7 +753,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
               className="attach-button"
               onClick={() => void attachments.pick()}
               disabled={busy || attachments.busy}
-              title="Attach images, video, audio, or text files"
+              title="Attach images, video, audio, or text files — or paste them into the message box"
               aria-label="Attach files"
               data-testid="attach-button"
             >
@@ -762,6 +762,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              onPaste={attachments.paste}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()

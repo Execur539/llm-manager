@@ -36,6 +36,7 @@ export function useAttachments(): {
   busy: boolean
   pick: () => Promise<void>
   addFiles: (files: FileList | File[]) => Promise<void>
+  paste: (e: React.ClipboardEvent) => void
   remove: (path: string) => void
   clear: () => void
 } {
@@ -125,14 +126,42 @@ export function useAttachments(): {
 
   addFilesRef.current = addFiles
 
+  /*
+   * Pasting into the composer attaches what was copied: a screenshot, an image copied from a
+   * browser, or files copied in the file manager.
+   *
+   * Only when the clipboard holds no plain text. Copying from Word or a web page carries the text
+   * and a picture of it together, and pasting that should give the text, as it always has.
+   */
+  const paste = useCallback((e: React.ClipboardEvent) => {
+    const data = e.clipboardData
+    if (!data || data.getData('text/plain')) return
+    const files = [...data.files]
+    if (!files.length) return
+    e.preventDefault()
+    void addFilesRef.current?.(files.map(namePasted))
+  }, [])
+
   return {
     items,
     busy,
     pick,
     addFiles,
+    paste,
     remove: (p) => setItems((prev) => prev.filter((a) => a.path !== p)),
     clear: () => setItems([])
   }
+}
+
+/**
+ * A pasted picture, named for what it is.
+ *
+ * Image data copied straight to the clipboard, like a screenshot, has no file behind it, and the
+ * browser calls every one `image.png`. Files copied in the file manager keep their own names.
+ */
+function namePasted(file: File): File {
+  if (window.api?.pathForFile?.(file) || !/^image\.[a-z0-9]+$/i.test(file.name)) return file
+  return new File([file], `pasted-${file.name}`, { type: file.type, lastModified: file.lastModified })
 }
 
 function fileToBase64(file: File): Promise<string> {
