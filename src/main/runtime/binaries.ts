@@ -81,10 +81,21 @@ export function childEnv(): NodeJS.ProcessEnv {
    * nothing and let the tool that needs it report that it is missing.
    */
   const dir = path.dirname(ffmpeg)
-  if (!path.isAbsolute(dir) || !fs.existsSync(dir)) return { ...process.env }
+
+  /*
+   * GPUs numbered the way nvidia-smi numbers them.
+   *
+   * CUDA picks its own order unless told otherwise, and on a mixed pair it is not nvidia-smi's: an
+   * RTX 5080 and RTX 4070 Ti came out with the 4070 Ti as CUDA0. The planner sizes each card from
+   * nvidia-smi's index while llama.cpp reads `--tensor-split` in CUDA's order, so every split on
+   * such a machine landed swapped — the 5080's share onto the 12 GB card — and loads that fit on
+   * paper ran out of memory. nvidia-smi lists GPUs in PCI bus order, so that is the order asked for.
+   */
+  const base = { ...process.env, CUDA_DEVICE_ORDER: 'PCI_BUS_ID' }
+  if (!path.isAbsolute(dir) || !fs.existsSync(dir)) return base
 
   return {
-    ...process.env,
+    ...base,
     PATH: `${dir}${path.delimiter}${process.env.PATH ?? ''}`
   }
 }

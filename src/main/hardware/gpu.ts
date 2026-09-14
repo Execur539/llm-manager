@@ -36,14 +36,37 @@ async function powershell(script: string, timeoutMs = 12000): Promise<string | n
   )
 }
 
-/** NVIDIA: exact free/total VRAM and utilisation. */
-async function detectNvidia(): Promise<GpuDevice[]> {
-  const out = await run('nvidia-smi', [
-    '--query-gpu=index,name,memory.total,memory.free,utilization.gpu',
-    '--format=csv,noheader,nounits'
-  ])
-  if (!out) return []
+/** What running a probe said: an answer, a missing tool, or a tool that did not answer. */
+export type ProbeOutcome = { status: 'ok'; stdout: string } | { status: 'absent' } | { status: 'failed'; reason: string }
 
+/**
+ * Tell "not installed" apart from "did not answer".
+ *
+ * Both used to come back as null, so an nvidia-smi that timed out while the driver was busy read
+ * exactly like a machine with no NVIDIA driver at all — and the app went on to plan every model for
+ * the CPU for the rest of the session. A missing executable is an answer; a timeout, a crash or a
+ * non-zero exit is not.
+ */
+export function classifyProbeError(err: unknown): ProbeOutcome {
+  const e = (err ?? {}) as { code?: string | number; killed?: boolean; signal?: string | null; message?: string }
+  if (e.code === 'ENOENT') return { status: 'absent' }
+  if (e.killed || e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT') return { status: 'failed', reason: 'timed out' }
+  if (typeof e.code === 'number') return { status: 'failed', reason: `exited with code ${e.code}` }
+  const first = typeof e.message === 'string' ? e.message.split('\n')[0].trim().slice(0, 160) : ''
+  return { status: 'failed', reason: first || 'failed' }
+}
+
+async function probe(cmd: string, args: string[], timeoutMs = 8000): Promise<ProbeOutcome> {
+  try {
+    const { stdout } = await exec(cmd, args, { timeout: timeoutMs, windowsHide: true })
+    return { status: 'ok', stdout }
+  } catch (err) {
+    return classifyProbeError(err)
+  }
+}
+
+/** nvidia-smi's CSV, one device per line. */
+export function parseNvidiaCsv(out: string): GpuDevice[] {
   const gpus: GpuDevice[] = []
   for (const line of out.split(/\r?\n/)) {
     const trimmed = line.trim()
@@ -67,6 +90,21 @@ async function detectNvidia(): Promise<GpuDevice[]> {
   return gpus
 }
 
+/** NVIDIA: exact free/total VRAM and utilisation, and whether nvidia-smi answered at all. */
+async function detectNvidia(): Promise<{ gpus: GpuDevice[]; outcome: ProbeOutcome }> {
+  const outcome = await probe('nvidia-smi', [
+    '--query-gpu=index,name,memory.total,memory.free,utilization.gpu',
+    '--format=csv,noheader,nounits'
+  ])
+  if (outcome.status !== 'ok') return { gpus: [], outcome }
+  const gpus = parseNvidiaCsv(outcome.stdout)
+  // Output that parses to nothing is not an answer either.
+  if (!gpus.length && outcome.stdout.trim()) {
+    return { gpus, outcome: { status: 'failed', reason: 'returned output that could not be read' } }
+  }
+  return { gpus, outcome }
+}
+
 /**
  * Vendor-neutral fallback via WMI + the driver registry key.
  *
@@ -74,7 +112,9 @@ async function detectNvidia(): Promise<GpuDevice[]> {
  * so we prefer HardwareInformation.qwMemorySize from the display class registry key, which
  * is a true 64-bit value.
  */
-async function detectGeneric(): Promise<GpuDevice[]> {
+async function detectGeneric(): Promise<{ gpus: GpuDevice[]; ok: boolean }> {
+  // WMI is Windows-only. Elsewhere there is nothing to ask, which is an answer rather than a failure.
+  if (process.platform !== 'win32') return { gpus: [], ok: true }
   const script = `
 $ErrorActionPreference='SilentlyContinue'
 $class='HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}'
@@ -95,11 +135,13 @@ Get-CimInstance Win32_VideoController | ForEach-Object {
 $out | ConvertTo-Json -Compress
 `
   const out = await powershell(script)
-  if (!out) return []
+  // No output at all is PowerShell failing; empty output is Windows listing no adapters.
+  if (out === null) return { gpus: [], ok: false }
+  if (!out.trim()) return { gpus: [], ok: true }
   try {
     const parsed = JSON.parse(out.trim())
     const list = Array.isArray(parsed) ? parsed : [parsed]
-    return list
+    const gpus = list
       .filter((g: { name?: string; bytes?: number }) => g && g.name && !isVirtualAdapter(g.name))
       // An adapter reporting no memory cannot be budgeted against, so it is not a compute device.
       .filter((g: { bytes?: number }) => Number(g.bytes) > 0)
@@ -113,8 +155,9 @@ $out | ConvertTo-Json -Compress
         utilisation: -1,
         freeIsMeasured: false
       }))
+    return { gpus, ok: true }
   } catch {
-    return []
+    return { gpus: [], ok: false }
   }
 }
 
@@ -146,12 +189,6 @@ function guessVendor(name: string): GpuDevice['vendor'] {
   return 'unknown'
 }
 
-/** Does a usable CUDA runtime exist? Presence of an NVIDIA adapter is not sufficient. */
-async function hasCuda(): Promise<boolean> {
-  const out = await run('nvidia-smi', ['--query-gpu=driver_version', '--format=csv,noheader'])
-  return !!out && out.trim().length > 0
-}
-
 export function pickBackend(gpus: GpuDevice[], cudaAvailable: boolean): Backend {
   if (cudaAvailable && gpus.some((g) => g.vendor === 'nvidia')) return 'cuda'
   if (gpus.some((g) => g.totalVram > 0)) return 'vulkan'
@@ -177,15 +214,45 @@ function mergeDevices(nvidia: GpuDevice[], generic: GpuDevice[]): GpuDevice[] {
   return [...nvidia, ...others.map((g, i) => ({ ...g, index: nvidia.length + i }))]
 }
 
-export async function detectHardware(): Promise<HardwareSnapshot> {
-  const [nvidia, generic, cuda, name] = await Promise.all([
-    detectNvidia(),
-    detectGeneric(),
-    hasCuda(),
-    cpuName()
-  ])
+/**
+ * Whether a detection is an answer or a guess.
+ *
+ * Provisional when a probe that should have spoken did not: nvidia-smi failing on a machine whose
+ * display adapters include an NVIDIA card, or Windows not listing adapters at all when nothing else
+ * answered either. A missing nvidia-smi on a machine with no NVIDIA card is a real answer, and so
+ * is an empty list that every probe agrees on.
+ */
+export function verdictFor(
+  nvidia: ProbeOutcome,
+  generic: { ok: boolean; gpus: GpuDevice[] }
+): NonNullable<HardwareSnapshot['detection']> {
+  if (nvidia.status === 'failed' && (!generic.ok || generic.gpus.some((g) => g.vendor === 'nvidia'))) {
+    return { state: 'provisional', reason: `nvidia-smi ${nvidia.reason}` }
+  }
+  if (!generic.ok && nvidia.status !== 'ok') {
+    return { state: 'provisional', reason: 'Windows did not list the display adapters' }
+  }
+  return { state: 'measured' }
+}
 
-  const gpus = mergeDevices(nvidia, generic)
+/**
+ * Keep a measured snapshot rather than replace it with a guess.
+ *
+ * A later detection that comes back provisional would otherwise tell a machine already seen with
+ * GPUs that it has none. The measured adapters stay, with the fresher memory figure from the new
+ * probe; a provisional result only ever replaces another provisional one.
+ */
+export function mergeDetection(previous: HardwareSnapshot | null, next: HardwareSnapshot): HardwareSnapshot {
+  if (next.detection?.state !== 'provisional' || !previous || previous.detection?.state === 'provisional') return next
+  return { ...previous, freeRam: next.freeRam, takenAt: next.takenAt }
+}
+
+export async function detectHardware(): Promise<HardwareSnapshot> {
+  const [nvidia, generic, name] = await Promise.all([detectNvidia(), detectGeneric(), cpuName()])
+
+  const gpus = mergeDevices(nvidia.gpus, generic.gpus)
+  // nvidia-smi answering with devices is what a usable CUDA runtime looks like; it was probed twice.
+  const cuda = nvidia.outcome.status === 'ok' && nvidia.gpus.length > 0
 
   return {
     gpus,
@@ -194,7 +261,8 @@ export async function detectHardware(): Promise<HardwareSnapshot> {
     cpuName: name,
     cpuThreads: os.cpus().length,
     backend: pickBackend(gpus, cuda),
-    takenAt: Date.now()
+    takenAt: Date.now(),
+    detection: verdictFor(nvidia.outcome, generic)
   }
 }
 
@@ -206,7 +274,7 @@ export async function detectHardware(): Promise<HardwareSnapshot> {
  * than trusting the cached figure.
  */
 export async function refreshFreeVram(snapshot: HardwareSnapshot): Promise<HardwareSnapshot> {
-  const nvidia = await detectNvidia()
+  const { gpus: nvidia } = await detectNvidia()
   if (!nvidia.length) return { ...snapshot, takenAt: Date.now() }
 
   const byName = new Map(nvidia.map((g) => [`${g.index}:${g.name}`, g]))

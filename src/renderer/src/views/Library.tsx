@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FitPlan, FitResult, ModelRecord } from '@shared/types'
 import { fmtBytes, invoke } from '../lib/api'
 import ConfirmDialog from '../components/ConfirmDialog'
 import Icon from '../components/Icon'
 import { Skeleton, Spinner } from '../components/Spinner'
+import { VramBars } from '../components/VramBar'
 import { toast } from '../lib/store'
 
 interface ImportResult {
@@ -97,6 +98,7 @@ function PlanCard({ plan, onLoad, busy }: { plan: FitPlan; onLoad: (p: FitPlan) 
           </>
         )}
       </dl>
+      <VramBars plan={plan} />
       <ul className="rationale">
         {plan.rationale.map((r, i) => (
           <li key={i}>{r}</li>
@@ -257,11 +259,14 @@ function AdvancedPlacement({
 export default function Library({
   models,
   onRefresh,
-  onLoaded
+  onLoaded,
+  detection = null
 }: {
   models: ModelRecord[]
   onRefresh: () => Promise<void>
   onLoaded: () => Promise<void>
+  /** Whether GPU detection has answered for certain; badges planned before it did are planned again. */
+  detection?: 'measured' | 'provisional' | null
 }): JSX.Element {
   const [selected, setSelected] = useState<ModelRecord | null>(null)
   const [fit, setFit] = useState<FitResult | { error: string } | null>(null)
@@ -288,15 +293,25 @@ export default function Library({
     void invoke<typeof disk>('library:disk').then(setDisk).catch(() => undefined)
   }, [models.length])
 
-  // Compute compatibility badges up front — the plan calls for them before loading, not after.
+  /*
+   * Compute compatibility badges up front — the plan calls for them before loading, not after.
+   *
+   * Each badge is computed once and kept, so one planned while GPU detection was still a guess is
+   * planned again when detection answers. Otherwise a library opened in the first seconds after
+   * launch goes on showing plans that leave out GPUs found a moment later.
+   */
+  const plannedUnder = useRef<Record<string, 'measured' | 'provisional' | null>>({})
   useEffect(() => {
     let cancelled = false
     void (async () => {
       for (const m of models) {
-        if (cancelled || fits[m.id]) continue
+        const stale = plannedUnder.current[m.id] === 'provisional' && detection !== 'provisional'
+        if (cancelled || (fits[m.id] && !stale)) continue
         try {
           const result = await invoke<FitResult | { error: string }>('autofit:plan', m.id)
-          if (!cancelled) setFits((prev) => ({ ...prev, [m.id]: result }))
+          if (cancelled) continue
+          plannedUnder.current[m.id] = detection
+          setFits((prev) => ({ ...prev, [m.id]: result }))
         } catch {
           /* skip this one */
         }
@@ -305,7 +320,7 @@ export default function Library({
     return () => {
       cancelled = true
     }
-  }, [models])
+  }, [models, detection])
 
   const select = async (m: ModelRecord): Promise<void> => {
     setSelected(m)
@@ -515,6 +530,13 @@ export default function Library({
               )}
               <CapBadges model={m} />
             </div>
+
+            {(() => {
+              // The plan this card would load with, drawn per GPU so a squeeze shows before opening it.
+              const fit = fits[m.id]
+              const plan = fit && !('error' in fit) ? (fit.chosen ?? fit.alternatives[0] ?? null) : null
+              return plan ? <VramBars plan={plan} compact /> : null
+            })()}
 
             {m.error && <div className="badge bad">{m.error}</div>}
 

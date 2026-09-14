@@ -267,6 +267,20 @@ export function clearSummary(chatId: string): void {
   run('UPDATE chats SET summary = NULL, summary_upto = NULL WHERE id = ?', chatId)
 }
 
+/** A conversation's stored summary and the last message it covers, without loading the messages. */
+export function getSummary(chatId: string): { summary: string; uptoMessageId: string } | null {
+  const row = get<{ summary: string | null; summary_upto: string | null }>(
+    'SELECT summary, summary_upto FROM chats WHERE id = ?',
+    chatId
+  )
+  return row?.summary && row.summary_upto ? { summary: row.summary, uptoMessageId: row.summary_upto } : null
+}
+
+/** How much context a conversation was last measured — or, straight after a compaction, estimated — to fill. */
+export function getContextUsed(chatId: string): number | null {
+  return get<{ context_used: number | null }>('SELECT context_used FROM chats WHERE id = ?', chatId)?.context_used ?? null
+}
+
 export function setContextUsed(chatId: string, tokens: number): void {
   run('UPDATE chats SET context_used = ? WHERE id = ?', Math.max(0, Math.round(tokens)), chatId)
 }

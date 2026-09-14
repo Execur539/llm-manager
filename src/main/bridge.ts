@@ -29,11 +29,11 @@ import type {
 } from '@shared/types'
 import { defaultModelsDir, exeDir, TOOL_OUTPUT_DIR } from './storage/paths'
 import { loadSettings, patchSettings } from './storage/settings'
-import { detectHardware, refreshFreeVram } from './hardware/gpu'
+import { detectHardware, mergeDetection, refreshFreeVram } from './hardware/gpu'
 import { scanLibrary, libraryDiskUsage } from './models/library'
 import { checkRelocation, keepInPlace, performMove } from './models/relocation'
 import { DEFAULT_CONSTRAINTS, planFit, verifyPrediction } from './autofit/engine'
-import { llama, type ContentPart, type CompletionOptions } from './runtime/llama'
+import { llama, estimateTokens, type ChatMessage, type ContentPart, type CompletionOptions } from './runtime/llama'
 import { missingBinaries, embeddingModelPath, vendorDiagnostics } from './runtime/binaries'
 import { Agent } from './agent/loop'
 import { killAllJobs } from './agent/tools/exec'
@@ -42,6 +42,9 @@ import { listCheckpoints, rewindTo, discardCheckpoints } from './agent/checkpoin
 import { mcpManager } from './agent/mcp'
 import { addMemory, allMemory, deleteMemory, updateMemory } from './agent/memory'
 import { searchModels, listFiles, groupVariants, recommendQuant, findMmprojFor, peekVariantArch } from './downloads/hf'
+import { summarizer, type SummarizerHandle } from './runtime/summarizer'
+import { chooseHelperPlacement, helperContext, helperVramNeed, keepRecent, type TranscriptItem } from './agent/compaction'
+import { summariseTranscript, COMPACTION_FAILED } from './agent/summarise'
 import { downloadQueue } from './downloads/queue'
 import { apiServer, requestQueue } from './api/server'
 import { tunnel } from './remote/tunnel'
@@ -194,8 +197,64 @@ export function modelsDir(): string {
   return loadSettings().modelsDir ?? defaultModelsDir()
 }
 
+/**
+ * The detection in flight, shared by everyone who asks while it runs.
+ *
+ * A detection is seconds of nvidia-smi and WMI, and at startup the dashboard, the library and the
+ * downloads page all ask at once — they should wait on one run rather than start one each.
+ */
+let detecting: Promise<HardwareSnapshot> | null = null
+/** Detections in a row that came back provisional, and when the next one may run. */
+let provisionalDetections = 0
+let nextDetectionAt = 0
+
+function detect(): Promise<HardwareSnapshot> {
+  detecting ??= detectHardware()
+    .then((fresh) => {
+      const merged = mergeDetection(hardware, fresh)
+      hardware = merged
+      if (merged.detection?.state === 'provisional') {
+        provisionalDetections++
+        // 5 s, 10 s, 20 s, 40 s, then once a minute: quick enough for a slow start, never a busy loop.
+        nextDetectionAt = Date.now() + Math.min(60_000, 5_000 * 2 ** (provisionalDetections - 1))
+        logger.warn('hardware', 'GPU detection got no answer; it will be retried', {
+          reason: merged.detection.reason,
+          attempt: provisionalDetections
+        })
+      } else {
+        provisionalDetections = 0
+      }
+      return merged
+    })
+    .finally(() => {
+      detecting = null
+    })
+  return detecting
+}
+
+/**
+ * The hardware snapshot, detected on first use.
+ *
+ * A provisional one — a detection that timed out, as opposed to one that found nothing — is
+ * detected again whenever a retry is due. The first snapshot used to be kept for the whole session,
+ * so a driver slow to answer at startup meant a machine with GPUs was planned for as if it had none
+ * until the app was restarted.
+ */
 async function getHardware(refresh = false): Promise<HardwareSnapshot> {
-  if (!hardware || refresh) hardware = await detectHardware()
+  if (!hardware || refresh) return detect()
+  if (hardware.detection?.state === 'provisional' && Date.now() >= nextDetectionAt) return detect()
+  return hardware
+}
+
+/**
+ * The snapshot to load a model against, detected again first if the last one was a guess.
+ *
+ * Loading against a provisional snapshot is how a machine with two GPUs ends up running a model on
+ * its CPU. One more detection costs a few seconds against that, so a load does not wait out the
+ * backoff.
+ */
+async function settledHardware(): Promise<HardwareSnapshot> {
+  if (!hardware || hardware.detection?.state === 'provisional') return detect()
   return hardware
 }
 
@@ -219,7 +278,18 @@ export function startHardwareRefresh(): void {
     void (async () => {
       if (!hardware) return
       try {
-        hardware = await refreshFreeVram(hardware)
+        /*
+         * A provisional snapshot is detected again, not refreshed.
+         *
+         * Refreshing re-reads the adapters already known, so a snapshot that missed the GPUs would
+         * have stayed without them however long the session ran.
+         */
+        if (hardware.detection?.state === 'provisional') {
+          if (Date.now() < nextDetectionAt) return
+          await detect()
+        } else {
+          hardware = await refreshFreeVram(hardware)
+        }
         emit('hardware:update', hardware)
       } catch {
         // A transient failure to read the GPU is not worth reporting; the next tick will do.
@@ -245,6 +315,7 @@ function getAgent(): Agent {
       commandTimeoutMs: s.agent.commandTimeoutMs,
       hardBlocksDisabled: s.agent.hardBlocksDisabled,
       compaction: s.agent.compaction,
+      compactionHelper: resolveCompactionHelper,
       hfToken: getHfToken(),
       remoteToolsEnabled: s.agent.remoteToolsEnabled,
       requestPermission: (req: PermissionRequest) =>
@@ -298,6 +369,7 @@ function getAgent(): Agent {
     agent.on('subToolCall', (c) => emit('agent:sub-tool-call', { sessionId: sid(), call: c }))
     agent.on('compacting', (info) => emit('agent:compacting', { sessionId: sid(), ...(info as object) }))
     agent.on('compacted', (info) => emit('agent:compacted', { sessionId: sid(), ...(info as object) }))
+    agent.on('compactionProgress', (p) => emit('agent:compaction-progress', { sessionId: sid(), ...(p as object) }))
     agent.on('done', (reason) => {
       /*
        * Persisted once the turn is over, not while it runs.
@@ -359,6 +431,180 @@ function persistPermissionRules(): void {
 }
 
 /** Size of the multimodal projector loaded alongside a model, if it has one. */
+/**
+ * The small model compaction should use instead of the loaded one, started if need be.
+ *
+ * Null whenever the loaded model should do it after all: the option is off, nothing is picked,
+ * the pick is not in the library or is the model already loaded, or the helper would not start.
+ * Each of those falls back rather than failing, because the compaction has to happen either way.
+ */
+async function resolveCompactionHelper(): Promise<SummarizerHandle | null> {
+  const s = loadSettings()
+  const choice = s.agent.summarizer
+  if (!choice?.enabled || !choice.modelId) return null
+  const model = library.find((m) => m.id === choice.modelId || m.filename === choice.modelId)
+  if (!model?.arch) {
+    logger.warn('compaction', 'summariser model is not in the library; the loaded model will summarise', {
+      modelId: choice.modelId
+    })
+    return null
+  }
+  if (llama.loaded?.model.path === model.path) return null
+
+  try {
+    const hw = await refreshFreeVram(await getHardware())
+    hardware = hw
+    // The user's headroom is kept for the desktop here too, exactly as the planner keeps it.
+    const headroom = s.autoFit.headroomMb * 1024 * 1024
+    const gpus =
+      hw.backend === 'cuda'
+        ? hw.gpus
+            .filter((g) => g.vendor === 'nvidia' && g.freeIsMeasured)
+            .map((g) => ({ index: g.index, name: g.name, freeBytes: g.freeVram - headroom }))
+        : []
+    const need = helperVramNeed(model.arch, model.bytes, helperContext(model.arch))
+    const placement = chooseHelperPlacement(need, gpus, choice.placement)
+    return await summarizer.ensure(model, placement, hw.backend)
+  } catch (err) {
+    logger.warn('compaction', 'summariser did not start; the loaded model will summarise', {
+      error: err instanceof Error ? err.message : String(err)
+    })
+    return null
+  }
+}
+
+/**
+ * Media parts are charged a flat rate, as the agent charges them: an image is sent as a data URL,
+ * and measuring that as text would value one photo at hundreds of thousands of tokens.
+ */
+const MEDIA_TOKEN_ESTIMATE = 1200
+
+/**
+ * The messages a chat's prompt is built from: its stored summary in place of the messages that
+ * summary covers, then everything after them word for word.
+ *
+ * A summary whose last message is no longer in the history describes nothing that is, so it is
+ * left out. It rides on the first kept message when that one is the user's, so the roles still
+ * alternate — some chat templates refuse two user turns in a row.
+ */
+function chatPromptHistory(chatId: string, history: AgentMessage[], preserveReasoning: boolean): ChatMessage[] {
+  const stored = chats.getSummary(chatId)
+  const upto = stored ? history.findIndex((m) => m.id === stored.uptoMessageId) : -1
+  const out = (upto === -1 ? history : history.slice(upto + 1)).map(
+    (m): ChatMessage => ({
+      role: m.role === 'tool' ? 'user' : (m.role as 'user' | 'assistant' | 'system'),
+      content: m.content,
+      ...(preserveReasoning && m.role === 'assistant' && m.reasoning ? { reasoning_content: m.reasoning } : {})
+    })
+  )
+  if (stored && upto !== -1) {
+    const note = `[Summary of the earlier conversation]\n${stored.summary}`
+    const first = out[0]
+    if (first?.role === 'user' && typeof first.content === 'string') {
+      out[0] = { ...first, content: `${note}\n\n[The conversation continues]\n${first.content}` }
+    } else {
+      out.unshift({ role: 'user', content: note })
+    }
+  }
+  return out
+}
+
+interface ChatCompactionReport {
+  ok: boolean
+  message: string
+  beforeTokens?: number
+  afterTokens?: number
+}
+
+/**
+ * Summarise a chat's older messages so the conversation fits its window again.
+ *
+ * An automatic run only acts once the next prompt would pass three quarters of the window; a manual
+ * one acts whenever there is something to fold away. A quarter of the window is kept word for word.
+ * A summary already stored is summarised again along with the messages after it, so each compaction
+ * costs what has built up since the last one rather than the whole conversation.
+ *
+ * Never throws. A compaction that fails leaves the conversation as it was and the turn goes ahead —
+ * the server's own refusal describes an overfull window better than a guess made here.
+ */
+async function compactChat(
+  chatId: string,
+  history: AgentMessage[],
+  opts: { automatic: boolean; pendingTokens?: number; preserveReasoning: boolean; signal?: AbortSignal }
+): Promise<ChatCompactionReport> {
+  const loaded = llama.loaded
+  if (!loaded) return { ok: false, message: 'Load a model first — compacting needs one to summarise with.' }
+
+  const stored = chats.getSummary(chatId)
+  const upto = stored ? history.findIndex((m) => m.id === stored.uptoMessageId) : -1
+  const summary = upto === -1 ? null : stored
+  // A summary of messages that are no longer there describes nothing.
+  if (stored && !summary) chats.clearSummary(chatId)
+
+  const live = summary ? history.slice(upto + 1) : history
+  const costs = live.map(
+    (m) =>
+      estimateTokens(m.content) +
+      (opts.preserveReasoning && m.role === 'assistant' ? estimateTokens(m.reasoning ?? '') : 0)
+  )
+  const before = (summary ? estimateTokens(summary.summary) : 0) + costs.reduce((a, n) => a + n, 0)
+  const windowTokens = loaded.plan.contextLength || 8192
+
+  if (opts.automatic) {
+    /*
+     * The server's own count from the last turn wins when it is the larger.
+     *
+     * Characters over four undercounts code and anything that is not English prose, and a guess
+     * that is too low here is a request the server refuses, not a compaction a little early.
+     */
+    const measured = chats.getContextUsed(chatId) ?? 0
+    if (Math.max(before, measured) + (opts.pendingTokens ?? 0) <= windowTokens * 0.75) {
+      return { ok: false, message: 'There is still room in the context window.' }
+    }
+  }
+
+  const cut = keepRecent(costs, Math.max(1500, Math.floor(windowTokens * 0.25)))
+  const older = live.slice(0, cut)
+  if (older.length < (summary ? 1 : 2)) {
+    return { ok: false, message: 'Nothing to compact yet — the recent messages are all that is in the window.' }
+  }
+
+  const items: TranscriptItem[] = [
+    ...(summary ? [{ role: 'summary so far', text: summary.summary }] : []),
+    ...older.map((m) => ({ role: m.role, text: m.content }))
+  ]
+
+  let boundary: string | null = null
+  emit('chat:compacting', { chatId, automatic: opts.automatic })
+  try {
+    const helper = await resolveCompactionHelper()
+    const text = await summariseTranscript(items, {
+      kind: 'chat',
+      helper,
+      signal: opts.signal,
+      onProgress: (p) => emit('chat:compaction-progress', { chatId, ...p })
+    })
+    if (opts.signal?.aborted) return { ok: false, message: 'Compaction was stopped.' }
+    if (text === COMPACTION_FAILED) {
+      logger.warn('compaction', 'no pass produced a summary; the chat goes on with its full history', { chatId })
+      return { ok: false, message: 'Compaction failed — no summary came back, so nothing was changed.' }
+    }
+    boundary = older[older.length - 1].id
+    chats.setSummary(chatId, text, boundary)
+    const after = estimateTokens(text) + costs.slice(cut).reduce((a, n) => a + n, 0)
+    // An estimate until the next turn measures it, and far closer than the figure it replaces.
+    chats.setContextUsed(chatId, after)
+    emit('chat:context', { chatId, used: after, max: windowTokens })
+    return { ok: true, message: `Summarised ${older.length} messages.`, beforeTokens: before, afterTokens: after }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    logger.warn('compaction', 'chat compaction failed; the chat goes on with its full history', { chatId, error: message })
+    return { ok: false, message: `Compaction failed: ${message}` }
+  } finally {
+    emit('chat:compacted', { chatId, uptoMessageId: boundary })
+  }
+}
+
 function companionSize(model: ModelRecord): number {
   if (!model.caps.mmprojPath) return 0
   try {
@@ -491,7 +737,16 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
   if (!model) throw new Error(`Model not found: ${modelId}`)
   if (!model.arch) throw new Error(model.error ?? 'Model metadata could not be parsed')
 
-  const hw = await getHardware()
+  /*
+   * The compaction helper goes before anything is measured.
+   *
+   * It sits in memory the outgoing model left free and was placed against that model. Left
+   * running, it would count against the incoming model's free VRAM — a smaller context or more
+   * experts in system RAM, to keep a helper that is not in use.
+   */
+  await summarizer.stop()
+
+  const hw = await settledHardware()
   const fresh = await refreshFreeVram(hw)
   hardware = fresh
 
@@ -720,7 +975,10 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   },
 
   'settings:patch': (patch: Partial<AppSettings>) => {
+    const helperBefore = JSON.stringify(loadSettings().agent.summarizer)
     const next = patchSettings(patch)
+    // A changed helper choice applies at the next compaction, not to one chosen under the old setting.
+    if (JSON.stringify(next.agent.summarizer) !== helperBefore) void summarizer.stop()
     // Apply straight away so the agent never operates under superseded settings.
     syncAgentOptions()
     // Takes effect on the next file rather than mid-transfer, which is the only sane moment to
@@ -885,10 +1143,11 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     if (!model.arch) return { error: model.error ?? 'Model metadata could not be parsed' }
 
     const hw = await getHardware()
-    hardware = await refreshFreeVram(hw)
+    const fresh = await refreshFreeVram(hw)
+    hardware = fresh
 
     const s = loadSettings()
-    return planFit(model.arch, hardware, {
+    const result = planFit(model.arch, fresh, {
       ...DEFAULT_CONSTRAINTS,
       minKvType: s.autoFit.minKvType,
       preferredKvType: s.autoFit.preferredKvType,
@@ -899,12 +1158,30 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       companionBytes: companionSize(model),
       overrides: sanitizeOverrides(overrides)
     })
+    /*
+     * A plan made while detection is still a guess says so.
+     *
+     * Otherwise a CPU-only plan on a machine whose GPUs have not answered yet reads as the app's
+     * verdict on that machine. The library asks again once detection settles.
+     */
+    const detection = fresh.detection
+    return detection?.state === 'provisional'
+      ? {
+          ...result,
+          notes: [
+            `GPU detection has not finished (${detection.reason ?? 'no answer yet'}), so this plan may leave GPUs out. Detection is retried automatically.`,
+            ...result.notes
+          ]
+        }
+      : result
   },
 
   // ---- model runtime
   'model:load': (modelId: string, plan?: FitPlan) => loadModelById(modelId, plan),
   'model:unload': async () => {
     await llama.unload()
+    // The helper was placed in what this model left free; it is placed again against the next one.
+    await summarizer.stop()
     emit('model:status', null)
     return true
   },
@@ -972,7 +1249,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     if (!variant) throw new Error(`${variantId} not found in ${repo}`)
     return peekVariantArch(variant, getHfToken())
   },
-  'hf:download': async (repo: string, variantId: string) => {
+  'hf:download': async (repo: string, variantId: string, options?: { skipProjector?: boolean }) => {
     const files = await listFiles(repo, getHfToken())
     const variant = groupVariants(files).find((v) => v.id === variantId)
     if (!variant) throw new Error(`${variantId} not found in ${repo}`)
@@ -1000,7 +1277,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     )
 
     // Multimodal models are useless without their projector, so fetch it automatically.
-    const mmproj = findMmprojFor(files)
+    // Unless the caller has no use for one: a compaction helper only ever reads text.
+    const mmproj = options?.skipProjector ? null : findMmprojFor(files)
     if (mmproj) {
       queued.push(
         downloadQueue.enqueue({
@@ -1085,14 +1363,10 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      * Rebuilt from storage every turn, so this is the only way past reasoning can come back.
      *
      * With the setting on, each earlier answer carries the thinking that produced it, and
-     * `--reasoning-preserve` keeps the template from dropping all but the latest.
+     * `--reasoning-preserve` keeps the template from dropping all but the latest. The messages are
+     * built once any compaction has run — see chatPromptHistory.
      */
     const preserveReasoning = loadSettings().reasoning.preserve
-    const messages = history.map((m) => ({
-      role: m.role === 'tool' ? ('user' as const) : (m.role as 'user' | 'assistant' | 'system'),
-      content: m.content,
-      ...(preserveReasoning && m.role === 'assistant' && m.reasoning ? { reasoning_content: m.reasoning } : {})
-    }))
 
     let userContent: string | Awaited<ReturnType<typeof buildContent>>['parts'] = text
     const notes: string[] = []
@@ -1105,12 +1379,12 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      */
     let prepared = new Map<string, PreparedMedia>()
 
-    // RAG: prepend retrieved context when a collection is attached.
+    // RAG: retrieved context, placed after the history once compaction has settled what that is.
+    let ragContext = ''
     if (collectionId) {
       const hw = await getHardware()
       const hits = await rag.retrieve(text, hw.backend, { collectionId, chatId }, 6)
-      const context = rag.formatContext(hits)
-      if (context) messages.push({ role: 'system', content: context })
+      ragContext = rag.formatContext(hits)
     }
 
     /*
@@ -1190,6 +1464,23 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     inFlightChats.get(chatId)?.abort()
     const abort = new AbortController()
     inFlightChats.set(chatId, abort)
+
+    /*
+     * Room is made before the turn rather than after it fails.
+     *
+     * Chat had no compaction: once a conversation outgrew the window the server refused every
+     * request, and the only way on was a new chat. It is summarised the way an agent session is —
+     * the same passes, helper model and progress — before the prompt is built, and stopping the
+     * turn stops the compaction. The new message is costed but never summarised.
+     */
+    await compactChat(chatId, history, {
+      automatic: true,
+      pendingTokens: estimateTokens(text) + (attachments?.length ?? 0) * MEDIA_TOKEN_ESTIMATE,
+      preserveReasoning,
+      signal: abort.signal
+    })
+    const messages = chatPromptHistory(chatId, history, preserveReasoning)
+    if (ragContext) messages.push({ role: 'system', content: ragContext })
 
     const request: CompletionOptions = {
       messages: [...messages, { role: 'user', content: userContent }],
@@ -1506,6 +1797,21 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   'chat:stop': (chatId: string) => {
     inFlightChats.get(chatId)?.abort()
     return true
+  },
+  /**
+   * Compact a chat now, whatever it currently costs.
+   *
+   * The same pass a turn runs when the window is nearly full, on demand — so a long conversation
+   * can be made cheaper before the next question rather than while that question waits.
+   */
+  'chat:compact': async (chatId: string): Promise<ChatCompactionReport> => {
+    if (inFlightChats.has(chatId)) {
+      return { ok: false, message: 'A reply is still being written — stop it or let it finish first.' }
+    }
+    return compactChat(chatId, chats.loadMessages(chatId), {
+      automatic: false,
+      preserveReasoning: loadSettings().reasoning.preserve
+    })
   },
   'agent:stop': () => {
     agentTurnAbort?.abort()
@@ -2076,7 +2382,8 @@ export async function shutdown(): Promise<void> {
     remoteWeb.stop(),
     tunnel.stop(),
     closeBrowser(),
-    rag.embeddings.stop()
+    rag.embeddings.stop(),
+    summarizer.stop()
   ])
   certificates.clearRenewal()
   stopDdnsUpdates()

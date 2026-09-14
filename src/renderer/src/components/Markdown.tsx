@@ -1,5 +1,5 @@
-import { Fragment, type JSX, type ReactNode } from 'react'
-import { parseBlocks, parseInline, type Block } from '../lib/markdown'
+import { Fragment, memo, useRef, type JSX, type ReactNode } from 'react'
+import { parseBlocks, parseInline, streamingParser, type Block, type StreamingBlocks } from '../lib/markdown'
 
 /**
  * Minimal markdown renderer for assistant messages.
@@ -92,91 +92,130 @@ function renderList(
 }
 
 /**
- * The streaming caret.
+ * One block, with the streaming caret inside it when it is the last block still being written.
  *
- * It has to be rendered *inside* the last block, not after the markdown. Markdown blocks are
- * block-level elements, so a sibling `<span>` after the last `<p>` starts a new line — the
+ * The caret has to be rendered *inside* the last block, not after the markdown. Markdown blocks
+ * are block-level elements, so a sibling `<span>` after the last `<p>` starts a new line — the
  * caret sat one line below the text it was supposed to be trailing.
  */
-export default function Markdown({ source, caret = false }: { source: string; caret?: boolean }): JSX.Element {
-  const blocks = parseBlocks(source)
-  const lastIndex = blocks.length - 1
+function renderBlock(block: Block, key: string, tail: ReactNode): JSX.Element {
+  switch (block.kind) {
+    case 'heading': {
+      const Tag = `h${Math.min(block.level + 2, 6)}` as 'h3' | 'h4' | 'h5' | 'h6'
+      return (
+        <Tag className="md-heading" key={key}>
+          {renderInline(block.text, key)}
+          {tail}
+        </Tag>
+      )
+    }
+    case 'code':
+      return (
+        <pre className="md-pre" key={key}>
+          {block.lang && <span className="md-lang">{block.lang}</span>}
+          <code>
+            {block.lines.join('\n')}
+            {tail}
+          </code>
+        </pre>
+      )
+    case 'list':
+      return renderList(block, key, tail)
+    case 'quote':
+      return (
+        <blockquote className="md-quote" key={key}>
+          {renderInline(block.lines.join(' '), key)}
+          {tail}
+        </blockquote>
+      )
+    case 'table':
+      return (
+        <div className="md-table-wrap" key={key}>
+          <table className="md-table">
+            <thead>
+              <tr>
+                {block.header.map((h, hi) => (
+                  <th key={hi}>{renderInline(h, `${key}-h${hi}`)}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {block.rows.map((row, ri) => (
+                <tr key={ri}>
+                  {row.map((cell, ci) => (
+                    <td key={ci}>{renderInline(cell, `${key}-${ri}-${ci}`)}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {tail}
+        </div>
+      )
+    case 'hr':
+      return (
+        <Fragment key={key}>
+          <hr className="md-hr" />
+          {tail}
+        </Fragment>
+      )
+    default:
+      return (
+        <p className="md-p" key={key}>
+          {renderInline(block.lines.join('\n'), key)}
+          {tail}
+        </p>
+      )
+  }
+}
+
+/**
+ * One block of a reply that is still arriving.
+ *
+ * Memoised on the block object. The streaming parser hands back the same object for every block
+ * that has settled, so on each token React skips the paragraphs above the one being written instead
+ * of rebuilding them; only the blocks still being written arrive as new objects and render again.
+ * Settled and live blocks share this component and a key by position, so a block settling is not a
+ * remount either.
+ */
+const StreamedBlock = memo(function StreamedBlock({
+  block,
+  id,
+  caret
+}: {
+  block: Block
+  id: string
+  caret: boolean
+}): JSX.Element {
+  return renderBlock(block, id, caret ? <span className="cursor" /> : null)
+})
+
+function Markdown({ source, caret = false }: { source: string; caret?: boolean }): JSX.Element {
+  const parser = useRef<((source: string) => StreamingBlocks) | null>(null)
+
+  if (!caret) {
+    return <div className="markdown">{parseBlocks(source).map((block, i) => renderBlock(block, `b${i}`, null))}</div>
+  }
+
+  // While streaming, each token costs what it changed — see streamingParser.
+  parser.current ??= streamingParser()
+  const { settled, live } = parser.current(source)
+  const blocks = settled.length ? settled.concat(live) : live
 
   return (
     <div className="markdown">
-      {blocks.map((block, i) => {
-        const key = `b${i}`
-        // Only the final block trails the caret, and only while text is still arriving.
-        const tail = caret && i === lastIndex ? <span className="cursor" key={`${key}-caret`} /> : null
-        switch (block.kind) {
-          case 'heading': {
-            const Tag = `h${Math.min(block.level + 2, 6)}` as 'h3' | 'h4' | 'h5' | 'h6'
-            return (
-              <Tag className="md-heading" key={key}>
-                {renderInline(block.text, key)}
-                {tail}
-              </Tag>
-            )
-          }
-          case 'code':
-            return (
-              <pre className="md-pre" key={key}>
-                {block.lang && <span className="md-lang">{block.lang}</span>}
-                <code>
-                  {block.lines.join('\n')}
-                  {tail}
-                </code>
-              </pre>
-            )
-          case 'list':
-            return renderList(block, key, tail)
-          case 'quote':
-            return (
-              <blockquote className="md-quote" key={key}>
-                {renderInline(block.lines.join(' '), key)}
-                {tail}
-              </blockquote>
-            )
-          case 'table':
-            return (
-              <div className="md-table-wrap" key={key}>
-                <table className="md-table">
-                  <thead>
-                    <tr>
-                      {block.header.map((h, hi) => (
-                        <th key={hi}>{renderInline(h, `${key}-h${hi}`)}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {block.rows.map((row, ri) => (
-                      <tr key={ri}>
-                        {row.map((cell, ci) => (
-                          <td key={ci}>{renderInline(cell, `${key}-${ri}-${ci}`)}</td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                {tail}
-              </div>
-            )
-          case 'hr':
-            return (
-              <Fragment key={key}>
-                <hr className="md-hr" />
-                {tail}
-              </Fragment>
-            )
-          default:
-            return (
-              <p className="md-p" key={key}>
-                {renderInline(block.lines.join('\n'), key)}
-                {tail}
-              </p>
-            )
-        }
-      })}
+      {blocks.map((block, i) => (
+        <StreamedBlock key={`b${i}`} id={`b${i}`} block={block} caret={i === blocks.length - 1} />
+      ))}
     </div>
   )
 }
+
+/**
+ * Memoised on its props, so a finished message is not parsed again when something else changes.
+ *
+ * The transcript re-renders on every streamed token, because the streaming state lives in the same
+ * store — so without this, every earlier message in the conversation was re-parsed for every token
+ * of the one being written.
+ */
+export default memo(Markdown)

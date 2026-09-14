@@ -33,7 +33,20 @@ const { checkHardBlock, describeCall, PermissionEngine } = await import('./built
 const { readGguf, readGgufParts, extractArchInfo, tensorByteSize, isKnownGgmlType } = await import('./built/gguf.js')
 const { recommendQuant, findMmprojFor, groupVariants } = await import('./built/hf.js')
 const { buildGguf } = await import('./e2e/fixtures.mjs')
- const { isVirtualAdapter } = await import('./built/gpu.js')
+const {
+  planChunks,
+  chunkProgress,
+  groupForMerge,
+  looksLikeALoop,
+  chooseHelperPlacement,
+  helperContext,
+  usableChunkTokens,
+  HELPER_MAX_CONTEXT,
+  TOKEN_ESTIMATE_SAFETY,
+  keepRecent,
+  instructionsFor
+} = await import('./built/compaction.js')
+const { isVirtualAdapter, classifyProbeError, verdictFor, mergeDetection, parseNvidiaCsv } = await import('./built/gpu.js')
 const { exportFilename, uniquePath } = await import('./built/filenames.js')
 const { detectReasoning, reasoningRequestFields } = await import('./built/reasoning.js')
 
@@ -96,6 +109,12 @@ const gpu = (name, totalGb, freeGb, measured = true, index = 0) => ({
   utilisation: 5,
   freeIsMeasured: measured
 })
+
+/** Whether a plan's per-card parts add up to its per-card predictions, card for card. */
+const segmentsAddUp = (plan) =>
+  !!plan?.vramSegments &&
+  plan.vramSegments.length === plan.predictedVramPerGpu.length &&
+  plan.vramSegments.every((s, d) => Math.abs(s.weights + s.kv + s.compute - plan.predictedVramPerGpu[d]) < 1)
 
 // ---------------------------------------------------------------- auto-fit
 
@@ -344,6 +363,13 @@ section('Mixed rigs — only addressable devices take part')
   check('reaches a useful context', (plan?.contextLength ?? 0) >= 65536, `${plan?.contextLength}`)
   console.log(`  ${plan?.contextLength.toLocaleString()} ctx across ${plan?.tensorSplit.length} GPUs`)
 
+  // The memory bars are drawn from these, so they must agree with the totals printed beside them.
+  check('each card\'s share splits into parts that add up to its prediction', segmentsAddUp(plan), JSON.stringify(plan?.vramSegments))
+  check('the per-card figures name the cards they belong to, leaving out the excluded iGPU',
+    plan?.devices?.length === 2 && plan.devices[1].name === 'NVIDIA GeForce RTX 4070 Ti', JSON.stringify(plan?.devices))
+  check('the card with the output layer also carries the logits', (plan?.vramSegments?.[1]?.compute ?? 0) > (plan?.vramSegments?.[0]?.compute ?? 0))
+  check('every alternative names its cards too', result.alternatives.every((a) => a.devices?.length === 2))
+
   // Under Vulkan an iGPU is usable, but not while discrete cards are present.
   const vulkanMixed = planFit(arch, { ...mixed, backend: 'vulkan' }, DEFAULT_CONSTRAINTS)
   const vplan = vulkanMixed.chosen ?? vulkanMixed.alternatives[0]
@@ -378,6 +404,41 @@ section('Virtual display adapters are not GPUs')
   }
 }
 
+section('GPU detection: no answer is not the answer "no GPU"')
+{
+  check('a missing nvidia-smi is an answer', classifyProbeError({ code: 'ENOENT' }).status === 'absent')
+  const timedOut = classifyProbeError({ killed: true, signal: 'SIGTERM', code: null })
+  check('a timed-out nvidia-smi is a failure, not an absence', timedOut.status === 'failed' && timedOut.reason === 'timed out', JSON.stringify(timedOut))
+  check('a non-zero exit is a failure', classifyProbeError({ code: 6 }).status === 'failed')
+
+  const nvidiaCard = gpu('NVIDIA GeForce RTX 5080', 16, -1, false)
+  const amdCard = { ...gpu('AMD Radeon RX 7900 XTX', 24, -1, false), vendor: 'amd' }
+  const stalled = verdictFor({ status: 'failed', reason: 'timed out' }, { ok: true, gpus: [nvidiaCard] })
+  check('nvidia-smi timing out beside an NVIDIA adapter is provisional', stalled.state === 'provisional')
+  check('and the verdict says why', /timed out/.test(stalled.reason ?? ''), JSON.stringify(stalled))
+  check('nvidia-smi failing on an AMD-only machine is still an answer',
+    verdictFor({ status: 'failed', reason: 'timed out' }, { ok: true, gpus: [amdCard] }).state === 'measured')
+  check('no driver and no adapters is an answer: no GPU', verdictFor({ status: 'absent' }, { ok: true, gpus: [] }).state === 'measured')
+  check('no answer from either probe is provisional', verdictFor({ status: 'absent' }, { ok: false, gpus: [] }).state === 'provisional')
+  check('nvidia-smi answering is enough on its own', verdictFor({ status: 'ok', stdout: '' }, { ok: false, gpus: [] }).state === 'measured')
+
+  const measured = { ...hw([gpu('NVIDIA GeForce RTX 5080', 16, 14)]), freeRam: 30 * GB, detection: { state: 'measured' } }
+  const guess = { ...hw([], 'cpu'), freeRam: 20 * GB, takenAt: measured.takenAt + 1000, detection: { state: 'provisional', reason: 'nvidia-smi timed out' } }
+  const kept = mergeDetection(measured, guess)
+  check('a provisional detection never replaces a measured one',
+    kept.gpus.length === 1 && kept.backend === 'cuda' && kept.detection.state === 'measured', JSON.stringify(kept.detection))
+  check('though the fresher RAM figure is taken from it', kept.freeRam === 20 * GB)
+  const laterGuess = { ...guess, takenAt: guess.takenAt + 5000 }
+  check('a provisional detection replaces an earlier provisional one', mergeDetection(guess, laterGuess) === laterGuess)
+  check('a measured detection replaces a provisional one', mergeDetection(guess, measured) === measured)
+  check('the first detection is taken, whatever it is', mergeDetection(null, guess) === guess)
+
+  const parsed = parseNvidiaCsv('0, NVIDIA GeForce RTX 5080, 16303, 14800, 3\r\n1, NVIDIA GeForce RTX 4070 Ti, 12282, 11700, 0\n')
+  check('nvidia-smi CSV is read per device', parsed.length === 2 && parsed[1].name === 'NVIDIA GeForce RTX 4070 Ti')
+  check('in bytes, and marked measured', parsed[0].totalVram === 16303 * 1024 * 1024 && parsed[0].freeIsMeasured)
+  check('lines that are not devices are skipped', parseNvidiaCsv('No devices were found').length === 0)
+}
+
 section('Honest about unmeasurable hardware')
 {
   const amd = planFit(arch, hw([{ ...gpu('Radeon RX 7900 XTX', 24, -1, false), vendor: 'amd' }], 'vulkan'), DEFAULT_CONSTRAINTS)
@@ -385,6 +446,7 @@ section('Honest about unmeasurable hardware')
 
   const cpuOnly = planFit(arch, hw([], 'cpu'), DEFAULT_CONSTRAINTS)
   check('falls back to a CPU plan with no GPU', cpuOnly.chosen?.gpuLayers === 0)
+  check('a CPU plan names no cards to draw', cpuOnly.chosen?.devices?.length === 0, JSON.stringify(cpuOnly.chosen?.devices))
 }
 
 section('User overrides are respected, not overwritten')
@@ -798,6 +860,10 @@ section('MoE models keep their routed experts in system RAM first')
   check('but it is counted in system RAM', (rp?.predictedHostBytes ?? 0) - (c?.predictedHostBytes ?? 0) > 9 * GB)
   check('a set --n-cpu-moe is honoured exactly',
     planFit(flash, rig, { ...DEFAULT_CONSTRAINTS, overrides: { cpuMoeLayers: blocks } }).chosen?.cpuMoeLayers === blocks)
+  check('an MoE plan\'s per-card parts add up too', segmentsAddUp(c), JSON.stringify(c?.vramSegments))
+  check('and its weights are the weights it puts on the GPUs',
+    Math.abs((c?.vramSegments ?? []).reduce((a, s) => a + s.weights, 0) - (c?.weightsOnGpuBytes ?? -1)) < 1,
+    `${c?.weightsOnGpuBytes}`)
 }
 
 section('GGUF tensors are classed the way llama.cpp places them')
@@ -850,6 +916,68 @@ section('GGUF tensors are classed the way llama.cpp places them')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
+}
+
+section('Compaction helper: chunks, progress, loops and placement')
+{
+  const msg = (role, chars) => ({ role, text: 'x'.repeat(chars) })
+  const lineChars = (items) => items.reduce((a, m) => a + `${m.role}: ${m.text}\n`.length, 0)
+
+  // About 40K tokens in 200 messages.
+  const items = Array.from({ length: 200 }, (_, i) => msg(i % 2 ? 'assistant' : 'user', 800))
+  const big = planChunks(items, 30000)
+  check('a large transcript is cut into about ten passes', big.chunks.length >= 9 && big.chunks.length <= 11, `${big.chunks.length}`)
+  check('each pass is about a tenth of the whole', big.weights.every((w) => w > 0.05 && w <= 0.12), big.weights.map((w) => w.toFixed(3)).join(' '))
+  check('nothing is dropped', big.chunks.join('').length === lineChars(items))
+  check('passes break at message boundaries', big.chunks.every((c) => c.endsWith('\n')))
+
+  const tight = planChunks(items, 2500)
+  check('a window too small for a tenth takes smaller pieces, never larger',
+    tight.chunks.length > big.chunks.length && tight.chunks.every((c) => Math.ceil(c.length / 4) <= 2500), `${tight.chunks.length}`)
+
+  const huge = planChunks([msg('tool', 40000)], 2000)
+  check('a message bigger than the window is split, not dropped', huge.chunks.length === 6 && huge.chunks.join('').length === 40007, `${huge.chunks.length}`)
+
+  const short = planChunks(Array.from({ length: 10 }, () => msg('user', 400)), 30000)
+  check('a short transcript is not cut into slivers', short.chunks.length <= 2, `${short.chunks.length}`)
+
+  const w = big.weights
+  check('progress starts at zero', chunkProgress(w, 0) === 0)
+  check('progress rises with each pass', chunkProgress(w, 3) < chunkProgress(w, 6))
+  check('the passes stop short of 100, leaving the merge', chunkProgress(w, w.length) === 90, `${chunkProgress(w, w.length)}`)
+  check('a single-pass plan finishes at 100', chunkProgress([1], 1) === 100)
+
+  const parts = Array.from({ length: 20 }, () => 'y'.repeat(2000))
+  check('summaries that fit are merged in one pass', groupForMerge(parts, 30000).length === 1)
+  const rounds = groupForMerge(parts, 3000)
+  check('summaries that would overflow are merged in rounds, all kept', rounds.length > 1 && rounds.flat().length === 20, `${rounds.length}`)
+
+  check('a summary repeating a line is flagged', looksLikeALoop(Array(6).fill('The user asked to fix the build and the build was fixed.').join('\n')))
+  check('a long phrase loop is flagged', looksLikeALoop(Array(60).fill('and then the agent ran the tests again').join(' ')))
+  const dense = Array.from({ length: 40 }, (_, i) => `Step ${i}: edited src/module${i}.ts and ran suite ${i * 7} which passed ${i + 3} cases.`).join(' ')
+  check('a long ordinary summary is not flagged', !looksLikeALoop(dense))
+
+  const free = [
+    { index: 0, name: 'RTX 5080', freeBytes: 2.9 * GB },
+    { index: 1, name: 'RTX 4070 Ti', freeBytes: 4 * GB }
+  ]
+  const placed = chooseHelperPlacement(2.5 * GB, free, 'auto')
+  check('the helper goes to the GPU with the most room', placed.kind === 'gpu' && placed.index === 1, JSON.stringify(placed))
+  check('a helper that fits on no GPU runs on the CPU', chooseHelperPlacement(8 * GB, free, 'auto').kind === 'cpu')
+  check('preferring the GPU still yields rather than crowding the loaded model', chooseHelperPlacement(8 * GB, free, 'gpu').kind === 'cpu')
+  check('the CPU setting is honoured', chooseHelperPlacement(2.5 * GB, free, 'cpu').kind === 'cpu')
+  check('the helper window is capped, and never above what the model was trained for',
+    helperContext({ contextLength: 262144 }) === HELPER_MAX_CONTEXT && helperContext({ contextLength: 8192 }) === 8192)
+  check('a chunk leaves room for the instruction and the reply', usableChunkTokens(32768, 60) <= 32768 - 60 - 1024)
+  // Measured: a real agent transcript tokenised at 3.1x the character estimate.
+  check('chunks are sized for a tokenizer counting well past the measured 3.1x the estimate',
+    TOKEN_ESTIMATE_SAFETY > 3.1 && usableChunkTokens(65536, 60) * TOKEN_ESTIMATE_SAFETY <= 65536 - 60)
+
+  check('compaction keeps the most recent messages that fit its budget', keepRecent([100, 100, 100, 100], 250) === 2)
+  check('and the last two whatever they cost', keepRecent([10, 5000, 5000], 100) === 1)
+  check('an empty conversation keeps nothing', keepRecent([], 100) === 0)
+  check('a chat is summarised as a conversation, not as a log of work',
+    /conversation/i.test(instructionsFor('chat').chunk) && instructionsFor('chat').merge !== instructionsFor('agent').merge)
 }
 
 section('Byte formatting')

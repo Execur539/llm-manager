@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
 import type { HardwareSnapshot, ModelCapabilities, ModelRecord } from '@shared/types'
 import { invoke, on, isDesktop } from './lib/api'
 import Dashboard from './views/Dashboard'
@@ -42,6 +42,13 @@ const NAV: { id: View; label: string; group: string; icon: IconName }[] = [
 /** Views whose layout owns the full height and scrolls internally. */
 const FILL_VIEWS = new Set<View>(['chat', 'agent', 'documents'])
 
+/** The sidebar's width range when expanded, matching Unsloth Studio's. */
+const SIDEBAR_MIN = 260
+const SIDEBAR_MAX = 480
+const SIDEBAR_DEFAULT = 280
+
+const clampSidebar = (px: number): number => Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, Math.round(px)))
+
 export interface LoadedModel {
   model: string
   modelId: string
@@ -57,6 +64,86 @@ export default function App(): JSX.Element {
   const [models, setModels] = useState<ModelRecord[]>([])
   const [loaded, setLoaded] = useState<LoadedModel | null>(null)
   const [banner, setBanner] = useState<string | null>(null)
+  /*
+   * The sidebar collapsed to icons, remembered between launches.
+   *
+   * Storage can throw (a remote tab with site data blocked), and a collapse preference is not worth
+   * failing to render over, so both reads and writes fall back quietly.
+   */
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('llmm.sidebarCollapsed') === '1'
+    } catch {
+      return false
+    }
+  })
+  useEffect(() => {
+    try {
+      localStorage.setItem('llmm.sidebarCollapsed', collapsed ? '1' : '0')
+    } catch {
+      /* remembered for this session only */
+    }
+  }, [collapsed])
+
+  /* The expanded width, dragged from the sidebar's edge and remembered the same way. */
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try {
+      const stored = Number(localStorage.getItem('llmm.sidebarWidth'))
+      return stored ? clampSidebar(stored) : SIDEBAR_DEFAULT
+    } catch {
+      return SIDEBAR_DEFAULT
+    }
+  })
+  useEffect(() => {
+    // Written once the width settles rather than on every frame of a drag.
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem('llmm.sidebarWidth', String(sidebarWidth))
+      } catch {
+        /* remembered for this session only */
+      }
+    }, 250)
+    return () => clearTimeout(timer)
+  }, [sidebarWidth])
+
+  /*
+   * Follow the pointer from the edge, one layout per animation frame.
+   *
+   * Moving the edge reflows the whole main pane, so updating on every pointer event — several per
+   * frame on a high-rate mouse — would lay the page out more often than it can be painted.
+   * Capturing the pointer keeps the drag alive when it runs ahead of the handle.
+   */
+  const startResize = (e: ReactPointerEvent<HTMLDivElement>): void => {
+    if (e.button !== 0) return
+    e.preventDefault()
+    const handle = e.currentTarget
+    handle.setPointerCapture(e.pointerId)
+    const startX = e.clientX
+    const startWidth = sidebarWidth
+    let next = startWidth
+    let frame = 0
+    document.body.classList.add('resizing-sidebar')
+    const move = (ev: PointerEvent): void => {
+      next = clampSidebar(startWidth + ev.clientX - startX)
+      if (!frame) {
+        frame = requestAnimationFrame(() => {
+          frame = 0
+          setSidebarWidth(next)
+        })
+      }
+    }
+    const end = (): void => {
+      handle.removeEventListener('pointermove', move)
+      handle.removeEventListener('pointerup', end)
+      handle.removeEventListener('pointercancel', end)
+      if (frame) cancelAnimationFrame(frame)
+      setSidebarWidth(next)
+      document.body.classList.remove('resizing-sidebar')
+    }
+    handle.addEventListener('pointermove', move)
+    handle.addEventListener('pointerup', end)
+    handle.addEventListener('pointercancel', end)
+  }
 
   const refreshModels = useCallback(async () => {
     setModels(await invoke<ModelRecord[]>('library:scan'))
@@ -91,16 +178,31 @@ export default function App(): JSX.Element {
   const groups = [...new Set(NAV.map((n) => n.group))]
 
   return (
-    <div className="app">
+    <div
+      className={`app${collapsed ? ' sidebar-collapsed' : ''}`}
+      // Only while expanded: an inline width would override the collapsed rail's.
+      style={collapsed ? undefined : ({ '--sidebar-width': `${sidebarWidth}px` } as CSSProperties)}
+    >
       <nav className="sidebar">
         <div className="brand">
           <BrandMark />
           <span className="brand-name">LLM Manager</span>
           {!isDesktop && <span className="badge">remote</span>}
+          <button
+            type="button"
+            className="sidebar-toggle"
+            onClick={() => setCollapsed((c) => !c)}
+            title={collapsed ? 'Expand the sidebar' : 'Collapse the sidebar'}
+            aria-label={collapsed ? 'Expand the sidebar' : 'Collapse the sidebar'}
+            aria-expanded={!collapsed}
+            data-testid="sidebar-toggle"
+          >
+            <Icon name="sidebar" size={15} />
+          </button>
         </div>
 
         {groups.map((group) => (
-          <div key={group}>
+          <div key={group} className="nav-section">
             <div className="nav-group">{group}</div>
             {NAV.filter((n) => n.group === group).map((n) => (
               <button
@@ -108,6 +210,8 @@ export default function App(): JSX.Element {
                 type="button"
                 className={`nav-item ${view === n.id ? 'active' : ''}`}
                 onClick={() => setView(n.id)}
+                // With the labels hidden, the name has to be reachable some other way.
+                title={collapsed ? n.label : undefined}
                 aria-current={view === n.id ? 'page' : undefined}
               >
                 <Icon name={n.icon} />
@@ -117,7 +221,10 @@ export default function App(): JSX.Element {
           </div>
         ))}
 
-        <div className="sidebar-footer">
+        <div
+          className="sidebar-footer"
+          title={collapsed ? (loaded ? `Loaded: ${loaded.model}` : 'No model loaded') : undefined}
+        >
           {loaded ? (
             <>
               <div className="loaded-head" data-testid="model-loaded">
@@ -150,6 +257,32 @@ export default function App(): JSX.Element {
         </div>
       </nav>
 
+      {!collapsed && (
+        <div
+          className="sidebar-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize the sidebar"
+          aria-valuemin={SIDEBAR_MIN}
+          aria-valuemax={SIDEBAR_MAX}
+          aria-valuenow={sidebarWidth}
+          tabIndex={0}
+          title="Drag to resize · double-click to reset"
+          onPointerDown={startResize}
+          onDoubleClick={() => setSidebarWidth(SIDEBAR_DEFAULT)}
+          onKeyDown={(e) => {
+            const step = e.shiftKey ? 40 : 10
+            if (e.key === 'ArrowLeft') setSidebarWidth((w) => clampSidebar(w - step))
+            else if (e.key === 'ArrowRight') setSidebarWidth((w) => clampSidebar(w + step))
+            else if (e.key === 'Home') setSidebarWidth(SIDEBAR_MIN)
+            else if (e.key === 'End') setSidebarWidth(SIDEBAR_MAX)
+            else return
+            e.preventDefault()
+          }}
+          data-testid="sidebar-resizer"
+        />
+      )}
+
       {/* Chat-like views fill the pane; the rest scroll normally. */}
       <main className={`main${FILL_VIEWS.has(view) ? ' fill' : ''}`}>
         {banner && (
@@ -164,14 +297,21 @@ export default function App(): JSX.Element {
 
         <div className="page">
         {view === 'dashboard' && <Dashboard hardware={hardware} models={models} loaded={loaded} onNavigate={setView} />}
-        {view === 'library' && <Library models={models} onRefresh={refreshModels} onLoaded={refreshLoaded} />}
+        {view === 'library' && (
+          <Library
+            models={models}
+            onRefresh={refreshModels}
+            onLoaded={refreshLoaded}
+            detection={hardware?.detection?.state ?? null}
+          />
+        )}
         {view === 'discover' && <Discover onDownloaded={refreshModels} />}
         {view === 'chat' && <ChatView loaded={loaded} />}
         {view === 'agent' && <AgentView loaded={loaded} />}
         {view === 'documents' && <Documents />}
         {view === 'server' && <ServerView />}
         {view === 'remote' && <RemoteView />}
-        {view === 'settings' && <Settings />}
+        {view === 'settings' && <Settings models={models} onModelsChanged={refreshModels} />}
         </div>
       </main>
 

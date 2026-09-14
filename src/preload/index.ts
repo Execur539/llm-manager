@@ -23,6 +23,9 @@ const EVENT_CHANNELS = [
   'chat:context',
   'chat:message',
   'chat:notes',
+  'chat:compacting',
+  'chat:compaction-progress',
+  'chat:compacted',
   'agent:delta',
   'agent:reasoning',
   'agent:prompt-progress',
@@ -38,6 +41,7 @@ const EVENT_CHANNELS = [
   'agent:question',
   'agent:compacting',
   'agent:compacted',
+  'agent:compaction-progress',
   'agent:done',
   'agent:error',
   // Ultra's attempts, for both surfaces. The renderer subscribes to every channel in this list

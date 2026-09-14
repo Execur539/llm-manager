@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { HardwareSnapshot, ModelRecord } from '@shared/types'
 import { fmtBytes, invoke } from '../lib/api'
+import { Spinner } from '../components/Spinner'
 import type { LoadedModel, View } from '../App'
 
 interface LiveStats {
@@ -143,7 +144,29 @@ export default function Dashboard({
           )
         })}
 
-        {hardware && hardware.gpus.length === 0 && (
+        {/*
+          * Still asking is not the same answer as "none".
+          *
+          * A driver slow to answer at startup used to produce "No GPU detected" — a verdict the app
+          * then planned every model by. While detection is provisional the card says what is known
+          * and why, until a retry settles it.
+          */}
+        {hardware?.detection?.state === 'provisional' && (
+          <div className="card" data-testid="gpu-detecting">
+            <div className="card-title">
+              {hardware.gpus.length ? 'Confirming GPUs…' : 'Detecting GPUs…'}
+              <Spinner size={13} />
+            </div>
+            <div className="dim">
+              {hardware.detection.reason
+                ? `The GPU driver has not answered yet (${hardware.detection.reason}).`
+                : 'The GPU driver has not answered yet.'}{' '}
+              Retrying automatically; plans made before it answers may leave GPUs out.
+            </div>
+          </div>
+        )}
+
+        {hardware && hardware.gpus.length === 0 && hardware.detection?.state !== 'provisional' && (
           <div className="card">
             <div className="card-title">No GPU detected</div>
             <div className="dim">Inference will run on CPU. Expect a few tokens per second on larger models.</div>

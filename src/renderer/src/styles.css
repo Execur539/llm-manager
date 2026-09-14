@@ -29,6 +29,20 @@
   --text-dim: #a8a49a;
   --text-faint: #7e7a72;
 
+  /* ---- sidebar -------------------------------------------------------------
+   * A surface a step lighter than the page rather than darker, with one neutral
+   * pill for both hover and the current view — the arrangement Unsloth Studio's
+   * sidebar uses. The accent stays out of the navigation, so the brand mark is
+   * the one coloured thing in it.
+   */
+  --sidebar: #252422;
+  --sidebar-hover: #302e2b;
+  --sidebar-border: #2e2c29;
+  --nav-fg: #d2cec6;
+  --nav-fg-strong: #f0eee7;
+  --nav-label: #9a968d;
+  --nav-icon-idle: #6d6961;
+
   /* ---- accent --------------------------------------------------------------
    * Coral, and the only saturated colour in the interface.
    *
@@ -167,21 +181,83 @@ body {
 }
 
 .app {
+  --sidebar-width: 280px;
   display: grid;
-  grid-template-columns: 218px 1fr;
+  grid-template-columns: var(--sidebar-width) 1fr;
   height: 100%;
+}
+
+/*
+ * Icons only. Not animated: sliding the column would reflow the whole main pane on every frame,
+ * which in a long chat is exactly the jank a collapse is meant to get out of the way of.
+ */
+.app.sidebar-collapsed {
+  --sidebar-width: 52px;
+}
+
+/*
+ * The sidebar's edge, draggable between 260 and 480 px.
+ *
+ * Fixed rather than absolute, so the grid container needs no positioning of its own; it inherits
+ * the width variable from .app, so it sits on the edge wherever a drag has put it. The visible line
+ * appears only on hover, focus or mid-drag — at rest the edge is just the sidebar's border.
+ */
+.sidebar-resizer {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--sidebar-width) - 3px);
+  width: 6px;
+  z-index: 20;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.sidebar-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  background: transparent;
+  transition: background-color 120ms ease;
+}
+
+.sidebar-resizer:hover::after,
+.sidebar-resizer:focus-visible::after,
+.resizing-sidebar .sidebar-resizer::after {
+  background: var(--accent);
+}
+
+/* The accent line is the focus indicator here; the global ring would box a 6 px strip. */
+.sidebar-resizer:focus-visible {
+  outline: none;
+}
+
+/* Mid-drag the pointer keeps its shape, and nothing it passes over gets selected. */
+.resizing-sidebar,
+.resizing-sidebar * {
+  cursor: col-resize !important;
+  user-select: none !important;
 }
 
 /* ---------------------------------------------------------------- sidebar */
 
+/*
+ * Modelled on Unsloth Studio's sidebar: full-height rows with fully rounded pills, sentence-case
+ * section headers, and a collapsed state that keeps only the icons. The values follow its
+ * measurements; the rules are this app's own.
+ */
 .sidebar {
-  background: var(--bg-inset);
-  border-right: 1px solid var(--border);
+  background: var(--sidebar);
+  border-right: 1px solid var(--sidebar-border);
   display: flex;
   flex-direction: column;
-  padding: 12px 10px;
-  gap: 2px;
+  padding: 10px 8px;
+  gap: 1px;
   overflow-y: auto;
+  overflow-x: hidden;
 }
 
 /* ---- brand ---- */
@@ -189,11 +265,32 @@ body {
 .brand {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 8.5px;
   font-weight: 600;
-  font-size: 13.5px;
-  padding: 4px 6px 16px;
-  letter-spacing: 0.1px;
+  font-size: 14px;
+  color: var(--nav-fg-strong);
+  padding: 2px 2px 12px 6px;
+}
+
+/* A header action, square with soft corners rather than a pill, so it never reads as a nav row. */
+.sidebar-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  min-height: 0;
+  padding: 0;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--nav-icon-idle);
+}
+
+.sidebar-toggle:hover:not(:disabled) {
+  background: var(--sidebar-hover);
+  color: var(--nav-fg-strong);
 }
 
 /*
@@ -207,10 +304,10 @@ body {
 .brand-mark {
   display: grid;
   place-items: center;
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
   flex-shrink: 0;
-  border-radius: 8px;
+  border-radius: 50%;
   color: var(--on-accent);
   background: linear-gradient(148deg, var(--accent-hover) 0%, var(--accent) 58%, #c56245 100%);
   box-shadow:
@@ -223,6 +320,9 @@ body {
 .brand-name {
   flex: 1;
   min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ---- navigation ---- */
@@ -230,69 +330,106 @@ body {
 /*
  * Nav items are buttons, so the browser default styling has to be undone before ours applies.
  * They were divs: unreachable by keyboard and invisible to assistive technology.
+ *
+ * The hover rule carries `:not(:disabled)` for specificity, not for disabled items: the global
+ * `button:hover:not(:disabled)` outranks a plain `.nav-item:hover`, so the rows were quietly
+ * showing the generic button hover instead of their own.
  */
 .nav-item {
   display: flex;
   align-items: center;
   justify-content: flex-start;
-  gap: 10px;
+  gap: 8.5px;
   width: 100%;
-  padding: 7px 10px;
+  height: 33px;
+  min-height: 0;
+  padding: 0 10px 0 12px;
   border: none;
-  border-radius: var(--r-md);
+  border-radius: var(--r-pill);
   background: none;
-  color: var(--text-dim);
+  color: var(--nav-fg);
   font: inherit;
+  font-size: 13.6px;
+  line-height: 18px;
+  font-weight: 500;
   text-align: left;
+  white-space: nowrap;
   cursor: pointer;
   user-select: none;
   transition: background-color 110ms ease, color 110ms ease;
 }
 
-.nav-item .icon {
-  flex-shrink: 0;
-  color: var(--text-faint);
-  transition: color 110ms ease;
-}
-
-.nav-item:hover {
-  color: var(--text);
-  background: var(--surface-1);
-}
-
-.nav-item:hover .icon {
-  color: var(--text-dim);
+.nav-item > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /*
- * The active item is a filled pill rather than a left border. A border on a rounded item leaves
- * an awkward notch, and the pill reads as "you are here" at a glance from across the window.
+ * Nudged right with `translate` rather than `transform`, so the hover pop — which animates
+ * `transform` — scales the icon without snapping it back to its un-nudged position.
  */
+.nav-item .icon {
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  translate: 2px 0;
+  color: var(--nav-icon-idle);
+  transition: color 110ms ease;
+}
+
+.nav-item:hover:not(:disabled),
 .nav-item.active {
-  color: var(--text);
-  background: var(--accent-wash);
-  font-weight: 500;
+  background: var(--sidebar-hover);
+  color: var(--nav-fg-strong);
 }
 
+.nav-item:hover:not(:disabled) .icon,
 .nav-item.active .icon {
-  color: var(--accent);
+  color: var(--nav-fg-strong);
 }
 
+/* A brief lift on hover, so a row answers the pointer before it is clicked. */
+.nav-item:hover:not(:disabled) .icon {
+  animation: icon-pop 0.3s ease-out;
+}
+
+@keyframes icon-pop {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  45% {
+    transform: scale(1.08);
+  }
+}
+
+/*
+ * Section headers in sentence case at nearly the size of the items, in a muted grey: they read as
+ * headings for what follows rather than as small print to decode.
+ */
 .nav-group {
-  font-size: 9.5px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
-  color: var(--text-faint);
-  padding: 15px 10px 5px;
+  font-size: 13px;
+  line-height: 16px;
+  font-weight: 500;
+  color: var(--nav-label);
+  padding: 21px 12px 8px 14px;
+}
+
+.brand + .nav-section .nav-group {
+  padding-top: 6px;
 }
 
 /* ---- footer ---- */
 
+/*
+ * The loaded model sits in a bordered card at the foot of the sidebar, where Unsloth keeps its
+ * account row: always in view, and plainly not part of the navigation above it.
+ */
 .sidebar-footer {
   margin-top: auto;
-  padding: 12px 10px 4px;
-  border-top: 1px solid var(--border);
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
   font-size: 11px;
   color: var(--text-faint);
 }
@@ -354,6 +491,56 @@ body {
   align-items: center;
   gap: 7px;
   color: var(--text-faint);
+}
+
+/* ---- collapsed: icons only ---- */
+
+.sidebar-collapsed .sidebar {
+  padding: 10px 0;
+  align-items: center;
+}
+
+.sidebar-collapsed .brand {
+  flex-direction: column;
+  gap: 8px;
+  padding: 2px 0 10px;
+}
+
+.sidebar-collapsed .brand-name,
+.sidebar-collapsed .brand .badge,
+.sidebar-collapsed .nav-group,
+.sidebar-collapsed .nav-item > span,
+.sidebar-collapsed .loaded-label,
+.sidebar-collapsed .loaded-name,
+.sidebar-collapsed .loaded-meta,
+.sidebar-collapsed .sidebar-footer button.full,
+.sidebar-collapsed .loaded-empty span {
+  display: none;
+}
+
+.sidebar-collapsed .nav-section + .nav-section {
+  margin-top: 10px;
+}
+
+.sidebar-collapsed .nav-item {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  justify-content: center;
+}
+
+.sidebar-collapsed .nav-item .icon {
+  translate: 0 0;
+}
+
+.sidebar-collapsed .sidebar-footer {
+  padding: 10px 0;
+  border-color: transparent;
+}
+
+.sidebar-collapsed .loaded-head,
+.sidebar-collapsed .loaded-empty {
+  justify-content: center;
 }
 
 /* ---------------------------------------------------------------- main */
@@ -675,6 +862,116 @@ button:disabled {
   color: var(--bad);
   border-color: #5c2626;
   background: rgba(229, 118, 108, 0.08);
+}
+
+/* ---------------------------------------------------------------- VRAM bars */
+
+.vram-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 6px;
+}
+
+.vram-bars.compact {
+  gap: 4px;
+  margin: 2px 0 8px;
+}
+
+.vram-row-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.vram-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+
+.vram-bar {
+  display: flex;
+  height: 8px;
+  margin-top: 4px;
+  border-radius: var(--r-pill);
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+
+.vram-bars.compact .vram-bar {
+  height: 5px;
+  margin-top: 0;
+}
+
+.vram-seg {
+  display: block;
+  flex-shrink: 0;
+  height: 100%;
+}
+
+/* A hairline between segments, so neighbouring tints stay tellable apart. */
+.vram-bar .vram-seg + .vram-seg {
+  box-shadow: inset 1px 0 0 rgba(0, 0, 0, 0.4);
+}
+
+.vram-seg.others {
+  background: var(--border-strong);
+}
+.vram-seg.weights {
+  background: var(--accent);
+}
+.vram-seg.kv {
+  background: color-mix(in oklab, var(--accent) 55%, var(--text));
+}
+.vram-seg.compute {
+  background: color-mix(in oklab, var(--accent) 45%, var(--bg-inset));
+}
+
+/* Past 80% of the card the model's segments turn amber, past 95% red — the other programs stay grey. */
+.vram-bar.high .vram-seg.weights {
+  background: var(--warn);
+}
+.vram-bar.high .vram-seg.kv {
+  background: color-mix(in oklab, var(--warn) 55%, var(--text));
+}
+.vram-bar.high .vram-seg.compute {
+  background: color-mix(in oklab, var(--warn) 45%, var(--bg-inset));
+}
+.vram-bar.critical .vram-seg.weights {
+  background: var(--bad);
+}
+.vram-bar.critical .vram-seg.kv {
+  background: color-mix(in oklab, var(--bad) 55%, var(--text));
+}
+.vram-bar.critical .vram-seg.compute {
+  background: color-mix(in oklab, var(--bad) 45%, var(--bg-inset));
+}
+
+.vram-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.vram-legend-note {
+  margin-left: auto;
+}
+
+.vram-legend i {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 5px;
+  border-radius: 2px;
+  vertical-align: -1px;
 }
 
 .meter {
@@ -3201,6 +3498,24 @@ button.danger.subtle:hover {
  * the same glance as the dead input. Amber rather than red: nothing is wrong, the session is
  * simply making room for itself to continue.
  */
+/* Where a chat's summary ends and the model's word-for-word view begins. */
+.summary-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 16px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.summary-divider::before,
+.summary-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-strong);
+}
+
 .compacting-notice {
   display: flex;
   align-items: center;

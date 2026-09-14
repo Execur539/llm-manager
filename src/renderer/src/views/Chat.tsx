@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import type { AgentMessage } from '@shared/types'
 import { invoke, fmtRelative } from '../lib/api'
 import {
@@ -12,6 +12,7 @@ import {
   setReasoning,
   adoptReasoning,
   seedContext,
+  seedSummary,
   DRAFT_CHAT
 } from '../lib/store'
 import type { LoadedModel } from '../App'
@@ -29,6 +30,7 @@ import { Spinner } from '../components/Spinner'
 import PromptProgress from '../components/PromptProgress'
 import MediaStage from '../components/MediaStage'
 import ContextMeter from '../components/ContextMeter'
+import CompactingNotice from '../components/CompactingNotice'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
@@ -58,6 +60,10 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   const progress = activeId ? (stream.promptProgress[activeId] ?? null) : null
   const media = activeId ? (stream.mediaStage[activeId] ?? null) : null
   const ctx = activeId ? (stream.context[activeId] ?? null) : null
+  const compacting = activeId ? (stream.compacting[activeId] ?? null) : null
+  const summaryUpto = activeId ? (stream.summaryUpto[activeId] ?? null) : null
+  // Mid-compaction the conversation takes no input, exactly as while a reply is being written.
+  const locked = busy || !!compacting
   // Usable before the first message: the choice is held against a draft key and adopted by
   // whatever conversation the message goes on to create.
   const effortId = activeId ?? DRAFT_CHAT
@@ -107,7 +113,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
     }
     let cancelled = false
     void (async () => {
-      const session = await invoke<{ messages: AgentMessage[]; contextUsed?: number } | null>(
+      const session = await invoke<{ messages: AgentMessage[]; contextUsed?: number; summaryUpto?: string } | null>(
         'chat:load',
         activeId
       )
@@ -115,6 +121,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
       setMessages(session?.messages ?? [])
       // So the meter reads correctly on reopening rather than staying blank until the next turn.
       seedContext(activeId, session?.contextUsed, loaded?.plan.contextLength ?? 0)
+      seedSummary(activeId, session?.summaryUpto ?? null)
       dropPending(activeId)
     })()
     return () => {
@@ -162,7 +169,8 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   }
 
   const send = async (): Promise<void> => {
-    if ((!input.trim() && !attachments.items.length) || busy || !loaded) return
+    // Not mid-compaction either: a message sent then lands in a history about to be rewritten.
+    if ((!input.trim() && !attachments.items.length) || busy || compacting || !loaded) return
 
     let chatId = activeId
     if (!chatId) {
@@ -209,7 +217,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
         onRename={(id, title) => void renameChat(id, title)}
       />
 
-      <DropZone onFiles={(f) => void attachments.addFiles(f)} disabled={busy}>
+      <DropZone onFiles={(f) => void attachments.addFiles(f)} disabled={locked}>
       <div className="chat">
         <div className="row head chat-head">
           <RailToggle />
@@ -227,6 +235,31 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
                 </option>
               ))}
             </select>
+          )}
+          {activeId && (
+            <button
+              disabled={!loaded || locked}
+              onClick={() => {
+                void invoke<{ ok: boolean; message: string; beforeTokens?: number; afterTokens?: number }>(
+                  'chat:compact',
+                  activeId
+                )
+                  .then((r) => {
+                    const saved =
+                      r.ok && r.beforeTokens != null && r.afterTokens != null
+                        ? ` Freed about ${Math.max(0, r.beforeTokens - r.afterTokens).toLocaleString()} tokens.`
+                        : ''
+                    toast(`${r.message}${saved}`, r.ok ? 'success' : 'info')
+                  })
+                  .catch((err: unknown) =>
+                    toast(`Compaction failed: ${err instanceof Error ? err.message : String(err)}`, 'error')
+                  )
+              }}
+              title="Summarise older messages to free context"
+              data-testid="compact-chat"
+            >
+              Compact
+            </button>
           )}
           {activeId && (
             <button
@@ -273,21 +306,35 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
           )}
 
           {messages.map((m) => (
-            <MessageRow role={m.role} key={m.id}>
-              {m.role === 'assistant' ? (
-                <>
-                  {m.reasoning && <ThinkingBlock text={m.reasoning} />}
-                  {/* Kept in step with Agent: a reasoning-only turn renders no empty body. */}
-                  {m.content && <Markdown source={m.content} />}
-                </>
-              ) : (
-                <>
-                  {/* The names are dropped from the text once the files themselves are shown. */}
-                  <div className="body">{stripAttachmentLine(m.content, !!m.attachments?.length)}</div>
-                  {m.attachments?.length ? <MessageMedia items={m.attachments} /> : null}
-                </>
+            <Fragment key={m.id}>
+              <MessageRow role={m.role}>
+                {m.role === 'assistant' ? (
+                  <>
+                    {m.reasoning && <ThinkingBlock text={m.reasoning} />}
+                    {/* Kept in step with Agent: a reasoning-only turn renders no empty body. */}
+                    {m.content && <Markdown source={m.content} />}
+                  </>
+                ) : (
+                  <>
+                    {/* The names are dropped from the text once the files themselves are shown. */}
+                    <div className="body">{stripAttachmentLine(m.content, !!m.attachments?.length)}</div>
+                    {m.attachments?.length ? <MessageMedia items={m.attachments} /> : null}
+                  </>
+                )}
+              </MessageRow>
+              {/*
+                * Where the model's word-for-word view begins.
+                *
+                * The transcript keeps every message, so without this nothing on screen says the model
+                * is working from a summary of everything above — which is exactly when a detail from
+                * early on seems to have been forgotten.
+                */}
+              {m.id === summaryUpto && (
+                <div className="summary-divider" role="note" data-testid="summary-divider">
+                  The model reads a summary of the messages above
+                </div>
               )}
-            </MessageRow>
+            </Fragment>
           ))}
 
           {(partial || reasoning || ultra.length > 0) && (
@@ -299,7 +346,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               </div>
             </MessageRow>
           )}
-          {busy && (progress || (!partial && !reasoning && !ultra.length)) && (
+          {busy && !compacting && (progress || (!partial && !reasoning && !ultra.length)) && (
             <MessageRow role="assistant">
               {/*
                 * Before the first token there is a real step to report, and until now it looked
@@ -337,12 +384,23 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
           */}
         <div className="composer">
           <JumpToLatest show={detached} onClick={jumpToLatest} />
-          <AttachmentBar items={attachments.items} onRemove={attachments.remove} disabled={busy} />
+          {compacting && (
+            <CompactingNotice
+              since={compacting.since}
+              automatic={compacting.automatic}
+              percent={compacting.percent}
+              chunk={compacting.chunk}
+              chunks={compacting.chunks}
+              stage={compacting.stage}
+              helper={compacting.helper}
+            />
+          )}
+          <AttachmentBar items={attachments.items} onRemove={attachments.remove} disabled={locked} />
           <div className="composer-shell">
             <button
               className="attach-button"
               onClick={() => void attachments.pick()}
-              disabled={busy || attachments.busy}
+              disabled={locked || attachments.busy}
               title="Attach images, video, audio, or text files"
               aria-label="Attach files"
               data-testid="attach-button"
@@ -359,7 +417,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
                 }
               }}
               placeholder={loaded ? 'Message…' : 'Load a model first'}
-              disabled={!loaded || busy}
+              disabled={!loaded || locked}
               rows={1}
               data-testid="chat-input"
             />
@@ -371,7 +429,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
             <button
               className={`send-button${busy ? ' stopping' : ''}`}
               onClick={() => (busy ? void invoke('chat:stop', activeId) : void send())}
-              disabled={!loaded || (!busy && !input.trim() && !attachments.items.length)}
+              disabled={!loaded || (!busy && (!!compacting || (!input.trim() && !attachments.items.length)))}
               title={busy ? 'Stop generating' : 'Send  (Enter)'}
               aria-label={busy ? 'Stop' : 'Send'}
               data-testid="chat-send"
@@ -386,7 +444,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               support={loaded?.caps?.reasoning}
               value={stream.reasoning[effortId] ?? null}
               onChange={(next) => setReasoning(effortId, next)}
-              disabled={busy}
+              disabled={locked}
               samples={ultraSamples}
               onSamplesChange={setUltraSamples}
             />

@@ -88,6 +88,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     enabled: true,
     planMode: false,
     compaction: 'auto-compact',
+    summarizer: { enabled: false, modelId: null, placement: 'auto' },
     maxToolCallsPerTurn: 50,
     commandTimeoutMs: 120000,
     hardBlocksDisabled: false,

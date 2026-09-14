@@ -94,10 +94,20 @@ const splitRow = (line: string): string[] =>
     .split('|')
     .map((c) => c.trim())
 
-export function parseBlocks(source: string): Block[] {
-  const lines = source.replace(/\r\n/g, '\n').split('\n')
-  const blocks: Block[] = []
+/** A block and the lines it was read from: `start` inclusive, `end` exclusive. */
+interface BlockSpan {
+  block: Block
+  start: number
+  end: number
+}
+
+function parseSpans(lines: string[]): BlockSpan[] {
+  const spans: BlockSpan[] = []
   let i = 0
+  // Always called after `i` has moved past the block, so `end` is where the next one may begin.
+  const push = (block: Block, start: number): void => {
+    spans.push({ block, start, end: Math.min(i, lines.length) })
+  }
 
   while (i < lines.length) {
     const line = lines[i]
@@ -106,6 +116,7 @@ export function parseBlocks(source: string): Block[] {
       i++
       continue
     }
+    const start = i
 
     // Fenced code. An unterminated fence runs to the end, which is what a streaming reply
     // looks like mid-block — it should render as code, not as prose.
@@ -119,20 +130,20 @@ export function parseBlocks(source: string): Block[] {
         i++
       }
       i++
-      blocks.push({ kind: 'code', lang, lines: body })
+      push({ kind: 'code', lang, lines: body }, start)
       continue
     }
 
     const heading = line.match(/^(#{1,6})\s+(.*)$/)
     if (heading) {
-      blocks.push({ kind: 'heading', level: heading[1].length, text: heading[2].trim() })
       i++
+      push({ kind: 'heading', level: heading[1].length, text: heading[2].trim() }, start)
       continue
     }
 
     if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(line)) {
-      blocks.push({ kind: 'hr' })
       i++
+      push({ kind: 'hr' }, start)
       continue
     }
 
@@ -145,7 +156,7 @@ export function parseBlocks(source: string): Block[] {
         rows.push(splitRow(lines[i]))
         i++
       }
-      blocks.push({ kind: 'table', header, rows })
+      push({ kind: 'table', header, rows }, start)
       continue
     }
 
@@ -155,7 +166,7 @@ export function parseBlocks(source: string): Block[] {
         body.push(lines[i].replace(/^\s*>\s?/, ''))
         i++
       }
-      blocks.push({ kind: 'quote', lines: body })
+      push({ kind: 'quote', lines: body }, start)
       continue
     }
 
@@ -180,7 +191,7 @@ export function parseBlocks(source: string): Block[] {
         items.push({ text: m[3], depth: Math.floor(m[1].length / 2) })
         i++
       }
-      blocks.push({ kind: 'list', ordered, items })
+      push({ kind: 'list', ordered, items }, start)
       continue
     }
 
@@ -192,9 +203,76 @@ export function parseBlocks(source: string): Block[] {
       i++
       if (isListItem) break
     }
-    if (para.length) blocks.push({ kind: 'p', lines: para })
+    if (para.length) push({ kind: 'p', lines: para }, start)
     else i++
   }
 
-  return blocks
+  return spans
+}
+
+export function parseBlocks(source: string): Block[] {
+  return parseSpans(source.replace(/\r\n/g, '\n').split('\n')).map((s) => s.block)
+}
+
+/**
+ * How many of `spans` can no longer change: the index of the first one that still can.
+ *
+ * Only ever a point where lines lie between two blocks. The parser reads forwards and looks at most
+ * one line ahead, and a line with another after it is finished — so once such a gap exists the
+ * blocks before it are fixed, and parsing the text on each side of it separately gives exactly the
+ * blocks that parsing the whole would. The last `keepLive` blocks stay live regardless, because a
+ * block still being written can still turn into a different kind of block.
+ */
+function settledCount(spans: BlockSpan[], keepLive: number): number {
+  for (let k = spans.length - keepLive; k > 0; k--) {
+    if (spans[k].start > spans[k - 1].end) return k
+  }
+  return 0
+}
+
+/** Split a streaming reply into the part that can no longer change and the part that still can. */
+export function splitSettled(source: string, keepLive = 2): { settled: string; tail: string } {
+  const text = source.replace(/\r\n/g, '\n')
+  const lines = text.split('\n')
+  const spans = parseSpans(lines)
+  const k = settledCount(spans, keepLive)
+  if (!k) return { settled: '', tail: text }
+  const cut = spans[k].start
+  return { settled: `${lines.slice(0, cut).join('\n')}\n`, tail: lines.slice(cut).join('\n') }
+}
+
+/** A streaming reply's blocks: those that can no longer change, then those that still can. */
+export interface StreamingBlocks {
+  settled: Block[]
+  live: Block[]
+}
+
+/**
+ * Parse a reply as it streams, doing work in proportion to what changed rather than to its length.
+ *
+ * Parsing the whole reply for every token made a long answer quadratic: by the end of it each new
+ * word re-read everything before it. This remembers the text that has settled and the blocks it
+ * gave, and each call parses only what follows that text. Blocks that settle are appended, and the
+ * ones already settled are handed back as the same objects — so a view memoised on them skips all
+ * but the blocks still being written. A source that no longer starts with the settled text, such as
+ * a different reply, starts over.
+ */
+export function streamingParser(keepLive = 2): (source: string) => StreamingBlocks {
+  let settledText = ''
+  let settled: Block[] = []
+  return (raw) => {
+    const source = raw.replace(/\r\n/g, '\n')
+    if (!source.startsWith(settledText)) {
+      settledText = ''
+      settled = []
+    }
+    const lines = source.slice(settledText.length).split('\n')
+    const spans = parseSpans(lines)
+    const k = settledCount(spans, keepLive)
+    if (k) {
+      settled = settled.concat(spans.slice(0, k).map((s) => s.block))
+      settledText += `${lines.slice(0, spans[k].start).join('\n')}\n`
+    }
+    return { settled, live: spans.slice(k).map((s) => s.block) }
+  }
 }

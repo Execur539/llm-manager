@@ -693,7 +693,17 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
 
         <div className="composer">
           <JumpToLatest show={detached} onClick={jumpToLatest} />
-          {compacting && <CompactingNotice since={compacting.since} automatic={compacting.automatic} />}
+          {compacting && (
+            <CompactingNotice
+              since={compacting.since}
+              automatic={compacting.automatic}
+              percent={compacting.percent}
+              chunk={compacting.chunk}
+              chunks={compacting.chunks}
+              stage={compacting.stage}
+              helper={compacting.helper}
+            />
+          )}
           <AttachmentBar items={attachments.items} onRemove={attachments.remove} disabled={busy} />
           <div className="composer-shell">
             <button

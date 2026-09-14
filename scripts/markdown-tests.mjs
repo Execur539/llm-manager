@@ -8,7 +8,7 @@
  */
 
 export async function runMarkdownTests(check, section) {
-  const { parseBlocks, parseInline } = await import('./built/markdown.js')
+  const { parseBlocks, parseInline, splitSettled, streamingParser } = await import('./built/markdown.js')
 
   const blocks = (src) => parseBlocks(src)
   const kinds = (src) => blocks(src).map((b) => b.kind).join(',')
@@ -78,4 +78,78 @@ export async function runMarkdownTests(check, section) {
   check('and its label is preserved', script.value === 'click')
 
   check('unclosed emphasis does not swallow the line', types('**unterminated') === 'text', types('**unterminated'))
+
+  section('Markdown: a streaming reply settles without changing what it renders')
+
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+  const reply = [
+    '# Plan',
+    '',
+    'First, a paragraph that runs',
+    'across two lines.',
+    '',
+    '- one',
+    '- two',
+    '  - nested',
+    '1. ordered',
+    '',
+    '> a quote',
+    '> that continues',
+    '',
+    '```ts',
+    'const a = 1',
+    '',
+    'const b = 2',
+    '```',
+    '',
+    '| a | b |',
+    '|---|---|',
+    '| 1 | 2 |',
+    '',
+    '---',
+    'Closing words with **bold** and `code`.',
+    '',
+    '  # an indented hash',
+    '',
+    'after | it',
+    '',
+    'Last.'
+  ].join('\n')
+
+  const split = splitSettled(reply)
+  check('the settled part and the tail make up the whole reply', split.settled + split.tail === reply)
+  check('a long reply settles most of itself', split.settled.length > reply.length / 2, `${split.settled.length} of ${reply.length}`)
+  check('the two parts parse to what the whole does', same([...parseBlocks(split.settled), ...parseBlocks(split.tail)], parseBlocks(reply)))
+
+  const fenced = splitSettled('p1\n\np2\n\np3\n\n```\na\n\nb\n\nc\n\nd')
+  check('an open code fence is never cut, whatever blank lines it holds', fenced.tail.includes('```\na\n\nb\n\nc\n\nd') && !fenced.settled.includes('```'))
+  check('a reply of one or two blocks settles nothing', splitSettled('just\n\ntwo').settled === '')
+
+  // Every step of a reply arriving a character at a time renders exactly what parsing it whole would.
+  const paragraphs = Array.from({ length: 24 }, (_, i) => `Paragraph ${i} with *some* text${i % 5 ? '' : '\n- and\n- a list'}.`).join('\n\n')
+  const documents = { reply, crlf: reply.replace(/\n/g, '\r\n'), paragraphs }
+  for (const [name, doc] of Object.entries(documents)) {
+    for (const keep of [1, 2]) {
+      const parse = streamingParser(keep)
+      let differsAt = -1
+      for (let n = 0; n <= doc.length; n++) {
+        const { settled, live } = parse(doc.slice(0, n))
+        if (!same([...settled, ...live], parseBlocks(doc.slice(0, n)))) {
+          differsAt = n
+          break
+        }
+      }
+      check(`streamed a character at a time, ${name} renders as it would whole (keeping ${keep} live)`, differsAt === -1, `first differs at ${differsAt}`)
+    }
+  }
+
+  const stable = streamingParser()
+  const earlier = stable(paragraphs.slice(0, 400)).settled
+  const later = stable(paragraphs.slice(0, 600)).settled
+  check('blocks that have settled come back as the same objects', earlier.length > 0 && later.length > earlier.length && earlier.every((b, i) => later[i] === b))
+
+  const restarted = streamingParser()
+  restarted(reply)
+  const other = restarted('Another\n\nreply entirely')
+  check('a different reply starts over', same([...other.settled, ...other.live], parseBlocks('Another\n\nreply entirely')))
 }

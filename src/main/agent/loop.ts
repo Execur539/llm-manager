@@ -50,6 +50,8 @@ import { mcpManager } from './mcp'
 import { readMemory } from './memory'
 import * as chats from '../chat/repo'
 import { APPDATA_DIR } from '../storage/paths'
+import { type CompactionHelper, type TranscriptItem } from './compaction'
+import { summariseTranscript } from './summarise'
 
 export interface AgentOptions {
   cwd: string
@@ -58,6 +60,14 @@ export interface AgentOptions {
   commandTimeoutMs: number
   hardBlocksDisabled: boolean
   compaction: CompactionStrategy
+  /**
+   * A small model to summarise with during compaction, when the user has chosen one.
+   *
+   * Asked for at the start of each compaction rather than held, because whether it can run — and
+   * where — depends on what the loaded model has left free at that moment. Null means the loaded
+   * model summarises, as it always did.
+   */
+  compactionHelper?: () => Promise<CompactionHelper | null>
   hfToken: string | null
   /** Which llama.cpp build is running; the embedding server used by document search needs it. */
   backend?: Backend
@@ -102,6 +112,12 @@ const PLAN_MODE_PROMPT = `
 PLAN MODE IS ACTIVE. You may only use read-class tools (reading, listing, searching, fetching).
 Investigate first, then present a concise written plan for the user to approve. Do not attempt
 to write files or run commands until plan mode is turned off.`
+
+/** A history message as plain text, with media named rather than dropped or pasted as base64. */
+function messageText(m: ChatMessage): string {
+  if (typeof m.content === 'string') return m.content
+  return m.content.map((part) => (part.type === 'text' ? (part.text ?? '') : `[${part.type}]`)).join('\n')
+}
 
 /** What a compaction did, so the caller can report it rather than guessing. */
 export interface CompactionReport {
@@ -451,10 +467,15 @@ Platform: Windows (PowerShell)${memoryBlock}`
       return
     }
 
-    const transcript = older
-      .map((m) => `${m.role}: ${typeof m.content === 'string' ? m.content : '[structured]'}`)
-      .join('\n')
-      .slice(-40000)
+    /*
+     * Every older message, as text.
+     *
+     * This kept only the transcript's last 40,000 characters, so on a long session most of what
+     * compaction removed was never shown to the summariser and described nowhere — the fault the
+     * manual path had already been fixed for. Structured content keeps its text rather than
+     * becoming a placeholder.
+     */
+    const items = older.map((m) => ({ role: m.role, text: messageText(m) }))
 
     /*
      * Announced before the summarising call, not after it.
@@ -466,28 +487,8 @@ Platform: Windows (PowerShell)${memoryBlock}`
      */
     this.emit('compacting', { strategy: 'auto-compact', automatic: true })
 
-    let summary = ''
-    try {
-      summary = await llama.complete({
-        messages: [
-          {
-            role: 'system',
-            content:
-              'Summarise the following agent transcript. Preserve: the user goal, decisions made, ' +
-              'files and paths touched, commands run and their outcomes, and anything still ' +
-              'outstanding. Be dense and factual. No preamble.'
-          },
-          { role: 'user', content: transcript }
-        ],
-        temperature: 0.2,
-        maxTokens: 1024,
-        // Compaction runs between iterations of a turn the user may already have stopped, and
-        // summarising a long session is not quick. Without the signal, stop had to wait it out.
-        signal: this.abort?.signal
-      })
-    } catch {
-      summary = '(compaction failed; older turns were dropped)'
-    }
+    // Every pass carries the turn's abort signal, so stop does not have to wait a compaction out.
+    const summary = await this.summariseItems(items)
 
     this.history = [
       system,
@@ -580,50 +581,26 @@ Platform: Windows (PowerShell)${memoryBlock}`
    * those summaries summarised together, so every message is represented by something.
    */
   private async summarise(messages: AgentMessage[]): Promise<string> {
-    const CHUNK_CHARS = 24_000
-    const chunks: string[] = []
-    let buffer = ''
-    for (const m of messages) {
-      const line = `${m.role}: ${m.content}\n`
-      if (buffer && buffer.length + line.length > CHUNK_CHARS) {
-        chunks.push(buffer)
-        buffer = ''
-      }
-      buffer += line
-    }
-    if (buffer) chunks.push(buffer)
+    return this.summariseItems(messages.map((m) => ({ role: m.role, text: m.content })))
+  }
 
-    const instruction =
-      'Summarise the following agent transcript. Preserve: the user goal, decisions made, ' +
-      'files and paths touched, commands run and their outcomes, and anything still ' +
-      'outstanding. Be dense and factual. No preamble.'
-
-    const pass = async (text: string): Promise<string> =>
-      llama
-        .complete({
-          messages: [
-            { role: 'system', content: instruction },
-            { role: 'user', content: text }
-          ],
-          temperature: 0.2,
-          maxTokens: 1024,
-          signal: this.abort?.signal
-        })
-        .catch(() => '')
-
-    const parts: string[] = []
-    for (const chunk of chunks) {
-      const out = (await pass(chunk)).trim()
-      if (out) parts.push(out)
-    }
-
-    if (!parts.length) return '(compaction failed; earlier turns are described only by this note)'
-    if (parts.length === 1) return parts[0]
-
-    // A second pass over the summaries, so the result reads as one account rather than several.
-    const joined = parts.map((p, i) => `Part ${i + 1}:\n${p}`).join('\n\n')
-    const merged = (await pass(joined)).trim()
-    return merged || parts.join('\n\n')
+  /**
+   * Summarise a run of messages in passes, reporting progress as each one finishes.
+   *
+   * With a helper model the transcript is always cut into about ten pieces — a tenth each where the
+   * helper's window allows — so the interface can say how far through it is, and any piece the
+   * helper fails or loops on is done by the loaded model instead. Without one, the loaded model
+   * takes bigger pieces: every extra pass costs it a reply written at its own speed, which on a
+   * large model is most of the time a compaction takes.
+   */
+  private async summariseItems(items: TranscriptItem[]): Promise<string> {
+    const helper = (await this.opts.compactionHelper?.().catch(() => null)) ?? null
+    return summariseTranscript(items, {
+      kind: 'agent',
+      helper,
+      signal: this.abort?.signal,
+      onProgress: (p) => this.emit('compactionProgress', p)
+    })
   }
 
   /**

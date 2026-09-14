@@ -72,7 +72,26 @@ export interface StreamState {
    * elapsed seconds because a ticking number belongs to whatever is rendering it, not to state
    * every subscriber re-renders for.
    */
-  compacting: Record<string, { since: number; strategy: string; automatic: boolean }>
+  compacting: Record<
+    string,
+    {
+      since: number
+      strategy: string
+      automatic: boolean
+      /** Progress through a chunked summary, once the first pass reports; absent before then. */
+      percent?: number
+      chunk?: number
+      chunks?: number
+      stage?: 'chunk' | 'merge'
+      /** The helper model doing the work, or null when the loaded model is. */
+      helper?: string | null
+    }
+  >
+  /**
+   * The last message a chat's stored summary covers, so the transcript can mark where the model's
+   * word-for-word view begins. Null when nothing has been summarised.
+   */
+  summaryUpto: Record<string, string | null>
   /** ids with a turn currently in flight */
   running: Record<string, boolean>
   /** messages that arrived while the view was unmounted, keyed by id */
@@ -182,6 +201,7 @@ const state: StreamState = {
  mediaStage: {},
   context: {},
   compacting: {},
+  summaryUpto: {},
   reasoningPartial: {},
   running: {},
   pending: {},
@@ -215,6 +235,7 @@ function emitChange(): void {
  mediaStage: { ...state.mediaStage },
     context: { ...state.context },
     compacting: { ...state.compacting },
+    summaryUpto: { ...state.summaryUpto },
     reasoningPartial: { ...state.reasoningPartial },
     running: { ...state.running },
     pending: { ...state.pending },
@@ -292,6 +313,13 @@ export function seedContext(id: string, used: number | undefined, max: number): 
   emitChange()
 }
 
+/** Record where a chat's stored summary ends, as read from storage when the chat is opened. */
+export function seedSummary(id: string, upto: string | null | undefined): void {
+  if (!id || (state.summaryUpto[id] ?? null) === (upto ?? null)) return
+  state.summaryUpto[id] = upto ?? null
+  emitChange()
+}
+
 /** Drain messages that arrived while a view was unmounted. */
 export function takePending(id: string): AgentMessage[] {
   const messages = state.pending[id] ?? []
@@ -326,6 +354,7 @@ export function clearFor(id: string): void {
   // the only place they are removed: both deliberately outlive individual turns.
   delete state.context[id]
   delete state.compacting[id]
+  delete state.summaryUpto[id]
   delete state.ultra[id]
   delete state.ultraSynthesising[id]
   delete state.ultraPlan[id]
@@ -712,6 +741,37 @@ function wire(): void {
     emitChange()
   })
 
+  // Chat compacts the same way the agent does, keyed by conversation instead of session.
+  on<{ chatId?: string; automatic?: boolean }>('chat:compacting', (info) => {
+    const id = info.chatId || activeId
+    state.compacting[id] = { since: Date.now(), strategy: 'auto-compact', automatic: info.automatic !== false }
+    emitChange()
+  })
+
+  on<{
+    chatId?: string
+    percent: number
+    chunk: number
+    chunks: number
+    stage: 'chunk' | 'merge'
+    helper: string | null
+  }>('chat:compaction-progress', (p) => {
+    const id = p.chatId || activeId
+    const current = state.compacting[id]
+    // A report arriving after the compaction ended describes nothing still on screen.
+    if (!current) return
+    state.compacting[id] = { ...current, percent: p.percent, chunk: p.chunk, chunks: p.chunks, stage: p.stage, helper: p.helper }
+    emitChange()
+  })
+
+  on<{ chatId?: string; uptoMessageId?: string | null }>('chat:compacted', (info) => {
+    const id = info.chatId || activeId
+    delete state.compacting[id]
+    // Only a compaction that stored a summary moves the marker; one that failed or was stopped does not.
+    if (info.uptoMessageId) state.summaryUpto[id] = info.uptoMessageId
+    emitChange()
+  })
+
   on<{ sessionId?: string; strategy: string; automatic?: boolean }>('agent:compacting', (info) => {
     const id = info.sessionId || activeId
     state.compacting[id] = {
@@ -719,6 +779,22 @@ function wire(): void {
       strategy: info.strategy,
       automatic: info.automatic !== false
     }
+    emitChange()
+  })
+
+  on<{
+    sessionId?: string
+    percent: number
+    chunk: number
+    chunks: number
+    stage: 'chunk' | 'merge'
+    helper: string | null
+  }>('agent:compaction-progress', (p) => {
+    const id = p.sessionId || activeId
+    const current = state.compacting[id]
+    // A report arriving after the compaction ended describes nothing still on screen.
+    if (!current) return
+    state.compacting[id] = { ...current, percent: p.percent, chunk: p.chunk, chunks: p.chunks, stage: p.stage, helper: p.helper }
     emitChange()
   })
 

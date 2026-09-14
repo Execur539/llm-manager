@@ -23,7 +23,9 @@ import type {
   GpuDevice,
   HardwareSnapshot,
   KvType,
-  ModelArchInfo
+  ModelArchInfo,
+  PlanDevice,
+  VramSegments
 } from '@shared/types'
 
 const MB = 1024 * 1024
@@ -316,6 +318,8 @@ export function proportionalSplit(budgets: number[]): number[] {
 interface Attempt {
   fits: boolean
   perGpu: number[]
+  /** `perGpu` split by kind; the parts of each card add up to its figure there. */
+  segments: VramSegments[]
   /** Blocks per GPU, with the output layer counted on the card that takes the last block. */
   layerSplit: number[]
   hostBytes: number
@@ -459,6 +463,39 @@ function placeItems(
 }
 
 /**
+ * What each card holds, by kind: weights, cache, and working memory.
+ *
+ * Follows `placeItems`'s accounting exactly — the same cut, a compute buffer on every card holding
+ * anything, the logits on the card with the output layer — so the parts always add up to the card's
+ * prediction and a bar drawn from them cannot disagree with the number beside it.
+ */
+function deviceSegments(
+  counts: number[],
+  weights: number[],
+  kv: number[],
+  staging: number[],
+  compute: number,
+  logits: number
+): VramSegments[] {
+  const out = counts.map(() => ({ weights: 0, kv: 0, compute: 0 }))
+  let k = 0
+  let outputDevice = 0
+  counts.forEach((n, d) => {
+    for (let j = 0; j < n; j++, k++) {
+      out[d].weights += weights[k]
+      out[d].kv += kv[k]
+      out[d].compute += staging[k]
+    }
+    if (n > 0) {
+      out[d].compute += compute
+      outputDevice = d
+    }
+  })
+  if (out.length) out[outputDevice].compute += logits
+  return out
+}
+
+/**
  * Try a placement at a given context length.
  *
  * Mirrors what llama.cpp does rather than an idealised split:
@@ -491,6 +528,10 @@ function attempt(
   let hostBytes = costs.input
   let weightsOnGpu = 0
   const items: number[] = []
+  // The same items split by kind, so each card's share can be shown as weights, cache and working memory.
+  const itemWeights: number[] = []
+  const itemKv: number[] = []
+  const itemStaging: number[] = []
   for (let il = 0; il < totalLayers; il++) {
     const expertsOnHost = il < cpuMoe
     if (il < firstOnGpu) {
@@ -498,9 +539,13 @@ function attempt(
       continue
     }
     const onGpu = costs.dense[il] + (expertsOnHost ? 0 : costs.experts[il])
-    weightsOnGpu += onGpu
     // Staging travels with the block, because that is where llama.cpp allocates it.
-    items.push(onGpu + kvPerBlock + (expertsOnHost ? hostExpertStaging(arch, batchSize) : 0))
+    const staging = expertsOnHost ? hostExpertStaging(arch, batchSize) : 0
+    weightsOnGpu += onGpu
+    items.push(onGpu + kvPerBlock + staging)
+    itemWeights.push(onGpu)
+    itemKv.push(kvPerBlock)
+    itemStaging.push(staging)
     if (expertsOnHost) hostBytes += costs.experts[il]
   }
 
@@ -511,6 +556,7 @@ function attempt(
     return {
       fits: true,
       perGpu: budgets.map(() => 0),
+      segments: budgets.map(() => ({ weights: 0, kv: 0, compute: 0 })),
       layerSplit: budgets.map(() => 0),
       hostBytes: hostBytes + costs.output + compute + logits,
       kvBytes: kvTotal,
@@ -520,9 +566,13 @@ function attempt(
   }
 
   items.push(costs.output)
+  itemWeights.push(costs.output)
+  itemKv.push(0)
+  itemStaging.push(0)
   weightsOnGpu += costs.output
 
   const { counts, perGpu } = placeItems(items, budgets, compute, logits)
+  const segments = deviceSegments(counts, itemWeights, itemKv, itemStaging, compute, logits)
   /*
    * A routed model does not get to fill a card to the last megabyte.
    *
@@ -536,6 +586,7 @@ function attempt(
   return {
     fits: perGpu.every((need, i) => need <= budgets[i] * margin),
     perGpu,
+    segments,
     layerSplit: counts,
     hostBytes,
     kvBytes: kvTotal,
@@ -682,6 +733,7 @@ function buildPlan(
     batchSize,
     flashAttention,
     predictedVramPerGpu: a.perGpu,
+    vramSegments: a.segments,
     predictedHostBytes: a.hostBytes,
     kvBytes: a.kvBytes,
     weightsOnGpuBytes: a.weightsOnGpu,
@@ -701,7 +753,7 @@ function buildPlan(
  * system RAM is the ordinary way to run it rather than a degradation, and is chosen automatically
  * with the reason stated.
  */
-export function planFit(
+function planFitInner(
   arch: ModelArchInfo,
   hw: HardwareSnapshot,
   constraints: FitConstraints = DEFAULT_CONSTRAINTS
@@ -1168,6 +1220,30 @@ export function planFit(
     needsUserChoice: true,
     hardware: hw,
     notes
+  }
+}
+
+export function planFit(
+  arch: ModelArchInfo,
+  hw: HardwareSnapshot,
+  constraints: FitConstraints = DEFAULT_CONSTRAINTS
+): FitResult {
+  const result = planFitInner(arch, hw, constraints)
+  /*
+   * Name the cards each plan's per-card figures belong to.
+   *
+   * The figures follow the devices the backend can address, which is not always every adapter in
+   * the snapshot — an integrated GPU beside discrete cards is left out — so they cannot be paired
+   * with `hardware.gpus` by position.
+   */
+  const hasDiscrete = hw.gpus.some((g) => g.totalVram > 0 && !/\bgraphics\b/i.test(g.name))
+  const devices: PlanDevice[] = hw.gpus
+    .filter((g) => usableForBackend(g, hw.backend, hasDiscrete))
+    .map((g) => ({ index: g.index, name: g.name, totalVram: g.totalVram, freeVram: g.freeVram, measured: g.freeIsMeasured }))
+  return {
+    ...result,
+    chosen: result.chosen ? { ...result.chosen, devices } : null,
+    alternatives: result.alternatives.map((p) => ({ ...p, devices }))
   }
 }
 

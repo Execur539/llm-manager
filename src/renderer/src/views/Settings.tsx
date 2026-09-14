@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import type { AppSettings } from '@shared/types'
+import type { AppSettings, ModelRecord } from '@shared/types'
+import { RECOMMENDED_SUMMARIZER } from '@shared/summarizer'
 import { invoke, on, fmtBytes } from '../lib/api'
 import ConfirmDialog from '../components/ConfirmDialog'
 import NumberField from '../components/NumberField'
@@ -19,7 +20,13 @@ interface MemoryEntry {
   updatedAt: number
 }
 
-export default function Settings(): JSX.Element {
+export default function Settings({
+  models = [],
+  onModelsChanged
+}: {
+  models?: ModelRecord[]
+  onModelsChanged?: () => Promise<void>
+}): JSX.Element {
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [missing, setMissing] = useState<string[]>([])
   const [paths, setPaths] = useState<{ exeDir: string; modelsDir: string } | null>(null)
@@ -32,6 +39,8 @@ export default function Settings(): JSX.Element {
   const [confirmHardBlocks, setConfirmHardBlocks] = useState(false)
   /** Bytes of the update fetched so far, or null when no download is running. */
   const [downloading, setDownloading] = useState<{ done: number; total: number } | null>(null)
+  /** The recommended summariser's download, started from here. */
+  const [helperDownload, setHelperDownload] = useState<'idle' | 'queued'>('idle')
 
   /*
    * The download reports progress; until now nobody listened.
@@ -41,6 +50,17 @@ export default function Settings(): JSX.Element {
    * transfer that is still going.
    */
   useEffect(() => on<{ done: number; total: number }>('update:progress', setDownloading), [])
+
+  // A finished summariser download rescans the library, so the model can be picked straight away.
+  useEffect(() => {
+    if (helperDownload !== 'queued') return
+    return on<{ filename: string; status: string }[]>('downloads:update', (list) => {
+      if (list.some((d) => d.filename === RECOMMENDED_SUMMARIZER.file && d.status === 'done')) {
+        setHelperDownload('idle')
+        void onModelsChanged?.()
+      }
+    })
+  }, [helperDownload, onModelsChanged])
 
   // New MCP server form
   const [mcpName, setMcpName] = useState('')
@@ -66,6 +86,24 @@ export default function Settings(): JSX.Element {
 
   const patch = async (p: Partial<AppSettings>): Promise<void> => {
     setSettings(await invoke<AppSettings>('settings:patch', p))
+  }
+
+  // Small models only: one near the size of a chat model would take the time it exists to save.
+  const helperChoices = models
+    .filter((m) => m.arch && !m.error && m.bytes <= 8 * 1024 ** 3)
+    .sort((a, b) => a.bytes - b.bytes)
+  const recommendedModel = models.find((m) => m.filename.toLowerCase() === RECOMMENDED_SUMMARIZER.file.toLowerCase())
+  const helper = settings.agent.summarizer
+  const setHelper = (next: Partial<AppSettings['agent']['summarizer']>): Promise<void> =>
+    patch({ agent: { ...settings.agent, summarizer: { ...helper, ...next } } })
+  const downloadRecommended = async (): Promise<void> => {
+    try {
+      await invoke('hf:download', RECOMMENDED_SUMMARIZER.repo, RECOMMENDED_SUMMARIZER.file, { skipProjector: true })
+      setHelperDownload('queued')
+      setInfo(`Downloading ${RECOMMENDED_SUMMARIZER.label}. Progress is under Find a model; it can be picked here once it finishes.`)
+    } catch (err) {
+      setInfo(`Could not start the download: ${err instanceof Error ? err.message : String(err)}`)
+    }
   }
 
   return (
@@ -277,6 +315,77 @@ export default function Settings(): JSX.Element {
               <option value="sliding-window">Sliding window (drop oldest)</option>
             </select>
           </dd>
+          {/*
+            * A small model for compaction, beside the loaded one.
+            *
+            * Off until chosen. Its summaries are what the loaded model works from afterwards, and a
+            * 2B model writes them less well than a very large one: minutes of waiting against some
+            * of that quality is the user's trade to make, not the app's. Shown whatever the agent's
+            * strategy is, because chats compact with it too.
+            */}
+          <dt>Summarise with a small model</dt>
+          <dd>
+            <input
+              type="checkbox"
+              checked={helper.enabled}
+              onChange={(e) => void setHelper({ enabled: e.target.checked })}
+              data-testid="summarizer-enabled"
+            />
+            <span className="faint" style={{ marginLeft: 6 }}>
+              chats and agent sessions compact in about ten passes with a progress reading, instead of on the
+              loaded model
+            </span>
+          </dd>
+          {helper.enabled && (
+            <>
+              <dt>Summariser model</dt>
+              <dd>
+                <select
+                  className="kv-select"
+                  value={helper.modelId ?? ''}
+                  onChange={(e) => void setHelper({ modelId: e.target.value || null })}
+                  data-testid="summarizer-model"
+                >
+                  <option value="">Choose a model…</option>
+                  {helperChoices.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.filename} · {fmtBytes(m.bytes)}
+                      {m.id === recommendedModel?.id ? ' · recommended' : ''}
+                    </option>
+                  ))}
+                </select>
+                {!helper.modelId && <span className="faint">until one is picked, the loaded model summarises</span>}
+              </dd>
+              <dt>Runs on</dt>
+              <dd>
+                <select
+                  className="kv-select"
+                  value={helper.placement}
+                  onChange={(e) => void setHelper({ placement: e.target.value as 'auto' | 'gpu' | 'cpu' })}
+                >
+                  <option value="auto">automatic — a GPU with room, else the CPU</option>
+                  <option value="gpu">GPU when there is room</option>
+                  <option value="cpu">CPU only</option>
+                </select>
+              </dd>
+              <dt>Recommended</dt>
+              <dd>
+                <span>
+                  {RECOMMENDED_SUMMARIZER.label} · {fmtBytes(RECOMMENDED_SUMMARIZER.bytes)}
+                </span>
+                {recommendedModel ? (
+                  helper.modelId !== recommendedModel.id && (
+                    <button onClick={() => void setHelper({ modelId: recommendedModel.id })}>Use it</button>
+                  )
+                ) : (
+                  <button onClick={() => void downloadRecommended()} disabled={helperDownload === 'queued'}>
+                    {helperDownload === 'queued' ? 'Downloading…' : 'Download'}
+                  </button>
+                )}
+                <span className="faint">long context on a small cache, and answers without thinking first</span>
+              </dd>
+            </>
+          )}
           <dt>Max tool calls / turn</dt>
           <dd>
             <NumberField

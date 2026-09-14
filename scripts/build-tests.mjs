@@ -10,6 +10,7 @@ await build({
     engine: path.join(ROOT, 'src/main/autofit/engine.ts'),
     gbnf: path.join(ROOT, 'src/main/agent/gbnf.ts'),
     permissions: path.join(ROOT, 'src/main/agent/permissions.ts'),
+    compaction: path.join(ROOT, 'src/main/agent/compaction.ts'),
     hf: path.join(ROOT, 'src/main/downloads/hf.ts'),
     gguf: path.join(ROOT, 'src/main/models/gguf.ts'),
     reasoning: path.join(ROOT, 'src/main/models/reasoning.ts'),

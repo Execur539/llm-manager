@@ -12,13 +12,27 @@ import { Spinner } from './Spinner'
  *
  * The clock ticks four times a second and displays whole seconds, so it never looks stalled
  * between updates while still only ever showing a figure that is true.
+ *
+ * Once the summary runs in passes it also says which pass, how far through the whole it is, and
+ * which model is doing it — the percentage is what makes a long compaction something to wait
+ * for rather than something to wonder about.
  */
 export default function CompactingNotice({
   since,
-  automatic
+  automatic,
+  percent,
+  chunk,
+  chunks,
+  stage,
+  helper
 }: {
   since: number
   automatic: boolean
+  percent?: number
+  chunk?: number
+  chunks?: number
+  stage?: 'chunk' | 'merge'
+  helper?: string | null
 }): JSX.Element {
   const [elapsed, setElapsed] = useState(0)
 
@@ -29,6 +43,8 @@ export default function CompactingNotice({
     return () => clearInterval(timer)
   }, [since])
 
+  const step = chunks ? (stage === 'merge' ? 'merging the summaries' : `part ${chunk} of ${chunks}`) : null
+
   return (
     <div className="compacting-notice" role="status" data-testid="compacting">
       <Spinner size={13} />
@@ -36,7 +52,19 @@ export default function CompactingNotice({
         {automatic
           ? 'The context window filled up — summarising earlier turns to make room'
           : 'Summarising earlier turns'}
+        {step && (
+          <span className="faint">
+            {' · '}
+            {step}
+            {helper ? ` with ${helper}` : ''}
+          </span>
+        )}
       </span>
+      {percent !== undefined && (
+        <span className="mono compacting-elapsed" data-testid="compacting-percent">
+          {percent}%
+        </span>
+      )}
       <span className="mono compacting-elapsed">{elapsed}s</span>
     </div>
   )

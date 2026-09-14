@@ -36,9 +36,16 @@ export type IconName =
   | 'chevron'
   | 'copy'
   | 'resume'
+  | 'sidebar'
 
 /** Path data only — the wrapper supplies sizing, colour and stroke. */
 const PATHS: Record<IconName, JSX.Element> = {
+  sidebar: (
+    <>
+      <rect x="3" y="4" width="18" height="16" rx="3" />
+      <path d="M9.5 4v16" />
+    </>
+  ),
   dashboard: (
     <>
       <rect x="3" y="3" width="7" height="9" rx="1.5" />

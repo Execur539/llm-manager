@@ -217,6 +217,14 @@ export interface HardwareSnapshot {
   cpuThreads: number
   backend: Backend
   takenAt: number
+  /**
+   * Whether this is an answer or a guess.
+   *
+   * Provisional when a probe that should have answered timed out or failed: the snapshot then says
+   * nothing reliable about GPUs and must not be read as "there are none". Absent on snapshots from
+   * before it existed, which are treated as measured.
+   */
+  detection?: { state: 'measured' | 'provisional'; reason?: string }
 }
 
 export type Backend = 'cuda' | 'vulkan' | 'cpu'
@@ -271,6 +279,24 @@ export interface FitConstraints {
   }>
 }
 
+/** A card's predicted share of a plan, by what it is spent on. */
+export interface VramSegments {
+  weights: number
+  kv: number
+  /** Compute buffers, staging for experts in system RAM, and the logits row. */
+  compute: number
+}
+
+/** A card a plan places work on, as it was measured when the plan was made. */
+export interface PlanDevice {
+  index: number
+  name: string
+  totalVram: number
+  /** -1 when the driver cannot report it. */
+  freeVram: number
+  measured: boolean
+}
+
 export interface FitPlan {
   /** human-facing label, e.g. "Max context" */
   label: string
@@ -316,6 +342,10 @@ export interface FitPlan {
   cpuMoeLayers?: number
   /** Raw tensor overrides passed straight through to llama.cpp. */
   overrideTensors?: string
+  /** Each card's predicted share by kind, in the same order as `predictedVramPerGpu`. */
+  vramSegments?: VramSegments[]
+  /** The cards those per-card figures belong to, in the same order. */
+  devices?: PlanDevice[]
   batchSize: number
   flashAttention: boolean
   /** predicted bytes per GPU */
@@ -530,6 +560,20 @@ export interface AppSettings {
     enabled: boolean
     planMode: boolean
     compaction: CompactionStrategy
+    /**
+     * Summarise with a separate small model instead of the loaded one.
+     *
+     * Compaction on a large model re-reads the transcript and writes the summary at that model's
+     * speed — minutes, on one running partly from system RAM. A small model beside it does the
+     * same passes far faster, at some cost in how well it summarises, so it is off until chosen.
+     */
+    summarizer: {
+      enabled: boolean
+      /** A library model id; null until one is picked. */
+      modelId: string | null
+      /** 'auto' puts it on a GPU with room beside the loaded model, and on the CPU otherwise. */
+      placement: 'auto' | 'gpu' | 'cpu'
+    }
     maxToolCallsPerTurn: number
     commandTimeoutMs: number
     hardBlocksDisabled: boolean
