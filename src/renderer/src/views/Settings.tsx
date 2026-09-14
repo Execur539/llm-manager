@@ -290,6 +290,26 @@ export default function Settings({
               onCommit={(n) => void patch({ runtime: { ...settings.runtime, threads: n } })}
             />
           </dd>
+          <dt>Batch size</dt>
+          <dd>
+            <NumberField
+              value={settings.runtime.batchSize}
+              min={0}
+              max={65536}
+              hint="--batch-size · 0 = automatic (512) · next load"
+              onCommit={(n) => void patch({ runtime: { ...settings.runtime, batchSize: n } })}
+            />
+          </dd>
+          <dt>Micro-batch size</dt>
+          <dd>
+            <NumberField
+              value={settings.runtime.ubatchSize}
+              min={0}
+              max={65536}
+              hint="--ubatch-size · 0 = automatic (512) · larger reads prompts faster, uses more VRAM · never above the batch size"
+              onCommit={(n) => void patch({ runtime: { ...settings.runtime, ubatchSize: n } })}
+            />
+          </dd>
         </dl>
       </div>
 

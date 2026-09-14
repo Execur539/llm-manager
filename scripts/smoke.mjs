@@ -26,7 +26,8 @@ const {
   DEFAULT_CONSTRAINTS,
   fmtBytes,
   verifyPrediction,
-  nglFor
+  nglFor,
+  resolveBatches
 } = await import('./built/engine.js')
 const { toolCallGrammar, schemaGrammar } = await import('./built/gbnf.js')
 const { checkHardBlock, describeCall, PermissionEngine } = await import('./built/permissions.js')
@@ -978,6 +979,22 @@ section('Compaction helper: chunks, progress, loops and placement')
   check('an empty conversation keeps nothing', keepRecent([], 100) === 0)
   check('a chat is summarised as a conversation, not as a log of work',
     /conversation/i.test(instructionsFor('chat').chunk) && instructionsFor('chat').merge !== instructionsFor('agent').merge)
+}
+
+section('Batch and micro-batch sizes')
+{
+  const same = (a, b) => a.batch === b.batch && a.ubatch === b.ubatch
+  check('both automatic is 512 and 512', same(resolveBatches(0, 0), { batch: 512, ubatch: 512 }))
+  check('a set batch keeps the default micro-batch', same(resolveBatches(2048, 0), { batch: 2048, ubatch: 512 }))
+  check('a small batch caps the micro-batch', same(resolveBatches(256, 0), { batch: 256, ubatch: 256 }))
+  check('a large micro-batch raises an automatic batch', same(resolveBatches(0, 1024), { batch: 1024, ubatch: 1024 }))
+  check('a micro-batch is never above the batch', same(resolveBatches(1024, 4096), { batch: 1024, ubatch: 1024 }))
+
+  const small = planFit(arch, hw([gpu('A', 24, 23)]), DEFAULT_CONSTRAINTS).chosen
+  const large = planFit(arch, hw([gpu('A', 24, 23)]), { ...DEFAULT_CONSTRAINTS, overrides: { batchSize: 4096, ubatchSize: 4096 } }).chosen
+  check('the plan carries both sizes', large?.batchSize === 4096 && large?.ubatchSize === 4096, `${large?.batchSize}/${large?.ubatchSize}`)
+  check('a larger micro-batch costs VRAM, so the plan reaches less context',
+    (large?.contextLength ?? Infinity) <= (small?.contextLength ?? 0), `${large?.contextLength} vs ${small?.contextLength}`)
 }
 
 section('Byte formatting')

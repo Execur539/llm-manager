@@ -815,7 +815,8 @@ function planFitInner(
   }
 
   // Honour user overrides exactly — they are respected, never silently changed.
-  const batchSize = o.batchSize ?? 512
+  // Buffers are sized by the micro-batch: it is what llama.cpp actually runs through the graph at once.
+  const batchSize = resolveBatches(o.batchSize, o.ubatchSize).ubatch
   const flashAttention = o.flashAttention ?? true
   if (!flashAttention) {
     notes.push(
@@ -1223,12 +1224,29 @@ function planFitInner(
   }
 }
 
+/**
+ * The logical batch (`--batch-size`) and micro-batch (`--ubatch-size`) a load will use.
+ *
+ * Either may be left unset (or 0) for automatic, which is 512 — what this app has always passed.
+ * llama.cpp never runs a micro-batch larger than the batch, so an explicit micro-batch above an
+ * automatic batch raises the batch to match rather than being quietly cut back to 512.
+ */
+export function resolveBatches(batch?: number, ubatch?: number): { batch: number; ubatch: number } {
+  const b = batch && batch > 0 ? Math.round(batch) : 0
+  const ub = ubatch && ubatch > 0 ? Math.round(ubatch) : 0
+  if (b && ub) return { batch: b, ubatch: Math.min(ub, b) }
+  if (b) return { batch: b, ubatch: Math.min(512, b) }
+  if (ub) return { batch: Math.max(512, ub), ubatch: ub }
+  return { batch: 512, ubatch: 512 }
+}
+
 export function planFit(
   arch: ModelArchInfo,
   hw: HardwareSnapshot,
   constraints: FitConstraints = DEFAULT_CONSTRAINTS
 ): FitResult {
   const result = planFitInner(arch, hw, constraints)
+  const { batch, ubatch } = resolveBatches(constraints.overrides.batchSize, constraints.overrides.ubatchSize)
   /*
    * Name the cards each plan's per-card figures belong to.
    *
@@ -1242,8 +1260,8 @@ export function planFit(
     .map((g) => ({ index: g.index, name: g.name, totalVram: g.totalVram, freeVram: g.freeVram, measured: g.freeIsMeasured }))
   return {
     ...result,
-    chosen: result.chosen ? { ...result.chosen, devices } : null,
-    alternatives: result.alternatives.map((p) => ({ ...p, devices }))
+    chosen: result.chosen ? { ...result.chosen, devices, batchSize: batch, ubatchSize: ubatch } : null,
+    alternatives: result.alternatives.map((p) => ({ ...p, devices, batchSize: batch, ubatchSize: ubatch }))
   }
 }
 

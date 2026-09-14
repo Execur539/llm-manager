@@ -630,6 +630,7 @@ function sanitizeOverrides(raw: Record<string, unknown> | undefined): FitConstra
   if (int(o.gpuLayers) !== undefined) out.gpuLayers = int(o.gpuLayers)
   if (int(o.cpuMoeLayers) !== undefined) out.cpuMoeLayers = int(o.cpuMoeLayers)
   if (int(o.batchSize)) out.batchSize = int(o.batchSize)
+  if (int(o.ubatchSize)) out.ubatchSize = int(o.ubatchSize)
   if (typeof o.flashAttention === 'boolean') out.flashAttention = o.flashAttention
   if (kv(o.kvType)) out.kvType = kv(o.kvType)
   if (kv(o.kvTypeV)) out.kvTypeV = kv(o.kvTypeV)
@@ -638,6 +639,14 @@ function sanitizeOverrides(raw: Record<string, unknown> | undefined): FitConstra
     const t = o.overrideTensors.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 2000)
     if (t) out.overrideTensors = t
   }
+  return out
+}
+
+/** The batch sizes set in Settings, as planner overrides; automatic ones are left out. */
+function batchOverrides(s: AppSettings): FitConstraints['overrides'] {
+  const out: FitConstraints['overrides'] = {}
+  if (s.runtime.batchSize > 0) out.batchSize = s.runtime.batchSize
+  if (s.runtime.ubatchSize > 0) out.ubatchSize = s.runtime.ubatchSize
   return out
 }
 
@@ -651,7 +660,7 @@ function constraintsFromSettings(s: AppSettings): FitConstraints {
     idealContext: s.autoFit.idealContext,
     headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
     allowRopeScaling: s.autoFit.allowRopeScaling,
-    overrides: {}
+    overrides: batchOverrides(s)
   }
 }
 
@@ -668,7 +677,14 @@ function moreConservative(
   companionBytes: number
 ): FitPlan | null {
   const base = { ...constraintsFromSettings(loadSettings()), companionBytes }
-  const keep = { contextLength: plan.contextLength, kvType: plan.kvType, kvTypeV: plan.kvTypeV }
+  // The batch sizes too: a retry that fell back to 512 would change the load's speed as well as its placement.
+  const keep = {
+    contextLength: plan.contextLength,
+    kvType: plan.kvType,
+    kvTypeV: plan.kvTypeV,
+    batchSize: plan.batchSize,
+    ...(plan.ubatchSize ? { ubatchSize: plan.ubatchSize } : {})
+  }
   const take = (result: FitResult): FitPlan | null => {
     const next = result.chosen ?? result.alternatives[0]
     return next ? { ...next, draftMax: plan.draftMax } : null
@@ -763,7 +779,7 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
       allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
-      overrides: {}
+      overrides: batchOverrides(s)
     })
     chosen = result.chosen ?? result.alternatives[0]
     if (!chosen) throw new Error('No workable configuration was found for this model on this hardware.')
@@ -1157,7 +1173,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
       allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
-      overrides: sanitizeOverrides(overrides)
+      // The load dialog's own placement choices sit on top of the batch sizes from Settings.
+      overrides: { ...batchOverrides(s), ...sanitizeOverrides(overrides) }
     })
     /*
      * A plan made while detection is still a guess says so.

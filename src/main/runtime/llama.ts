@@ -308,6 +308,8 @@ export class LlamaRuntime extends EventEmitter {
       // Jinja templates enable llama.cpp's native tool-calling handlers.
       '--jinja'
     ]
+    // Plans saved before the micro-batch was settable carry none, and get llama.cpp's default.
+    if (plan.ubatchSize) args.push('--ubatch-size', String(plan.ubatchSize))
 
     /*
      * Keys and values are set separately, because they are not equally sensitive.

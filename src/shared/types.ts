@@ -263,6 +263,8 @@ export interface FitConstraints {
     gpuLayers: number
     kvType: KvType
     batchSize: number
+    /** Micro-batch (`--ubatch-size`); what the compute buffers are sized by. */
+    ubatchSize: number
     flashAttention: boolean
     tensorSplit: number[]
     /** Precision of the value cache, when it should differ from the keys. */
@@ -347,6 +349,8 @@ export interface FitPlan {
   /** The cards those per-card figures belong to, in the same order. */
   devices?: PlanDevice[]
   batchSize: number
+  /** `--ubatch-size`; absent on plans saved before it was set explicitly. */
+  ubatchSize?: number
   flashAttention: boolean
   /** predicted bytes per GPU */
   predictedVramPerGpu: number[]
@@ -546,6 +550,15 @@ export interface AppSettings {
     loadMode: 'auto' | 'ram' | 'mmap'
     /** CPU threads for generation; 0 lets llama.cpp choose, which counts physical cores. */
     threads: number
+    /**
+     * Logical batch (`--batch-size`): the most prompt tokens handed to llama.cpp per step. 0 = automatic.
+     */
+    batchSize: number
+    /**
+     * Micro-batch (`--ubatch-size`): the tokens actually computed at once. Larger reads long prompts
+     * faster and costs VRAM in the compute buffers, which the planner accounts for. 0 = automatic.
+     */
+    ubatchSize: number
   }
   reasoning: {
     /**

@@ -107,7 +107,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   },
   runtime: {
     loadMode: 'auto',
-    threads: 0
+    threads: 0,
+    batchSize: 0,
+    ubatchSize: 0
   },
   video: {
     /*
@@ -197,6 +199,8 @@ const NUMERIC_BOUNDS: { path: [keyof AppSettings, string]; min: number; max: num
   { path: ['server', 'port'], min: 1, max: 65_535 },
   { path: ['downloads', 'connections'], min: 1, max: 16 },
   { path: ['runtime', 'threads'], min: 0, max: 256 },
+  { path: ['runtime', 'batchSize'], min: 0, max: 65_536 },
+  { path: ['runtime', 'ubatchSize'], min: 0, max: 65_536 },
   // A video may not take the whole window: the question about it has to fit too.
   { path: ['video', 'contextShare'], min: 0.05, max: 0.8 },
   // Below a quarter frame per second a two-minute clip is eight pictures; above four the model
