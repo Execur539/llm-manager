@@ -92,6 +92,13 @@ export interface StreamState {
    * word-for-word view begins. Null when nothing has been summarised.
    */
   summaryUpto: Record<string, string | null>
+  /**
+   * The message a Continue is extending, while it streams.
+   *
+   * The streamed text belongs at the end of that message, not in a reply of its own. Cleared when
+   * the message comes back grown, or when the turn ends however it ends.
+   */
+  extending: Record<string, string>
   /** ids with a turn currently in flight */
   running: Record<string, boolean>
   /** messages that arrived while the view was unmounted, keyed by id */
@@ -202,6 +209,7 @@ const state: StreamState = {
   context: {},
   compacting: {},
   summaryUpto: {},
+  extending: {},
   reasoningPartial: {},
   running: {},
   pending: {},
@@ -236,6 +244,7 @@ function emitChange(): void {
     context: { ...state.context },
     compacting: { ...state.compacting },
     summaryUpto: { ...state.summaryUpto },
+    extending: { ...state.extending },
     reasoningPartial: { ...state.reasoningPartial },
     running: { ...state.running },
     pending: { ...state.pending },
@@ -295,6 +304,8 @@ export function setRunning(id: string, running: boolean): void {
      * alone it sat there claiming the agent was still writing, with nothing running at all.
      */
     delete state.pendingCalls[id]
+    // A stopped Continue never sends back the message it was extending.
+    delete state.extending[id]
   }
   emitChange()
 }
@@ -355,6 +366,7 @@ export function clearFor(id: string): void {
   delete state.context[id]
   delete state.compacting[id]
   delete state.summaryUpto[id]
+  delete state.extending[id]
   delete state.ultra[id]
   delete state.ultraSynthesising[id]
   delete state.ultraPlan[id]
@@ -688,6 +700,8 @@ function wire(): void {
     const id = wrapped.sessionId || activeId
     state.partial[id] = ''
     state.reasoningPartial[id] = ''
+    // The extended answer is back with the new text in it, so nothing is being added to it any more.
+    if (state.extending[id] === message.id) delete state.extending[id]
     /*
      * Replace, rather than append, when the id is already queued.
      *
@@ -700,6 +714,11 @@ function wire(): void {
     // Once the plan is on the message it belongs to, the live copy is a duplicate of it — both
     // were rendering at once for the rest of the turn.
     if (message.plan) delete state.ultraPlan[id]
+    emitChange()
+  })
+
+  on<{ sessionId?: string; messageId: string }>('agent:continuing', (d) => {
+    state.extending[d.sessionId || activeId] = d.messageId
     emitChange()
   })
 
@@ -809,6 +828,7 @@ function wire(): void {
   on<{ sessionId?: string; reason?: string } | string>('agent:done', (payload) => {
     const id = typeof payload === 'string' ? activeId : payload.sessionId || activeId
     state.running[id] = false
+    delete state.extending[id]
     emitChange()
   })
 
@@ -816,6 +836,7 @@ function wire(): void {
     const id = typeof payload === 'string' ? activeId : payload.sessionId || activeId
     state.errors[id] = typeof payload === 'string' ? payload : (payload.message ?? 'Unknown error')
     state.running[id] = false
+    delete state.extending[id]
     emitChange()
   })
 

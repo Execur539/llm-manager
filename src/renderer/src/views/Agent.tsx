@@ -120,6 +120,8 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   const ultra = activeId ? (stream.ultra[activeId] ?? []) : []
   const synthesising = activeId ? !!stream.ultraSynthesising[activeId] : false
   const ultraPlan = activeId ? stream.ultraPlan[activeId] : undefined
+  // The answer a Continue is adding to, whose streamed text is drawn inside it rather than below it.
+  const extendingId = activeId ? (stream.extending[activeId] ?? null) : null
 
   /*
    * Ultra's attempt count, mirrored from settings.
@@ -589,6 +591,26 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                         : undefined
                   }
                 />
+              ) : m.role === 'assistant' && m.id === extendingId ? (
+                /*
+                 * An answer being continued, with the new text written onto its end as it arrives.
+                 *
+                 * The same joins the main process makes when it folds the text in, so the message
+                 * does not shift when the finished copy replaces this one.
+                 */
+                <>
+                  {(m.reasoning || reasoning) && (
+                    <ThinkingBlock
+                      text={m.reasoning && reasoning ? `${m.reasoning}\n\n${reasoning}` : m.reasoning || reasoning}
+                      streaming={!!reasoning}
+                      answerStarted={!!partial}
+                    />
+                  )}
+                  <div className="continuing" data-testid="continuing-message">
+                    <Markdown source={m.content + partial} caret />
+                  </div>
+                  {progress && !partial && <PromptProgress {...progress} />}
+                </>
               ) : m.role === 'assistant' ? (
                 <>
                   {m.reasoning && <ThinkingBlock text={m.reasoning} />}
@@ -650,7 +672,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             <PendingToolCall key={c.index} name={c.name} args={c.args} />
           ))}
 
-          {(partial || reasoning || ultra.length > 0) && (
+          {!extendingId && (partial || reasoning || ultra.length > 0) && (
             <MessageRow role="assistant" testId="streaming-message">
               {/* Plans, while they are being weighed — above whatever the run then does. */}
               <UltraSamples samples={ultra} synthesising={synthesising} plan={ultraPlan} />
@@ -668,7 +690,8 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             * tool list are both non-empty, so gating on those — as the dots do — would hide the
             * bar for exactly the steps where the wait is longest.
             */}
-          {running && (progress || (!partial && !reasoning && !unsavedCalls.length && !pendingCalls.length && !ultra.length)) && (
+          {/* Not while continuing: the answer being extended shows its own progress and caret. */}
+          {running && !extendingId && (progress || (!partial && !reasoning && !unsavedCalls.length && !pendingCalls.length && !ultra.length)) && (
             <MessageRow role="assistant">
               {/*
                 * Preparing an attachment comes before the model is given anything at all, so it

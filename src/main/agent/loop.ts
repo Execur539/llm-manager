@@ -817,6 +817,12 @@ Platform: Windows (PowerShell)${memoryBlock}`
       extending = undefined
       continueFinal = false
     }
+    /*
+     * Said before the first token, so the interface can write the new text into the message it
+     * belongs to. Without it the stream looks like any other reply and was drawn as a second
+     * bubble under the first, snapping back into one only when the finished message arrived.
+     */
+    if (extending) this.emit('continuing', { messageId: extending.id })
 
     let calls = 0
     try {

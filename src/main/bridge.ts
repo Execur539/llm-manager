@@ -333,6 +333,7 @@ function getAgent(): Agent {
     const sid = (): string => activeAgentSessionId
     agent.on('delta', (t: string) => emit('agent:delta', { sessionId: sid(), text: t }))
     agent.on('reasoning', (t: string) => emit('agent:reasoning', { sessionId: sid(), text: t }))
+    agent.on('continuing', (c: { messageId: string }) => emit('agent:continuing', { sessionId: sid(), ...c }))
     agent.on('promptProgress', (p: { percent: number; processed: number; total: number; cached: number }) =>
       emit('agent:prompt-progress', { sessionId: sid(), ...p })
     )

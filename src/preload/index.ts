@@ -28,6 +28,8 @@ const EVENT_CHANNELS = [
   'chat:compacted',
   'agent:delta',
   'agent:reasoning',
+  // The stream that follows extends an existing answer rather than starting a new one.
+  'agent:continuing',
   'agent:prompt-progress',
   'agent:media-progress',
   'agent:context',
