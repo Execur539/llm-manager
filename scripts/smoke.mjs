@@ -51,6 +51,7 @@ const { isVirtualAdapter, classifyProbeError, verdictFor, mergeDetection, parseN
 const { continuedMessage } = await import('./built/continuation.js')
 const { samplingOptions, SAMPLING_FIELDS, DEFAULT_SAMPLING } = await import('./built/sampling.js')
 const { planImageCopy, MAX_IMAGE_EDGE } = await import('./built/imageCopy.js')
+const { toStored, fromStored, forCaps, textOf } = await import('./built/sentContent.js')
 const { exportFilename, uniquePath } = await import('./built/filenames.js')
 const { detectReasoning, reasoningRequestFields } = await import('./built/reasoning.js')
 
@@ -982,6 +983,51 @@ section('Compaction helper: chunks, progress, loops and placement')
   check('an empty conversation keeps nothing', keepRecent([], 100) === 0)
   check('a chat is summarised as a conversation, not as a log of work',
     /conversation/i.test(instructionsFor('chat').chunk) && instructionsFor('chat').merge !== instructionsFor('agent').merge)
+}
+
+section('What a message sent is stored, and sent again byte for byte')
+{
+  const files = new Map()
+  let writes = 0
+  const blobs = {
+    async put(bytes, ext) {
+      const key = `blob-${bytes.toString('hex')}.${ext}`
+      if (!files.has(key)) {
+        files.set(key, Buffer.from(bytes))
+        writes++
+      }
+      return key
+    },
+    async get(file) {
+      return files.get(file) ?? null
+    }
+  }
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex')
+  const image = { type: 'image_url', image_url: { url: `data:image/png;base64,${png.toString('base64')}` } }
+  const sent = [
+    { type: 'text', text: 'What is in these?' },
+    { type: 'text', text: 'Attached file `notes.md`:\n\n```md\nhello\n```' },
+    image,
+    { ...image },
+    { type: 'input_audio', input_audio: { data: Buffer.from('RIFF----WAVEfmt ').toString('base64'), format: 'wav' } },
+    { type: 'input_video', input_video: { data: Buffer.from('....ftypmp42').toString('base64') } },
+    { type: 'image_url', image_url: { url: 'https://example.com/cat.png' } }
+  ]
+  const stored = await toStored(sent, blobs)
+  const back = await fromStored(JSON.parse(JSON.stringify(stored)), blobs)
+  check('a message comes back exactly as it was sent', JSON.stringify(back) === JSON.stringify(sent))
+  check('the same image sent twice is stored once', writes === 3, `${writes} files written`)
+  check('no media bytes are kept inline', !JSON.stringify(stored).includes(png.toString('base64')))
+  check('plain text is stored as it is', (await toStored('Just text', blobs)) === 'Just text')
+
+  files.delete(`blob-${png.toString('hex')}.png`)
+  const partial = await fromStored(stored, blobs)
+  check('a missing file drops only the parts that needed it',
+    partial.length === sent.length - 2 && partial.some((p) => p.type === 'input_audio'), JSON.stringify(partial.map((p) => p.type)))
+
+  const noVision = forCaps(sent, { vision: false, audio: true, videoPossible: true })
+  check('a model without vision is sent the text and audio alone', noVision.every((p) => p.type === 'text' || p.type === 'input_audio'))
+  check('the text of a message includes its documents', textOf(sent).includes('Attached file `notes.md`'))
 }
 
 section('Attachments: a kept copy is reduced only past what a projector reads')

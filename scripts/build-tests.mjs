@@ -25,7 +25,8 @@ await build({
     markdown: path.join(ROOT, 'src/renderer/src/lib/markdown.ts'),
     continuation: path.join(ROOT, 'src/shared/continuation.ts'),
     sampling: path.join(ROOT, 'src/shared/sampling.ts'),
-    imageCopy: path.join(ROOT, 'src/main/chat/image-copy.ts')
+    imageCopy: path.join(ROOT, 'src/main/chat/image-copy.ts'),
+    sentContent: path.join(ROOT, 'src/main/chat/sent-content.ts')
   },
   outdir: path.join(ROOT, 'scripts/built'),
   bundle: true,

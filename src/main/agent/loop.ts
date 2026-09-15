@@ -90,11 +90,15 @@ export interface AgentOptions {
   /** Sampling parameters from the parameters panel; any left unset keep the loop's own defaults. */
   sampling?: SamplingSettings
   /**
-   * The images and audio an earlier user message was sent with, for a history rebuilt from storage.
-   *
-   * The transcript keeps text only, so without this every rebuild dropped them — see media-cache.
+   * Exactly what an earlier user message sent the model — or, for a tool result, the images the tool
+   * returned — for a history rebuilt from storage. The transcript keeps only what the user typed, so
+   * without this every rebuild dropped attachments; see media-cache.
    */
-  mediaFor?: (messageId: string) => ContentPart[] | undefined
+  sentContentFor?: (messageId: string) => string | ContentPart[] | undefined
+  /** The text of what a message sent, attached documents included, for summarising it. */
+  sentTextFor?: (messageId: string) => string | undefined
+  /** Told what a turn sends the model whenever that is more than the text the transcript stores. */
+  onSent?: (messageId: string, content: string | ContentPart[]) => void
   /** true when the caller is a remote web-UI session */
   remote?: boolean
   remoteToolsEnabled?: boolean
@@ -592,7 +596,8 @@ Platform: Windows (PowerShell)${memoryBlock}`
    * those summaries summarised together, so every message is represented by something.
    */
   private async summarise(messages: AgentMessage[]): Promise<string> {
-    return this.summariseItems(messages.map((m) => ({ role: m.role, text: m.content })))
+    // What each message sent, where that was more than its text, so attached documents are summarised too.
+    return this.summariseItems(messages.map((m) => ({ role: m.role, text: this.opts.sentTextFor?.(m.id) ?? m.content })))
   }
 
   /**
@@ -723,17 +728,21 @@ Platform: Windows (PowerShell)${memoryBlock}`
       ...rest
         .map((m): ChatMessage => {
           if (m.role === 'tool') {
-            return { role: 'user', content: `[tool result]\n${m.content}` }
+            const text = `[tool result]\n${m.content}`
+            // An image the tool returned goes back with its result, as the model first saw it.
+            const returned = this.opts.sentContentFor?.(m.id)
+            return Array.isArray(returned) && returned.length
+              ? { role: 'user', content: [{ type: 'text', text }, ...returned] }
+              : { role: 'user', content: text }
           }
           /*
-           * A user message goes back with the images and audio it was sent with. The transcript
-           * stores only its text, so a rebuilt history — Continue, an edit, a restart — used to send
-           * every earlier image as nothing, and the model answered as if it had never seen them.
+           * A user message goes back exactly as it was sent: attached documents' text, images, audio,
+           * video and any Ultra plan included. The transcript stores only what the user typed, so a
+           * rebuilt history — Continue, an edit, every agent turn, a restart — used to send all of it
+           * as nothing, and the model answered as if it had never seen it.
            */
-          const media = m.role === 'user' ? this.opts.mediaFor?.(m.id) : undefined
-          if (media?.length) {
-            return { role: 'user', content: [...media, { type: 'text', text: m.content }] }
-          }
+          const sent = m.role === 'user' ? this.opts.sentContentFor?.(m.id) : undefined
+          if (sent !== undefined) return { role: 'user', content: sent }
           /*
            * Past reasoning goes back with the answer it produced, so the model can remember why it
            * decided what it did — not only what it said. `--reasoning-preserve` is what stops the
@@ -755,8 +764,8 @@ Platform: Windows (PowerShell)${memoryBlock}`
    *
    * `media` carries image and audio parts for a turn that has attachments on a model that can
    * take them. They go to the model but not into the transcript: the parts hold base64 payloads
-   * megabytes wide, and the persisted message keeps the readable text instead. A history rebuilt
-   * from storage gets them back through `mediaFor`, which the bridge fills from the turn as sent.
+   * megabytes wide, and the persisted message keeps the readable text instead. What the turn sent is
+   * reported through `onSent`, and a history rebuilt from storage gets it back from `sentContentFor`.
    */
   async run(
     session: AgentSessionState,
@@ -801,11 +810,10 @@ Platform: Windows (PowerShell)${memoryBlock}`
     else this.history[0] = { role: 'system', content: this.buildSystemPrompt() }
 
     if (!turnMeta.continueTurn) {
-      this.history.push(
-        media.length
-          ? { role: 'user', content: [...media, { type: 'text', text: userInput }] }
-          : { role: 'user', content: userInput }
-      )
+      const userContent: string | ContentPart[] = media.length
+        ? [...media, { type: 'text', text: userInput }]
+        : userInput
+      this.history.push({ role: 'user', content: userContent })
 
       const userMsg: AgentMessage = {
         id: turnMeta.userMessageId ?? crypto.randomBytes(6).toString('hex'),
@@ -816,6 +824,12 @@ Platform: Windows (PowerShell)${memoryBlock}`
       }
       session.messages.push(userMsg)
       this.emit('message', userMsg)
+      /*
+       * Recorded whenever it is more than the stored text — attachments, or an Ultra plan in the
+       * prompt — so a rebuilt history sends the same. Not for a planning sample, whose message is a
+       * draft that is never stored.
+       */
+      if (!this.sampling && (media.length || userInput !== displayText)) this.opts.onSent?.(userMsg.id, userContent)
     }
 
     /*
@@ -1120,13 +1134,12 @@ Platform: Windows (PowerShell)${memoryBlock}`
            * result — and would not survive the transcript, which stores text. Appending a user
            * turn carrying the parts is the arrangement llama.cpp accepts, and it keeps the
            * persisted history readable: the transcript records that an image was returned, while
-           * the pixels live only in the rolling window for this session.
+           * the pixels are recorded against the result through `onSent`, for any rebuilt history.
            */
           if (media.length) {
-            this.history.push({
-              role: 'user',
-              content: [...media, { type: 'text', text: `[image returned by ${call.name}]` }]
-            })
+            const returned: ContentPart[] = [...media, { type: 'text', text: `[image returned by ${call.name}]` }]
+            this.history.push({ role: 'user', content: returned })
+            if (!this.sampling) this.opts.onSent?.(toolMsg.id, returned)
           }
         }
 

@@ -451,6 +451,50 @@ export function allAttachmentPaths(): string[] {
   })
 }
 
+/** One message's attachments, with their paths and extras. */
+export function attachmentRowsForMessage(messageId: string): { id: string; kind: string; path: string; meta: AttachmentMeta }[] {
+  return all<{ id: string; kind: string; path: string; meta: string | null }>(
+    'SELECT id, kind, path, meta FROM attachments WHERE message_id = ? ORDER BY created_at, rowid',
+    messageId
+  ).map((r) => ({ id: r.id, kind: r.kind, path: r.path, meta: parseMeta(r.meta) }))
+}
+
+/** Record what a message sent the model, as stored-content JSON — see sent-content. */
+export function saveSentContent(chatId: string, messageId: string, content: string): void {
+  run(
+    `INSERT INTO message_content (message_id, chat_id, content, created_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(message_id) DO UPDATE SET chat_id = excluded.chat_id, content = excluded.content, created_at = excluded.created_at`,
+    messageId,
+    chatId,
+    content,
+    Date.now()
+  )
+}
+
+/** What a message sent the model, as stored-content JSON, or null when nothing beyond its text was recorded. */
+export function loadSentContent(messageId: string): string | null {
+  return get<{ content: string }>('SELECT content FROM message_content WHERE message_id = ?', messageId)?.content ?? null
+}
+
+/** Every file a sent-content record refers to: what the kept copies must not lose. */
+export function sentContentFiles(): string[] {
+  return all<{ content: string }>('SELECT content FROM message_content').flatMap((r) => {
+    try {
+      const parts = JSON.parse(r.content) as unknown
+      return Array.isArray(parts)
+        ? parts.flatMap((p) => (p && typeof p.file === 'string' ? [p.file as string] : []))
+        : []
+    } catch {
+      return []
+    }
+  })
+}
+
+/** Drop records whose message no longer exists, left behind by deleted or rewound messages. */
+export function pruneSentContent(olderThan: number): void {
+  run('DELETE FROM message_content WHERE created_at < ? AND message_id NOT IN (SELECT id FROM messages)', olderThan)
+}
+
 function toMessageAttachment(r: { id: string; kind: string; path: string; meta: string | null }): MessageAttachment {
   let meta: AttachmentMeta = {}
   try {

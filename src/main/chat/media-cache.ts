@@ -1,94 +1,136 @@
 /**
- * The images and audio a user message was sent with, kept so a rebuilt history can send them again.
+ * What each message sent the model beyond the text the transcript stores, so a rebuilt history
+ * sends the same.
  *
- * A message is stored as text. Its attachments reach the model as separate parts — base64 payloads
- * megabytes wide — which never go into the transcript. Anything that rebuilt a conversation from
- * storage therefore rebuilt it without them: every chat message after the one with the image, and
- * any agent turn resumed with Continue or rewound by an edit, went out with the earlier images gone,
- * and the model answered as though it had never seen them, or invented what they showed.
+ * The transcript keeps what the user typed. The model was often sent more — attached documents'
+ * text, images, audio, a sampled video, an Ultra plan folded into the prompt, a screenshot a tool
+ * returned — and anything that rebuilt a conversation from storage rebuilt it without them: every
+ * chat message after the one with the attachment, every agent turn, Continue, an edit, a restart.
+ * The model answered as though it had never seen them, or invented what they showed.
  *
- * Parts are kept here, by message, from the moment a turn is built. After a restart, or once the
- * oldest have been let go to stay within the memory cap, images and audio are rebuilt from their
- * attachment files. Video is not: sampling one again is minutes of work, so a video from before a
- * restart stays named in the text but is not sent again.
+ * What was sent is recorded when it is sent: in memory for this run, and in the database with its
+ * media as kept files, so a restart sends it again byte for byte. Messages from before this was
+ * recorded are rebuilt from their kept attachment files once, by the caller's `reconstruct`.
  */
 
-import fs from 'node:fs'
-import type { ModelCapabilities } from '@shared/types'
+import type { AgentMessage, ModelCapabilities } from '@shared/types'
 import type { ContentPart } from '../runtime/llama'
-import { attachmentsFor } from './repo'
+import { logger } from '../log'
+import { attachmentRowsForMessage, loadSentContent, saveSentContent } from './repo'
+import { sentBlobs } from './attachment-store'
+import { forCaps, fromStored, textOf, toStored, type StoredContent } from './sent-content'
 
 /** Room for a long session of screenshots, and a bound on what a very long one can hold onto. */
 const MAX_CHARS = 512 * 1024 * 1024
 
-const parts = new Map<string, ContentPart[]>()
+/** Null records that a message sent nothing beyond its stored text, so it is not looked up again. */
+type Sent = string | ContentPart[] | null
+
+const cache = new Map<string, Sent>()
 let totalChars = 0
 
-function sizeOf(list: ContentPart[]): number {
-  return list.reduce(
-    (n, p) => n + (p.image_url?.url.length ?? 0) + (p.input_audio?.data.length ?? 0) + (p.input_video?.data?.length ?? 0),
+function sizeOf(content: Sent): number {
+  if (!content) return 0
+  if (typeof content === 'string') return content.length
+  return content.reduce(
+    (n, p) =>
+      n +
+      (p.text?.length ?? 0) +
+      (p.image_url?.url.length ?? 0) +
+      (p.input_audio?.data.length ?? 0) +
+      (p.input_video?.data?.length ?? 0),
     0
   )
 }
 
-/** Keep the media parts a message was sent with. Its text is not kept here; the transcript has that. */
-export function rememberMedia(messageId: string, sent: ContentPart[]): void {
-  const media = sent.filter((p) => p.type !== 'text')
-  const previous = parts.get(messageId)
-  if (previous) {
+function remember(messageId: string, content: Sent): void {
+  const previous = cache.get(messageId)
+  if (previous !== undefined) {
     totalChars -= sizeOf(previous)
-    parts.delete(messageId)
+    cache.delete(messageId)
   }
-  parts.set(messageId, media)
-  totalChars += sizeOf(media)
-  // Oldest first, which is the order a Map iterates in; a let-go message is rebuilt from disk if needed.
-  for (const [id, list] of parts) {
+  cache.set(messageId, content)
+  totalChars += sizeOf(content)
+  // Oldest first, which is the order a Map iterates in; a message let go is read back from storage.
+  for (const [id, entry] of cache) {
     if (totalChars <= MAX_CHARS || id === messageId) break
-    totalChars -= sizeOf(list)
-    parts.delete(id)
+    totalChars -= sizeOf(entry)
+    cache.delete(id)
   }
 }
 
 /**
- * The media a message was sent with, as far as the loaded model can take it.
- *
- * Filtered on the way out rather than when stored: the model can change between turns, and a server
- * refuses a whole request that carries an image it has no projector for.
+ * What a message sent, as far as the loaded model can take it; undefined when it sent only its
+ * stored text, or has not been restored.
  */
-export function mediaFor(messageId: string, caps: ModelCapabilities | undefined): ContentPart[] | undefined {
-  const list = parts.get(messageId)
-  if (!list?.length || !caps) return undefined
-  const usable = list.filter((p) => {
-    if (p.type === 'image_url') return caps.vision
-    if (p.type === 'input_audio') return caps.audio
-    if (p.type === 'input_video') return caps.vision && caps.videoPossible
-    return true
-  })
-  return usable.length ? usable : undefined
+export function sentContentFor(messageId: string, caps: ModelCapabilities | undefined): string | ContentPart[] | undefined {
+  const content = cache.get(messageId)
+  if (content === undefined || content === null) return undefined
+  return typeof content === 'string' ? content : forCaps(content, caps)
+}
+
+/** The text of what a message sent, attached documents included, when more than its stored text. */
+export function sentTextFor(messageId: string): string | undefined {
+  const content = cache.get(messageId)
+  return content ? textOf(content) : undefined
 }
 
 /**
- * Make sure the media for these messages is at hand, rebuilding what is missing from disk.
+ * Record what a message sent: at once in memory, then in the database with its media as kept files.
  *
- * `rebuild` turns attachment files into parts the way sending them did, or returns null when the
- * loaded model could not take them — in which case nothing is remembered, and the message is looked
- * at again once a model that can is loaded. A message with nothing to rebuild is remembered as such,
- * so it is not looked up again on every turn.
+ * Bytes identical to one of the message's kept attachments point at that file rather than being
+ * written a second time. A failure to store is logged, not thrown: the message has already gone.
  */
-export async function restoreMedia(
-  messageIds: string[],
-  rebuild: (files: string[]) => Promise<ContentPart[] | null>
+export async function persistSent(chatId: string, messageId: string, content: string | ContentPart[]): Promise<void> {
+  remember(messageId, content)
+  try {
+    const known = attachmentRowsForMessage(messageId).flatMap((row) =>
+      // A video's own file is the source clip, possibly gigabytes; only what was made from it was sent.
+      row.kind === 'video' ? [...(row.meta.optimised ? [row.meta.optimised] : []), ...(row.meta.stills ?? [])] : [row.path]
+    )
+    const stored = await toStored(content, sentBlobs(chatId, known))
+    saveSentContent(chatId, messageId, JSON.stringify(stored))
+  } catch (err) {
+    logger.warn('attachments', `could not record what message ${messageId} sent`, err)
+  }
+}
+
+/**
+ * Make sure what a conversation's messages sent is at hand for rebuilding its history.
+ *
+ * Read from the database where it was recorded. A user message from before recording began is
+ * rebuilt by `reconstruct` from its kept files and recorded, which returns null when it carried
+ * nothing beyond its text, and undefined when the loaded model cannot take what it carried — in
+ * which case it is looked at again once one that can is loaded.
+ */
+export async function restoreSent(
+  chatId: string,
+  messages: AgentMessage[],
+  reconstruct: (message: AgentMessage) => Promise<ContentPart[] | null | undefined>
 ): Promise<void> {
-  for (const id of messageIds) {
-    if (parts.has(id)) continue
-    const files = attachmentsFor(id)
-      .filter((a) => (a.kind === 'image' || a.kind === 'audio') && fs.existsSync(a.path))
-      .map((a) => a.path)
-    if (!files.length) {
-      rememberMedia(id, [])
+  const blobs = sentBlobs(chatId, [])
+  for (const message of messages) {
+    if (message.role !== 'user' && message.role !== 'tool') continue
+    if (cache.has(message.id)) continue
+
+    const raw = loadSentContent(message.id)
+    if (raw !== null) {
+      try {
+        remember(message.id, await fromStored(JSON.parse(raw) as StoredContent, blobs))
+        continue
+      } catch (err) {
+        logger.warn('attachments', `could not read what message ${message.id} sent`, err)
+      }
+    }
+
+    // A tool result with no record returned no media.
+    if (message.role === 'tool') {
+      remember(message.id, null)
       continue
     }
-    const rebuilt = await rebuild(files).catch(() => null)
-    if (rebuilt) rememberMedia(id, rebuilt)
+    const rebuilt = await reconstruct(message).catch(() => undefined)
+    if (rebuilt === undefined) continue
+    if (rebuilt === null) remember(message.id, null)
+    else await persistSent(chatId, message.id, rebuilt)
   }
 }

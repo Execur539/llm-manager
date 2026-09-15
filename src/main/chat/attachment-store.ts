@@ -21,7 +21,18 @@ import crypto from 'node:crypto'
 import { nativeImage } from 'electron'
 import { ATTACHMENTS_DIR } from '../storage/paths'
 import { logger } from '../log'
-import { allAttachmentPaths, attachmentRowsForChat, classifyAttachment, setAttachmentStored } from './repo'
+import {
+  allAttachmentPaths,
+  attachmentRowsForChat,
+  classifyAttachment,
+  pruneSentContent,
+  sentContentFiles,
+  setAttachmentStored
+} from './repo'
+import type { BlobStore } from './sent-content'
+
+/** Media a message sent that is not one of its kept attachments, one folder per conversation, named by content. */
+const SENT_DIR = 'sent'
 import { planImageCopy } from './image-copy'
 
 const segment = (s: string): string => s.replace(/[^A-Za-z0-9_-]/g, '_')
@@ -141,6 +152,39 @@ export async function adoptAttachments(chatId: string): Promise<void> {
   }
 }
 
+/**
+ * Where a conversation keeps the media its messages sent, for sent-content.
+ *
+ * Content-addressed: bytes are named by their SHA-256, so the same screenshot sent twice is one
+ * file. Bytes identical to one of `known` — a message's own kept attachments — point at that file
+ * instead, so an attached image is never stored twice.
+ */
+export function sentBlobs(chatId: string, known: string[]): BlobStore {
+  const hash = (bytes: Buffer): string => crypto.createHash('sha256').update(bytes).digest('hex')
+  let byHash: Map<string, string> | null = null
+  return {
+    async put(bytes, ext) {
+      const digest = hash(bytes)
+      if (!byHash) {
+        byHash = new Map()
+        for (const file of known) {
+          const content = await fsp.readFile(file).catch(() => null)
+          if (content) byHash.set(hash(content), file)
+        }
+      }
+      const existing = byHash.get(digest)
+      if (existing) return existing
+      const dir = path.join(ATTACHMENTS_DIR, segment(chatId), SENT_DIR)
+      await fsp.mkdir(dir, { recursive: true })
+      const file = path.join(dir, `${digest}.${ext.replace(/[^A-Za-z0-9]/g, '') || 'bin'}`)
+      if (!fs.existsSync(file)) await fsp.writeFile(file, bytes)
+      byHash.set(digest, file)
+      return file
+    },
+    get: (file) => fsp.readFile(file).catch(() => null)
+  }
+}
+
 /** Delete a conversation's kept copies, when the conversation itself is deleted. */
 export async function deleteConversationFiles(chatId: string): Promise<void> {
   await fsp.rm(path.join(ATTACHMENTS_DIR, segment(chatId)), { recursive: true, force: true }).catch(() => undefined)
@@ -150,26 +194,42 @@ export async function deleteConversationFiles(chatId: string): Promise<void> {
  * Remove kept copies no message refers to any more.
  *
  * They are left behind when a message is deleted or a conversation rewound, since the database
- * drops the rows on its own. Only folders more than an hour old are touched, so a message still
- * being sent never loses a copy it has not recorded yet.
+ * drops the rows on its own. Records of what deleted messages sent go first, so the media only they
+ * referred to can go too. Only things more than an hour old are touched, so a message still being
+ * sent never loses a copy it has not recorded yet.
  */
 export async function pruneOrphanAttachments(): Promise<void> {
-  const referenced = new Set<string>()
-  for (const file of allAttachmentPaths()) {
+  const cutoff = Date.now() - 60 * 60 * 1000
+  pruneSentContent(cutoff)
+
+  const files = new Set<string>()
+  const slots = new Set<string>()
+  for (const file of [...allAttachmentPaths(), ...sentContentFiles()]) {
     if (!isStoredCopy(file)) continue
-    const [chat, slot] = path.relative(ATTACHMENTS_DIR, file).split(path.sep)
-    if (chat && slot) referenced.add(path.join(ATTACHMENTS_DIR, chat, slot))
+    const resolved = path.resolve(file)
+    files.add(resolved)
+    const [chat, slot] = path.relative(ATTACHMENTS_DIR, resolved).split(path.sep)
+    if (chat && slot) slots.add(path.join(ATTACHMENTS_DIR, chat, slot))
   }
 
-  const cutoff = Date.now() - 60 * 60 * 1000
   for (const chat of await fsp.readdir(ATTACHMENTS_DIR, { withFileTypes: true }).catch(() => [])) {
     if (!chat.isDirectory()) continue
     const chatDir = path.join(ATTACHMENTS_DIR, chat.name)
-    for (const slot of await fsp.readdir(chatDir, { withFileTypes: true }).catch(() => [])) {
-      const slotDir = path.join(chatDir, slot.name)
-      if (referenced.has(slotDir)) continue
+    for (const entry of await fsp.readdir(chatDir, { withFileTypes: true }).catch(() => [])) {
+      const target = path.join(chatDir, entry.name)
       try {
-        if ((await fsp.stat(slotDir)).mtimeMs < cutoff) await fsp.rm(slotDir, { recursive: true, force: true })
+        if (entry.isDirectory() && entry.name === SENT_DIR) {
+          // Shared by every message in the conversation, so it is swept file by file.
+          for (const name of await fsp.readdir(target).catch(() => [])) {
+            const blob = path.join(target, name)
+            if (!files.has(blob) && (await fsp.stat(blob)).mtimeMs < cutoff) await fsp.rm(blob, { force: true })
+          }
+          const left = await fsp.readdir(target).catch(() => null)
+          if (left && !left.length) await fsp.rm(target, { recursive: true, force: true })
+          continue
+        }
+        if (slots.has(target)) continue
+        if ((await fsp.stat(target)).mtimeMs < cutoff) await fsp.rm(target, { recursive: true, force: true })
       } catch {
         // Best effort: anything that cannot be examined is left alone.
       }

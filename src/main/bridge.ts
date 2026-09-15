@@ -46,7 +46,7 @@ import { summarizer, type SummarizerHandle } from './runtime/summarizer'
 import { chooseHelperPlacement, helperContext, helperVramNeed, keepRecent, type TranscriptItem } from './agent/compaction'
 import { summariseTranscript, COMPACTION_FAILED } from './agent/summarise'
 import { samplingOptions } from '../shared/sampling'
-import { mediaFor, rememberMedia, restoreMedia } from './chat/media-cache'
+import { persistSent, restoreSent, sentContentFor, sentTextFor } from './chat/media-cache'
 import {
   adoptAttachments,
   deleteConversationFiles,
@@ -80,7 +80,7 @@ import * as rag from './rag'
 import * as chats from './chat/repo'
 import { buildContent, type VideoContext, type PreparedMedia } from './chat/multimodal'
 import { planVideo } from './chat/video-plan'
-import { classifyAttachment, recordAttachment, IMAGE_EXT, AUDIO_EXT, VIDEO_EXT, TEXT_EXT } from './chat/repo'
+import { classifyAttachment, recordAttachment, toDataUrl, IMAGE_EXT, AUDIO_EXT, VIDEO_EXT, TEXT_EXT } from './chat/repo'
 import { historicalStats, liveStats, requestLog, recordGeneration, clearStats, setContextUsed } from './stats'
 import { buildDiagnostics, logger } from './log'
 import { exportChat, writeExport, all, run, get } from './storage/db'
@@ -319,7 +319,10 @@ function getAgent(): Agent {
   if (!agent) {
     agent = new Agent({
       cwd: app.getPath('home'),
-      mediaFor: (messageId) => mediaFor(messageId, llama.loaded?.model.caps),
+      sentContentFor: (messageId) => sentContentFor(messageId, llama.loaded?.model.caps),
+      sentTextFor: (messageId) => sentTextFor(messageId),
+      // Recorded against the session the turn belongs to, which is the one running when it sends.
+      onSent: (messageId, content) => void persistSent(activeAgentSessionId, messageId, content),
       planMode: s.agent.planMode,
       maxToolCallsPerTurn: s.agent.maxToolCallsPerTurn,
       commandTimeoutMs: s.agent.commandTimeoutMs,
@@ -503,11 +506,11 @@ function chatPromptHistory(chatId: string, history: AgentMessage[], preserveReas
   const stored = chats.getSummary(chatId)
   const upto = stored ? history.findIndex((m) => m.id === stored.uptoMessageId) : -1
   const out = (upto === -1 ? history : history.slice(upto + 1)).map((m): ChatMessage => {
-    // An earlier message's images and audio go back with it; the transcript only has its text.
-    const media = m.role === 'user' ? mediaFor(m.id, llama.loaded?.model.caps) : undefined
+    // An earlier message goes back exactly as it was sent, attachments included; the transcript has only its text.
+    const sent = m.role === 'user' ? sentContentFor(m.id, llama.loaded?.model.caps) : undefined
     return {
       role: m.role === 'tool' ? 'user' : (m.role as 'user' | 'assistant' | 'system'),
-      content: media ? [...media, { type: 'text', text: m.content }] : m.content,
+      content: sent ?? m.content,
       ...(preserveReasoning && m.role === 'assistant' && m.reasoning ? { reasoning_content: m.reasoning } : {})
     }
   })
@@ -560,7 +563,7 @@ async function compactChat(
   const live = summary ? history.slice(upto + 1) : history
   const costs = live.map(
     (m) =>
-      estimateTokens(m.content) +
+      estimateTokens(sentTextFor(m.id) ?? m.content) +
       (opts.preserveReasoning && m.role === 'assistant' ? estimateTokens(m.reasoning ?? '') : 0)
   )
   const before = (summary ? estimateTokens(summary.summary) : 0) + costs.reduce((a, n) => a + n, 0)
@@ -587,7 +590,8 @@ async function compactChat(
 
   const items: TranscriptItem[] = [
     ...(summary ? [{ role: 'summary so far', text: summary.summary }] : []),
-    ...older.map((m) => ({ role: m.role, text: m.content }))
+    // What each message sent, where that was more than its text, so attached documents are summarised too.
+    ...older.map((m) => ({ role: m.role, text: sentTextFor(m.id) ?? m.content }))
   ]
 
   let boundary: string | null = null
@@ -622,25 +626,43 @@ async function compactChat(
 }
 
 /**
- * Rebuild an earlier message's images or audio from its attachment files, the way sending them did.
+ * Rebuild what a message from before sent content was recorded sent the model, from its kept files.
  *
- * Null when the loaded model could not take them, so the message is looked at again once one that
- * can is loaded, rather than being remembered as having nothing to send.
+ * Documents are read again, images and audio re-encoded from their kept copies, and a video sent as
+ * the clip and stills made from it — never sampled again. Null when the message carried nothing
+ * beyond its text; undefined when the loaded model cannot take something it carried, so it is looked
+ * at again once one that can is loaded.
  */
-async function rebuildMedia(files: string[]): Promise<ContentPart[] | null> {
+async function reconstructSent(message: AgentMessage): Promise<ContentPart[] | null | undefined> {
+  const rows = chats.attachmentRowsForMessage(message.id)
+  if (!rows.length) return null
   const caps = llama.loaded?.model.caps
-  if (!caps) return null
-  if (files.some((f) => classifyAttachment(f) === 'image') && !caps.vision) return null
-  if (files.some((f) => classifyAttachment(f) === 'audio') && !caps.audio) return null
-  const built = await buildContent('', files, caps, await videoContext())
-  return built.parts.filter((p) => p.type !== 'text')
+  if (!caps) return undefined
+  const video = await videoContext()
+
+  const files = rows.filter((r) => r.kind !== 'video' && fs.existsSync(r.path)).map((r) => r.path)
+  if (files.some((f) => classifyAttachment(f) === 'image') && !caps.vision) return undefined
+  if (files.some((f) => classifyAttachment(f) === 'audio') && !caps.audio) return undefined
+  const parts: ContentPart[] = files.length ? (await buildContent('', files, caps, video)).parts : []
+
+  for (const row of rows.filter((r) => r.kind === 'video')) {
+    const clip = row.meta.optimised && fs.existsSync(row.meta.optimised) ? row.meta.optimised : null
+    const stills = (row.meta.stills ?? []).filter((still) => fs.existsSync(still))
+    if (!clip && !stills.length) continue
+    if (!caps.vision || video.visionUnavailable) return undefined
+    if (clip && video.serverTakesVideo) {
+      parts.push({ type: 'input_video', input_video: { data: (await fsp.readFile(clip)).toString('base64') } })
+    }
+    for (const still of stills) parts.push({ type: 'image_url', image_url: { url: await toDataUrl(still) } })
+  }
+  return parts.length ? [...parts, { type: 'text', text: message.content }] : null
 }
 
-/** A conversation's earlier user messages, with their images and audio at hand for its history. */
+/** A conversation's earlier messages, with everything they sent the model at hand for its history. */
 async function restoreConversationMedia(chatId: string, messages: AgentMessage[]): Promise<void> {
   // Older attachments are brought into the app's own storage first, so a rebuild reads the kept copy.
   await adoptAttachments(chatId).catch(() => undefined)
-  await restoreMedia(messages.filter((m) => m.role === 'user').map((m) => m.id), rebuildMedia)
+  await restoreSent(chatId, messages, reconstructSent)
 }
 
 function companionSize(model: ModelRecord): number {
@@ -1517,8 +1539,6 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         emit('chat:media-progress', { chatId, ...p })
       )
       userContent = built.parts
-      // Kept so the next message's history can send these again; the transcript stores only text.
-      rememberMedia(userMsg.id, built.parts)
       notes.push(...built.notes)
       prepared = new Map(built.media.map((m) => [m.source, m]))
 
@@ -1530,6 +1550,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         const kept = await keepPrepared(chatId, media)
         chats.setAttachmentMeta(id, { optimised: kept.optimised, stills: kept.stills, note: media.note })
       }
+      // Recorded exactly as sent, after the clip has moved, so a rebuilt history sends the same and points at kept files.
+      await persistSent(chatId, userMsg.id, built.parts)
       if (prepared.size) announce()
       emit('chat:media-progress', { chatId, file: '', stage: '' })
     }
@@ -1560,6 +1582,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      * the same passes, helper model and progress — before the prompt is built, and stopping the
      * turn stops the compaction. The new message is costed but never summarised.
      */
+    // What earlier messages sent is loaded first, so compaction counts and summarises their attachments too.
+    await restoreConversationMedia(chatId, history)
     await compactChat(chatId, history, {
       automatic: true,
       pendingTokens:
@@ -1569,8 +1593,6 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       preserveReasoning,
       signal: abort.signal
     })
-    // Earlier messages' images and audio, rebuilt from disk where this run of the app has not sent them.
-    await restoreConversationMedia(chatId, history)
     const messages = chatPromptHistory(chatId, history, preserveReasoning)
     // The parameters panel's system prompt leads, ahead of any summary and the history itself.
     const generation = loadSettings().generation
@@ -1799,8 +1821,6 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      * player: until this point the row knows the file but not the clip that was made from it.
      */
     emit('agent:media-progress', { sessionId, file: '', stage: '' })
-    // Kept so later rebuilds of the history — the next turn, Continue, an edit — send these again.
-    rememberMedia(userMessageId, turn.media)
     if (turn.prepared.length) {
       for (const media of turn.prepared) {
         const id = attachmentIds.get(media.source)
@@ -1924,7 +1944,10 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     if (inFlightChats.has(chatId)) {
       return { ok: false, message: 'A reply is still being written — stop it or let it finish first.' }
     }
-    return compactChat(chatId, chats.loadMessages(chatId), {
+    const history = chats.loadMessages(chatId)
+    // Loaded first, so the summary covers what attachments said rather than only their names.
+    await restoreConversationMedia(chatId, history)
+    return compactChat(chatId, history, {
       automatic: false,
       preserveReasoning: loadSettings().reasoning.preserve
     })

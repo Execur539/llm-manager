@@ -286,6 +286,28 @@ export const MIGRATIONS: { id: number; sql: string }[] = [
     ALTER TABLE chats ADD COLUMN summary TEXT;
     ALTER TABLE chats ADD COLUMN summary_upto TEXT;
     `
+  },
+  {
+    id: 9,
+    sql: `
+    -- What a message sent the model, when that was more than the text stored in messages.
+    --
+    -- The transcript keeps what the user typed. The model was often sent more: attached documents'
+    -- text, images, audio, a sampled video and its stills, an Ultra plan in the prompt, a screenshot
+    -- a tool returned. Rebuilding a history from the transcript alone dropped all of it. The parts
+    -- are stored as JSON here, with media as references to kept files rather than inline bytes.
+    --
+    -- Keyed to the conversation rather than the message on purpose: a tool result's record is
+    -- written mid-turn, before the turn stores the message it belongs to. Rows for messages that
+    -- are later deleted are cleared at startup.
+    CREATE TABLE IF NOT EXISTS message_content (
+      message_id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_message_content_chat ON message_content(chat_id);
+    `
   }
 ]
 
