@@ -39,6 +39,7 @@ import PendingToolCall from '../components/PendingToolCall'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
+import ParametersPanel, { ParamsToggle, useParamsPanel } from '../components/ParametersPanel'
 
 /**
  * An answer being continued, drawn with what has arrived so far folded in.
@@ -125,6 +126,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   /** The message currently open for rewriting, at most one at a time. */
   const [editing, setEditing] = useState<string | null>(null)
   const attachments = useAttachments()
+  const [paramsOpen, setParamsOpen] = useParamsPanel()
 
   const stream = useStream()
   // Selection lives in the store so a remount restores the open session, not a blank pane.
@@ -527,6 +529,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
               Stop
             </button>
           )}
+          <ParamsToggle open={paramsOpen} onToggle={() => setParamsOpen(!paramsOpen)} />
         </div>
 
         {showTools && (
@@ -805,6 +808,9 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
         </div>
       </div>
       </DropZone>
+      {paramsOpen && (
+        <ParametersPanel kind="agent" modelId={loaded?.modelId ?? null} onClose={() => setParamsOpen(false)} />
+      )}
     </div>
   )
 }

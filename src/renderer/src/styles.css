@@ -3499,6 +3499,186 @@ button.danger.subtle:hover {
  * the same glance as the dead input. Amber rather than red: nothing is wrong, the session is
  * simply making room for itself to continue.
  */
+/* ---------------------------------------------------------------- parameters panel */
+
+/*
+ * The per-request parameters, on the right of the conversation.
+ *
+ * Mirrors the conversation rail on the left: a scroll of its own and a hairline between it and
+ * the transcript, taking no width from the composer while it is closed.
+ */
+.params-panel {
+  width: 272px;
+  flex-shrink: 0;
+  min-height: 0;
+  overflow-y: auto;
+  border-left: 1px solid var(--border);
+  padding: 0 6px 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.params-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.params-title {
+  font-weight: 600;
+  margin-right: auto;
+}
+
+.params-note {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-faint);
+}
+
+.params-group-title {
+  margin-bottom: 9px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+details.params-group > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+details.params-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.params-group > summary::before {
+  content: '';
+  display: inline-block;
+  width: 0;
+  height: 0;
+  margin: 0 7px 1px 1px;
+  border-left: 4px solid currentColor;
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transition: transform 120ms ease;
+}
+
+details.params-group[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.param + .param {
+  margin-top: 11px;
+}
+
+.param {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.param-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.param-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+/* A parameter that has been set reads brighter than one left at its default. */
+.param.set .param-label {
+  color: var(--text);
+}
+
+.param-input {
+  width: 78px;
+  height: 26px;
+  padding: 2px 7px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.param-select {
+  width: 128px;
+  height: 26px;
+}
+
+.param-reset {
+  width: 22px;
+  min-width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-faint);
+}
+
+.param-reset:disabled {
+  visibility: hidden;
+}
+
+.param-slider {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+/* At its default the slider only shows where the default sits. */
+.param-slider.unset {
+  opacity: 0.45;
+}
+
+.params-text {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.params-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.params-toggle.active {
+  background: var(--bg-inset);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+@media (max-width: 1250px) {
+  .params-panel {
+    width: 240px;
+  }
+}
+
+/* Too narrow for a third column: the panel floats over the conversation instead. */
+@media (max-width: 900px) {
+  .params-panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 35;
+    width: min(320px, 90vw);
+    padding: 16px;
+    border-left: 1px solid var(--border-strong);
+    background: var(--sidebar);
+    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.35);
+  }
+}
+
 /* Where a chat's summary ends and the model's word-for-word view begins. */
 .summary-divider {
   display: flex;

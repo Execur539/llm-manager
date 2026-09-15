@@ -8,6 +8,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { AppSettings } from '@shared/types'
 import { APPDATA_DIR, SETTINGS_FILE } from './paths'
+import { DEFAULT_SAMPLING } from '../../shared/sampling'
 
 export const DEFAULT_SETTINGS: AppSettings = {
   modelsDir: null,
@@ -110,6 +111,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
     threads: 0,
     batchSize: 0,
     ubatchSize: 0
+  },
+  generation: {
+    systemPrompt: '',
+    sampling: { ...DEFAULT_SAMPLING, stop: [] }
   },
   video: {
     /*

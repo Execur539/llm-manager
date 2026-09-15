@@ -23,7 +23,9 @@ await build({
     queue: path.join(ROOT, 'src/main/downloads/queue.ts'),
     ultra: path.join(ROOT, 'src/main/ultra/index.ts'),
     markdown: path.join(ROOT, 'src/renderer/src/lib/markdown.ts'),
-    continuation: path.join(ROOT, 'src/shared/continuation.ts')
+    continuation: path.join(ROOT, 'src/shared/continuation.ts'),
+    sampling: path.join(ROOT, 'src/shared/sampling.ts'),
+    imageCopy: path.join(ROOT, 'src/main/chat/image-copy.ts')
   },
   outdir: path.join(ROOT, 'scripts/built'),
   bundle: true,

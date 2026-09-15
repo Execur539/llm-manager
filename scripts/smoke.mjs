@@ -49,6 +49,8 @@ const {
 } = await import('./built/compaction.js')
 const { isVirtualAdapter, classifyProbeError, verdictFor, mergeDetection, parseNvidiaCsv } = await import('./built/gpu.js')
 const { continuedMessage } = await import('./built/continuation.js')
+const { samplingOptions, SAMPLING_FIELDS, DEFAULT_SAMPLING } = await import('./built/sampling.js')
+const { planImageCopy, MAX_IMAGE_EDGE } = await import('./built/imageCopy.js')
 const { exportFilename, uniquePath } = await import('./built/filenames.js')
 const { detectReasoning, reasoningRequestFields } = await import('./built/reasoning.js')
 
@@ -980,6 +982,35 @@ section('Compaction helper: chunks, progress, loops and placement')
   check('an empty conversation keeps nothing', keepRecent([], 100) === 0)
   check('a chat is summarised as a conversation, not as a log of work',
     /conversation/i.test(instructionsFor('chat').chunk) && instructionsFor('chat').merge !== instructionsFor('agent').merge)
+}
+
+section('Attachments: a kept copy is reduced only past what a projector reads')
+{
+  check('an image within the limit is kept as it came', planImageCopy({ width: 1920, height: 1080, ext: '.png' }).action === 'copy')
+  const wide = planImageCopy({ width: 7680, height: 4320, ext: '.PNG' })
+  check('a larger one is reduced to the limit on its long side',
+    wide.action === 'resize' && wide.width === MAX_IMAGE_EDGE && wide.height === 1152, JSON.stringify(wide))
+  check('a PNG stays lossless', wide.action === 'resize' && wide.format === 'png')
+  const photo = planImageCopy({ width: 3000, height: 4000, ext: 'jpeg' })
+  check('a tall JPEG stays a JPEG, reduced on its long side',
+    photo.action === 'resize' && photo.format === 'jpeg' && photo.height === MAX_IMAGE_EDGE && photo.width === 1536, JSON.stringify(photo))
+  check('a format that cannot be re-encoded is kept as it came', planImageCopy({ width: 5000, height: 5000, ext: '.webp' }).action === 'copy')
+  check('an image of unknown size is kept as it came', planImageCopy({ width: 0, height: 0, ext: '.png' }).action === 'copy')
+}
+
+section('Parameters panel: settings become request options')
+{
+  check('nothing set sends nothing', Object.keys(samplingOptions(DEFAULT_SAMPLING)).length === 0)
+  const set = samplingOptions({ ...DEFAULT_SAMPLING, temperature: 0.3, topK: 40.6, repeatPenalty: 9, minP: Number.NaN, stop: ['</answer>', ''] })
+  check('a value that is set is sent', set.temperature === 0.3)
+  check('whole-number parameters are rounded', set.topK === 41, `${set.topK}`)
+  check('an out-of-range value is brought into range', set.repeatPenalty === 2, `${set.repeatPenalty}`)
+  check('a value that is not a number is left out', !('minP' in set))
+  check('empty stop strings are left out', JSON.stringify(set.stop) === JSON.stringify(['</answer>']))
+  check('a hand-edited string is not trusted as a number', !('topP' in samplingOptions({ ...DEFAULT_SAMPLING, topP: '0.5' })))
+  check('every parameter has its own llama-server field',
+    SAMPLING_FIELDS.every((f) => /^[a-z_]+$/.test(f.serverKey)) && new Set(SAMPLING_FIELDS.map((f) => f.serverKey)).size === SAMPLING_FIELDS.length)
+  check('every parameter defaults to unset', SAMPLING_FIELDS.every((f) => DEFAULT_SAMPLING[f.key] === null) && DEFAULT_SAMPLING.stop.length === 0)
 }
 
 section('Continue: picking up exactly where it stopped')

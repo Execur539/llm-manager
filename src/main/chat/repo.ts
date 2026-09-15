@@ -339,8 +339,12 @@ export function recordAttachment(messageId: string, att: AttachmentInput, meta?:
  * a two-minute video can take a minute to sample, and a message that does not appear until that
  * finishes looks like the app has hung. What the sampler made of it is known only afterwards.
  */
-export function setAttachmentMeta(id: string, meta: unknown): void {
-  run('UPDATE attachments SET meta = ? WHERE id = ?', meta ? JSON.stringify(meta) : null, id)
+export function setAttachmentMeta(id: string, meta: AttachmentMeta): void {
+  const row = get<{ meta: string | null }>('SELECT meta FROM attachments WHERE id = ?', id)
+  // Merged, so what preparing the file found does not erase where its kept copy came from.
+  const defined = Object.fromEntries(Object.entries(meta ?? {}).filter(([, v]) => v !== undefined))
+  const merged = { ...parseMeta(row?.meta ?? null), ...defined }
+  run('UPDATE attachments SET meta = ? WHERE id = ?', Object.keys(merged).length ? JSON.stringify(merged) : null, id)
 }
 
 export function attachmentsFor(messageId: string): { id: string; kind: string; path: string }[] {
@@ -351,11 +355,21 @@ export function attachmentsFor(messageId: string): { id: string; kind: string; p
 }
 
 /** What was stored alongside an attachment when the message was sent. */
-interface AttachmentMeta {
+export interface AttachmentMeta {
   /** The re-encoded clip actually sent to the model, when one was built. */
   optimised?: string
   stills?: string[]
   note?: string
+  /** The user's own file, when the attachment now points at the app's kept copy of it. */
+  original?: string
+}
+
+function parseMeta(raw: string | null): AttachmentMeta {
+  try {
+    return (JSON.parse(raw ?? '{}') as AttachmentMeta) ?? {}
+  } catch {
+    return {}
+  }
 }
 
 /**
@@ -411,6 +425,30 @@ export function attachmentsForMessage(messageId: string): MessageAttachment[] {
     'SELECT id, kind, path, meta FROM attachments WHERE message_id = ? ORDER BY created_at, rowid',
     messageId
   ).map(toMessageAttachment)
+}
+
+/** Every attachment in a conversation, with its path and extras, for keeping its files. */
+export function attachmentRowsForChat(chatId: string): { id: string; kind: string; path: string; meta: AttachmentMeta }[] {
+  return all<{ id: string; kind: string; path: string; meta: string | null }>(
+    `SELECT a.id, a.kind, a.path, a.meta
+       FROM attachments a
+       JOIN messages m ON m.id = a.message_id
+      WHERE m.chat_id = ?`,
+    chatId
+  ).map((r) => ({ id: r.id, kind: r.kind, path: r.path, meta: parseMeta(r.meta) }))
+}
+
+/** Point an attachment at the app's kept copy of its file, with its extras. */
+export function setAttachmentStored(id: string, file: string, meta: AttachmentMeta): void {
+  run('UPDATE attachments SET path = ?, meta = ? WHERE id = ?', file, JSON.stringify(meta), id)
+}
+
+/** Every file any attachment refers to, clips and stills included: what the kept copies must not lose. */
+export function allAttachmentPaths(): string[] {
+  return all<{ path: string; meta: string | null }>('SELECT path, meta FROM attachments').flatMap((r) => {
+    const meta = parseMeta(r.meta)
+    return [r.path, ...(meta.optimised ? [meta.optimised] : []), ...(meta.stills ?? [])]
+  })
 }
 
 function toMessageAttachment(r: { id: string; kind: string; path: string; meta: string | null }): MessageAttachment {

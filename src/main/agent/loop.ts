@@ -54,6 +54,7 @@ import { type CompactionHelper, type TranscriptItem } from './compaction'
 import { summariseTranscript } from './summarise'
 // Relative, not `@shared`: the main-process bundle has no such alias, so only type imports can use it.
 import { continuedMessage } from '../../shared/continuation'
+import { samplingOptions, AGENT_TEMPERATURE, type SamplingSettings } from '../../shared/sampling'
 
 export interface AgentOptions {
   cwd: string
@@ -86,6 +87,14 @@ export interface AgentOptions {
    * it had decided something a few messages back.
    */
   preserveReasoning?: boolean
+  /** Sampling parameters from the parameters panel; any left unset keep the loop's own defaults. */
+  sampling?: SamplingSettings
+  /**
+   * The images and audio an earlier user message was sent with, for a history rebuilt from storage.
+   *
+   * The transcript keeps text only, so without this every rebuild dropped them — see media-cache.
+   */
+  mediaFor?: (messageId: string) => ContentPart[] | undefined
   /** true when the caller is a remote web-UI session */
   remote?: boolean
   remoteToolsEnabled?: boolean
@@ -717,6 +726,15 @@ Platform: Windows (PowerShell)${memoryBlock}`
             return { role: 'user', content: `[tool result]\n${m.content}` }
           }
           /*
+           * A user message goes back with the images and audio it was sent with. The transcript
+           * stores only its text, so a rebuilt history — Continue, an edit, a restart — used to send
+           * every earlier image as nothing, and the model answered as if it had never seen them.
+           */
+          const media = m.role === 'user' ? this.opts.mediaFor?.(m.id) : undefined
+          if (media?.length) {
+            return { role: 'user', content: [...media, { type: 'text', text: m.content }] }
+          }
+          /*
            * Past reasoning goes back with the answer it produced, so the model can remember why it
            * decided what it did — not only what it said. `--reasoning-preserve` is what stops the
            * template from dropping all but the latest.
@@ -737,9 +755,8 @@ Platform: Windows (PowerShell)${memoryBlock}`
    *
    * `media` carries image and audio parts for a turn that has attachments on a model that can
    * take them. They go to the model but not into the transcript: the parts hold base64 payloads
-   * megabytes wide, and the persisted message keeps the readable text instead. The consequence
-   * is that media lives for the life of the running session — resuming a session after a restart
-   * rebuilds the history from stored text, so the file is named but no longer shown.
+   * megabytes wide, and the persisted message keeps the readable text instead. A history rebuilt
+   * from storage gets them back through `mediaFor`, which the bridge fills from the turn as sent.
    */
   async run(
     session: AgentSessionState,
@@ -871,6 +888,8 @@ Platform: Windows (PowerShell)${memoryBlock}`
         const resuming = continueFinal
         // Spent on the first step: whatever follows is new text of its own, not a resumption.
         continueFinal = false
+        // Read per step, so a change in the parameters panel applies from the next request.
+        const sampling = samplingOptions(this.opts.sampling)
 
         for await (const ev of untilStopped(
           llama.streamEvents({
@@ -878,7 +897,9 @@ Platform: Windows (PowerShell)${memoryBlock}`
             tools: this.availableTools(),
             signal,
             continueFinal: resuming,
-            temperature: this.samplingTemperature ?? 0.6,
+            ...sampling,
+            // A planning sample's own temperature still wins: stepping it is how Ultra's drafts differ.
+            temperature: this.samplingTemperature ?? sampling.temperature ?? AGENT_TEMPERATURE,
             ...reasoningRequestFields(llama.loaded?.model.caps.reasoning, this.opts.reasoningChoice ?? null)
           })
         )) {

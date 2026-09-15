@@ -34,6 +34,7 @@ import CompactingNotice from '../components/CompactingNotice'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
+import ParametersPanel, { ParamsToggle, useParamsPanel } from '../components/ParametersPanel'
 
 interface Collection {
   id: string
@@ -49,6 +50,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   const [collectionId, setCollectionId] = useState('')
   const [error, setError] = useState<string | null>(null)
   const attachments = useAttachments()
+  const [paramsOpen, setParamsOpen] = useParamsPanel()
 
   // Streaming and selection both live in the store, so leaving this page mid-response no longer
   // discards the text or forgets which conversation was open.
@@ -278,6 +280,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               Export
             </button>
           )}
+          <ParamsToggle open={paramsOpen} onToggle={() => setParamsOpen(!paramsOpen)} />
         </div>
 
         {!loaded && (
@@ -453,6 +456,9 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
         </div>
       </div>
       </DropZone>
+      {paramsOpen && (
+        <ParametersPanel kind="chat" modelId={loaded?.modelId ?? null} onClose={() => setParamsOpen(false)} />
+      )}
     </div>
   )
 }

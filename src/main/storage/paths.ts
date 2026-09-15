@@ -30,6 +30,13 @@ export const SESSIONS_DIR = path.join(APPDATA_DIR, 'sessions')
 export const CHECKPOINTS_DIR = path.join(APPDATA_DIR, 'checkpoints')
 /** Full tool outputs that were truncated in-context but kept re-readable on disk. */
 export const TOOL_OUTPUT_DIR = path.join(APPDATA_DIR, 'tool-output')
+/**
+ * The app's kept copies of what was attached to conversations, one folder per conversation.
+ *
+ * Apart from tool-output on purpose: that folder is swept weekly, and these last as long as the
+ * messages that refer to them.
+ */
+export const ATTACHMENTS_DIR = path.join(APPDATA_DIR, 'attachments')
 
 export const MODELS_DIR_NAME = 'LLMManagerModels'
 
@@ -97,7 +104,7 @@ export function defaultModelsDir(): string {
 }
 
 export function ensureDirs(): void {
-  for (const dir of [APPDATA_DIR, LOGS_DIR, SESSIONS_DIR, CHECKPOINTS_DIR, TOOL_OUTPUT_DIR]) {
+  for (const dir of [APPDATA_DIR, LOGS_DIR, SESSIONS_DIR, CHECKPOINTS_DIR, TOOL_OUTPUT_DIR, ATTACHMENTS_DIR]) {
     fs.mkdirSync(dir, { recursive: true })
   }
 }

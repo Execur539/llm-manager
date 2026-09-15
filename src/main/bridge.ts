@@ -45,6 +45,15 @@ import { searchModels, listFiles, groupVariants, recommendQuant, findMmprojFor, 
 import { summarizer, type SummarizerHandle } from './runtime/summarizer'
 import { chooseHelperPlacement, helperContext, helperVramNeed, keepRecent, type TranscriptItem } from './agent/compaction'
 import { summariseTranscript, COMPACTION_FAILED } from './agent/summarise'
+import { samplingOptions } from '../shared/sampling'
+import { mediaFor, rememberMedia, restoreMedia } from './chat/media-cache'
+import {
+  adoptAttachments,
+  deleteConversationFiles,
+  keepPrepared,
+  pruneOrphanAttachments,
+  storeAttachment
+} from './chat/attachment-store'
 import { downloadQueue } from './downloads/queue'
 import { apiServer, requestQueue } from './api/server'
 import { tunnel } from './remote/tunnel'
@@ -310,6 +319,7 @@ function getAgent(): Agent {
   if (!agent) {
     agent = new Agent({
       cwd: app.getPath('home'),
+      mediaFor: (messageId) => mediaFor(messageId, llama.loaded?.model.caps),
       planMode: s.agent.planMode,
       maxToolCallsPerTurn: s.agent.maxToolCallsPerTurn,
       commandTimeoutMs: s.agent.commandTimeoutMs,
@@ -412,6 +422,7 @@ function syncAgentOptions(): void {
     compaction: s.agent.compaction,
     remoteToolsEnabled: s.agent.remoteToolsEnabled,
     preserveReasoning: s.reasoning.preserve,
+    sampling: s.generation.sampling,
     backend: hardware?.backend,
     hfToken: getHfToken()
   })
@@ -491,18 +502,22 @@ const MEDIA_TOKEN_ESTIMATE = 1200
 function chatPromptHistory(chatId: string, history: AgentMessage[], preserveReasoning: boolean): ChatMessage[] {
   const stored = chats.getSummary(chatId)
   const upto = stored ? history.findIndex((m) => m.id === stored.uptoMessageId) : -1
-  const out = (upto === -1 ? history : history.slice(upto + 1)).map(
-    (m): ChatMessage => ({
+  const out = (upto === -1 ? history : history.slice(upto + 1)).map((m): ChatMessage => {
+    // An earlier message's images and audio go back with it; the transcript only has its text.
+    const media = m.role === 'user' ? mediaFor(m.id, llama.loaded?.model.caps) : undefined
+    return {
       role: m.role === 'tool' ? 'user' : (m.role as 'user' | 'assistant' | 'system'),
-      content: m.content,
+      content: media ? [...media, { type: 'text', text: m.content }] : m.content,
       ...(preserveReasoning && m.role === 'assistant' && m.reasoning ? { reasoning_content: m.reasoning } : {})
-    })
-  )
+    }
+  })
   if (stored && upto !== -1) {
     const note = `[Summary of the earlier conversation]\n${stored.summary}`
     const first = out[0]
     if (first?.role === 'user' && typeof first.content === 'string') {
       out[0] = { ...first, content: `${note}\n\n[The conversation continues]\n${first.content}` }
+    } else if (first?.role === 'user' && Array.isArray(first.content)) {
+      out[0] = { ...first, content: [{ type: 'text', text: `${note}\n\n[The conversation continues]` }, ...first.content] }
     } else {
       out.unshift({ role: 'user', content: note })
     }
@@ -604,6 +619,28 @@ async function compactChat(
   } finally {
     emit('chat:compacted', { chatId, uptoMessageId: boundary })
   }
+}
+
+/**
+ * Rebuild an earlier message's images or audio from its attachment files, the way sending them did.
+ *
+ * Null when the loaded model could not take them, so the message is looked at again once one that
+ * can is loaded, rather than being remembered as having nothing to send.
+ */
+async function rebuildMedia(files: string[]): Promise<ContentPart[] | null> {
+  const caps = llama.loaded?.model.caps
+  if (!caps) return null
+  if (files.some((f) => classifyAttachment(f) === 'image') && !caps.vision) return null
+  if (files.some((f) => classifyAttachment(f) === 'audio') && !caps.audio) return null
+  const built = await buildContent('', files, caps, await videoContext())
+  return built.parts.filter((p) => p.type !== 'text')
+}
+
+/** A conversation's earlier user messages, with their images and audio at hand for its history. */
+async function restoreConversationMedia(chatId: string, messages: AgentMessage[]): Promise<void> {
+  // Older attachments are brought into the app's own storage first, so a rebuild reads the kept copy.
+  await adoptAttachments(chatId).catch(() => undefined)
+  await restoreMedia(messages.filter((m) => m.role === 'user').map((m) => m.id), rebuildMedia)
 }
 
 function companionSize(model: ModelRecord): number {
@@ -885,6 +922,8 @@ async function pruneStagedUploads(): Promise<void> {
   }
 
   await sweep(TOOL_OUTPUT_DIR)
+  // Kept attachment copies are not aged out, but ones no message refers to any more are removed.
+  await pruneOrphanAttachments().catch(() => undefined)
 }
 
 /**
@@ -927,7 +966,10 @@ async function videoContext(): Promise<VideoContext> {
 
 async function attachmentTurn(
   input: string,
+  /** What is sent: the app's kept copies of images and audio, and any other file as attached. */
   files: string[],
+  /** The user's own files, which are what the agent should act on if it opens one. */
+  originals: string[],
   onStage?: (p: { file: string; stage: string }) => void
 ): Promise<{ text: string; media: ContentPart[]; prepared: PreparedMedia[] }> {
   const caps = llama.loaded?.model.caps
@@ -943,7 +985,7 @@ async function attachmentTurn(
   }
 
   // Named whether or not they were also sent as media, so the agent can act on the file itself.
-  const onDisk = files.filter((f) => classifyAttachment(f) !== 'doc')
+  const onDisk = originals.filter((f) => classifyAttachment(f) !== 'doc')
   if (onDisk.length) {
     sections.push(`Attached files on disk:\n${onDisk.map((f) => `- ${f}`).join('\n')}`)
   }
@@ -1196,6 +1238,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
 
   // ---- model runtime
   'model:load': (modelId: string, plan?: FitPlan) => loadModelById(modelId, plan),
+  'model:sampling-defaults': () => llama.samplingDefaults(),
   'model:unload': async () => {
     await llama.unload()
     // The helper was placed in what this model left free; it is placed again against the next one.
@@ -1329,7 +1372,11 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   // ---- chats
   'chat:list': (kind?: 'chat' | 'agent') => chats.listChats(kind),
   'chat:create': (opts: Parameters<typeof chats.createChat>[0]) => chats.createChat(opts ?? {}),
-  'chat:load': (id: string) => chats.loadSession(id),
+  'chat:load': async (id: string) => {
+    // Attachments from before copies were kept are brought in the first time a conversation opens.
+    await adoptAttachments(id).catch(() => undefined)
+    return chats.loadSession(id)
+  },
   'chat:rename': (id: string, title: string) => {
     chats.renameChat(id, title)
     return true
@@ -1339,6 +1386,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     // Messages, tasks and attachments cascade out of the database; a session's file snapshots
     // live on disk and were left behind, holding a full copy of everything the agent had edited.
     await discardCheckpoints(id)
+    // Its kept attachment copies go with it; nothing else refers to them.
+    await deleteConversationFiles(id)
     return true
   },
   'chat:search': (query: string) => chats.searchChats(query),
@@ -1423,10 +1472,25 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       createdAt: Date.now()
     }
     chats.appendMessage(chatId, userMsg)
+    /*
+     * Images and audio are copied into the app's own storage first, and the copy is what is recorded
+     * and sent, so a restart, a moved original or a week-old paste can no longer change or lose what
+     * the model saw — see attachment-store. Video and documents keep their own paths.
+     */
+    const sendFiles: string[] = []
     const attachmentIds = new Map<string, string>()
     for (const file of attachments ?? []) {
+      const stored = await storeAttachment(chatId, file)
+      sendFiles.push(stored)
       try {
-        attachmentIds.set(file, recordAttachment(userMsg.id, { path: file, kind: classifyAttachment(file) }))
+        attachmentIds.set(
+          stored,
+          recordAttachment(
+            userMsg.id,
+            { path: stored, kind: classifyAttachment(file) },
+            stored !== file ? { original: file } : undefined
+          )
+        )
       } catch (err) {
         // A missing attachment row must never cost the user their message — but it should not
         // vanish without trace either, or the only symptom is an export that quietly lost a file.
@@ -1449,17 +1513,22 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     announce()
 
     if (attachments?.length) {
-      const built = await buildContent(text, attachments, loaded.model.caps, await videoContext(), (p) =>
+      const built = await buildContent(text, sendFiles, loaded.model.caps, await videoContext(), (p) =>
         emit('chat:media-progress', { chatId, ...p })
       )
       userContent = built.parts
+      // Kept so the next message's history can send these again; the transcript stores only text.
+      rememberMedia(userMsg.id, built.parts)
       notes.push(...built.notes)
       prepared = new Map(built.media.map((m) => [m.source, m]))
 
-      // Now that the clip exists, the row can point at it and the player gains its toggle.
+      // Now that the clip exists, the row can point at it and the player gains its toggle. The clip and
+      // stills move out of the weekly-swept scratch folder first, so the player keeps working after it.
       for (const media of prepared.values()) {
         const id = attachmentIds.get(media.source)
-        if (id) chats.setAttachmentMeta(id, { optimised: media.optimised, stills: media.stills, note: media.note })
+        if (!id) continue
+        const kept = await keepPrepared(chatId, media)
+        chats.setAttachmentMeta(id, { optimised: kept.optimised, stills: kept.stills, note: media.note })
       }
       if (prepared.size) announce()
       emit('chat:media-progress', { chatId, file: '', stage: '' })
@@ -1493,15 +1562,26 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      */
     await compactChat(chatId, history, {
       automatic: true,
-      pendingTokens: estimateTokens(text) + (attachments?.length ?? 0) * MEDIA_TOKEN_ESTIMATE,
+      pendingTokens:
+        estimateTokens(text) +
+        estimateTokens(String(loadSettings().generation.systemPrompt ?? '')) +
+        (attachments?.length ?? 0) * MEDIA_TOKEN_ESTIMATE,
       preserveReasoning,
       signal: abort.signal
     })
+    // Earlier messages' images and audio, rebuilt from disk where this run of the app has not sent them.
+    await restoreConversationMedia(chatId, history)
     const messages = chatPromptHistory(chatId, history, preserveReasoning)
+    // The parameters panel's system prompt leads, ahead of any summary and the history itself.
+    const generation = loadSettings().generation
+    const systemPrompt = String(generation.systemPrompt ?? '')
+    if (systemPrompt.trim()) messages.unshift({ role: 'system', content: systemPrompt })
     if (ragContext) messages.push({ role: 'system', content: ragContext })
 
     const request: CompletionOptions = {
       messages: [...messages, { role: 'user', content: userContent }],
+      // The parameters panel's settings. Ultra keeps them for every sample, stepping only the temperature.
+      ...samplingOptions(generation.sampling),
       signal: abort.signal,
       // Dropped silently if the model never advertised the level — see reasoningRequestFields.
       ...reasoningRequestFields(loaded.model.caps.reasoning, effort)
@@ -1670,10 +1750,21 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       createdAt: Date.now()
     })
 
+    // Kept copies first, recorded and sent in place of the originals — the same as the chat path.
+    const sendFiles: string[] = []
     const attachmentIds = new Map<string, string>()
     for (const file of attachments ?? []) {
+      const stored = await storeAttachment(sessionId, file)
+      sendFiles.push(stored)
       try {
-        attachmentIds.set(file, recordAttachment(userMessageId, { path: file, kind: classifyAttachment(file) }))
+        attachmentIds.set(
+          stored,
+          recordAttachment(
+            userMessageId,
+            { path: stored, kind: classifyAttachment(file) },
+            stored !== file ? { original: file } : undefined
+          )
+        )
       } catch (err) {
         logger.warn('agent', `could not record attachment ${file}`, err)
       }
@@ -1700,7 +1791,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      * file that is minutes, and it all used to happen above this point with nothing shown.
      */
     const turn = attachments?.length
-      ? await attachmentTurn(input, attachments, (p) => emit('agent:media-progress', { sessionId, ...p }))
+      ? await attachmentTurn(input, sendFiles, attachments, (p) => emit('agent:media-progress', { sessionId, ...p }))
       : { text: input, media: [] as ContentPart[], prepared: [] as PreparedMedia[] }
 
     /*
@@ -1708,10 +1799,15 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      * player: until this point the row knows the file but not the clip that was made from it.
      */
     emit('agent:media-progress', { sessionId, file: '', stage: '' })
+    // Kept so later rebuilds of the history — the next turn, Continue, an edit — send these again.
+    rememberMedia(userMessageId, turn.media)
     if (turn.prepared.length) {
       for (const media of turn.prepared) {
         const id = attachmentIds.get(media.source)
-        if (id) chats.setAttachmentMeta(id, { optimised: media.optimised, stills: media.stills, note: media.note })
+        if (!id) continue
+        // Out of the weekly-swept scratch folder before the row points at them.
+        const kept = await keepPrepared(sessionId, media)
+        chats.setAttachmentMeta(id, { optimised: kept.optimised, stills: kept.stills, note: media.note })
       }
       announce()
     }
@@ -1720,6 +1816,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     activeAgentSessionId = sessionId
     const turnAbort = new AbortController()
     agentTurnAbort = turnAbort
+    // Every turn rebuilds the history from storage, which keeps only text; the images come from here.
+    await restoreConversationMedia(session.id, session.messages)
     a.hydrate(session)
     // A prompt left unanswered by an earlier turn (window reloaded, remote tab closed) would
     // otherwise sit in the map forever and never be answerable again.
@@ -1855,6 +1953,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
 
     const a = getAgent()
     activeAgentSessionId = id
+    // The history compaction leaves behind is the one the next turn uses, images included.
+    await restoreConversationMedia(session.id, session.messages)
     a.hydrate(session)
     const report = await a.compactNow(session)
 
@@ -1984,6 +2084,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     activeAgentSessionId = sessionId
     const turnAbort = new AbortController()
     agentTurnAbort = turnAbort
+    await restoreConversationMedia(session.id, session.messages)
     a.hydrate(session)
     drainPendingPermissions()
 
@@ -2049,6 +2150,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      * Hydrated deliberately, unlike the ordinary send path, which reuses the rolling window.
      * Continuing usually follows an edit, and the point of an edit is that the window is stale.
      */
+    // With the images the earlier messages were sent with — without them the model resumes blind.
+    await restoreConversationMedia(session.id, session.messages)
     a.hydrate(session)
     drainPendingPermissions()
 

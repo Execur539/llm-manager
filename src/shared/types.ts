@@ -560,6 +560,16 @@ export interface AppSettings {
      */
     ubatchSize: number
   }
+  /**
+   * What each request asks of the model: a system prompt for chats, and the sampling parameters.
+   *
+   * None of it needs the model reloaded — it travels with every request — which is why it lives in a
+   * panel beside the conversation rather than in Settings.
+   */
+  generation: {
+    systemPrompt: string
+    sampling: import('./sampling').SamplingSettings
+  }
   reasoning: {
     /**
      * Show the model its own reasoning from earlier turns, not only from the current one.

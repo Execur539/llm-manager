@@ -25,6 +25,8 @@ import { TOOL_OUTPUT_DIR } from '../storage/paths'
 import { loadSettings } from '../storage/settings'
 import { nglFor } from '../autofit/engine'
 import { logger } from '../log'
+// Relative, not `@shared`: the main-process bundle has no such alias for value imports.
+import { DEFAULT_TEMPERATURE, DEFAULT_TOP_P, SAMPLING_FIELDS, type SamplingOptions } from '../../shared/sampling'
 
 /** Location of the stand-in server used when LLMM_MOCK_LLAMA=1. */
 function mockServerPath(): string {
@@ -96,19 +98,19 @@ export interface ChatMessage {
   reasoning_content?: string
 }
 
-export interface CompletionOptions {
+/**
+ * Everything a request can ask of the server.
+ *
+ * The sampling parameters — temperature, top-p, penalties, seed, stop strings and the rest — come
+ * from the table the parameters panel is drawn from, so a parameter added there is one requests
+ * can carry.
+ */
+export interface CompletionOptions extends SamplingOptions {
   messages: ChatMessage[]
-  temperature?: number
-  topP?: number
-  topK?: number
-  minP?: number
-  repeatPenalty?: number
-  maxTokens?: number
   /** OpenAI-style tool definitions; llama.cpp maps these onto the model's template */
   tools?: ToolDefinition[]
   /** GBNF grammar to constrain sampling — the safety net for weak tool models */
   grammar?: string
-  stop?: string[]
   /**
    * Reasoning effort, as named by the model's own chat template.
    *
@@ -289,6 +291,30 @@ export class LlamaRuntime extends EventEmitter {
       this.modalityCache = none
     }
     return this.modalityCache
+  }
+
+  /**
+   * The sampling defaults the running server applies to any field a request leaves out.
+   *
+   * llama-server reports them in `/props`, already including any recommended settings the model
+   * file carries — which is what the parameters panel shows in a field nobody has set. Asked for
+   * fresh each time, since it is one small local request. Null when nothing is loaded or the
+   * server does not say.
+   */
+  async samplingDefaults(): Promise<Record<string, number> | null> {
+    const loaded = this.current
+    if (!loaded) return null
+    try {
+      const res = await fetch(`http://127.0.0.1:${loaded.port}/props`, { signal: AbortSignal.timeout(5000) })
+      const json = (await res.json()) as { default_generation_settings?: { params?: Record<string, unknown> } }
+      const out: Record<string, number> = {}
+      for (const [key, value] of Object.entries(json.default_generation_settings?.params ?? {})) {
+        if (typeof value === 'number' && Number.isFinite(value)) out[key] = value
+      }
+      return out
+    } catch {
+      return null
+    }
   }
 
   private buildArgs(model: ModelRecord, plan: FitPlan, port: number): string[] {
@@ -691,8 +717,8 @@ export class LlamaRuntime extends EventEmitter {
     const body: Record<string, unknown> = {
       messages: opts.messages,
       stream,
-      temperature: opts.temperature ?? 0.7,
-      top_p: opts.topP ?? 0.95,
+      temperature: opts.temperature ?? DEFAULT_TEMPERATURE,
+      top_p: opts.topP ?? DEFAULT_TOP_P,
       cache_prompt: true
     }
     /*
@@ -702,10 +728,18 @@ export class LlamaRuntime extends EventEmitter {
      * this needs no version check — the events simply never arrive and the UI never shows a bar.
      */
     if (stream) body.return_progress = true
-    if (opts.topK !== undefined) body.top_k = opts.topK
-    if (opts.minP !== undefined) body.min_p = opts.minP
-    if (opts.repeatPenalty !== undefined) body.repeat_penalty = opts.repeatPenalty
-    if (opts.maxTokens !== undefined && opts.maxTokens > 0) body.max_tokens = opts.maxTokens
+    /*
+     * The rest of the sampling parameters, each only when set, so the model's own default applies
+     * otherwise. Field names come from the same table the parameters panel is drawn from.
+     */
+    for (const field of SAMPLING_FIELDS) {
+      if (field.key === 'temperature' || field.key === 'topP') continue
+      const value = opts[field.key]
+      if (value === undefined) continue
+      // No limit is llama.cpp's default; a zero would ask for an empty reply.
+      if (field.key === 'maxTokens' && value <= 0) continue
+      body[field.serverKey] = value
+    }
     if (opts.stop?.length) body.stop = opts.stop
     if (opts.reasoningEffort) body.reasoning_effort = opts.reasoningEffort
     if (opts.chatTemplateKwargs && Object.keys(opts.chatTemplateKwargs).length > 0) {

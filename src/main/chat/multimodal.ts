@@ -1117,9 +1117,10 @@ export async function buildContent(
           /*
            * The clip is kept, not just described.
            *
-           * It already exists on disk and nothing deletes it, so recording where it went costs
-           * nothing and turns "1.8 fps at 336px, cropped to the region that changes" from a
-           * claim the user has to take on faith into something they can watch.
+           * It already exists on disk, and the bridge moves it in beside the conversation's other
+           * kept attachments so the weekly sweep of scratch files never takes it. Recording where
+           * it went turns "1.8 fps at 336px, cropped to the region that changes" from a claim the
+           * user has to take on faith into something they can watch.
            */
           media.push({
             source: file,
