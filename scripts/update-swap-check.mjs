@@ -45,7 +45,9 @@ const built = await esbuild.build({
 })
 const tmpMod = path.join(os.tmpdir(), `llmm-swap-${process.pid}.mjs`)
 await fsp.writeFile(tmpMod, built.outputFiles[0].text, 'utf8')
-const { buildSwapScript, FAILURE_TEXT } = await import(`file://${tmpMod.replace(/\\/g, '/')}`)
+const { buildSwapScript, FAILURE_TEXT, chooseUpdateTarget, misplacedLauncher } = await import(
+  `file://${tmpMod.replace(/\\/g, '/')}`
+)
 
 /*
  * Run a generated script exactly as the app does.
@@ -146,6 +148,64 @@ console.log('\nWhen the exe cannot be replaced, it gives up cleanly')
    * spin — 120 attempts would have burned a core and finished in milliseconds.
    */
   check('it actually waits between attempts', elapsed >= 700, `only ${elapsed}ms for one retry`)
+}
+
+// ---------------------------------------------------------------- waiting for the app to exit
+
+console.log('\nThe swap waits for the app itself to exit')
+{
+  check('waits on the app by process id', buildSwapScript({ target: 'T', staged: 'S', marker: 'M', waitPid: 4321 }).includes('Wait-Process -Id 4321'))
+  check('never on anything but a whole-number id', !buildSwapScript({ target: 'T', staged: 'S', marker: 'M', waitPid: '1; calc' }).includes('Wait-Process'))
+
+  const dir = await fsp.mkdtemp(path.join(work, 'wait-'))
+  const target = path.join(dir, 'LLM-Manager-portable.exe')
+  const staged = path.join(dir, '.update-789.exe')
+  const marker = path.join(dir, 'update-failed.txt')
+  await fsp.writeFile(target, 'OLD VERSION')
+  await fsp.writeFile(staged, 'NEW VERSION')
+
+  // A stand-in for the app: a process that lives about two seconds, holding nothing open.
+  const app = spawn(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'ping.exe'), ['-n', '3', '127.0.0.1'], { stdio: 'ignore' })
+  const started = Date.now()
+  await runScript(buildSwapScript({ target, staged, marker, relaunch: false, waitPid: app.pid }), dir)
+  const elapsed = Date.now() - started
+  check('the exe is not swapped until the app has gone', elapsed >= 1500, `swapped after ${elapsed}ms`)
+  check('and then it is swapped', fs.readFileSync(target, 'utf8') === 'NEW VERSION')
+}
+
+// ---------------------------------------------------------------- which file is replaced
+
+console.log('\nAn update replaces the portable exe the user launches')
+{
+  const cache = 'C:\\Users\\u\\AppData\\Local\\LLMManager'
+  const cacheExe = `${cache}\\runtime-1.0.11\\LLM Manager.exe`
+  const folder = 'D:\\Apps\\LLM-Manager'
+  const portable = `${folder}\\LLM-Manager-portable.exe`
+  const on = (...files) => (f) => files.some((x) => x.toLowerCase() === f.toLowerCase())
+  const pick = (input) => chooseUpdateTarget({ appExe: cacheExe, cacheRoot: cache, ...input })
+
+  check('the exe the launcher names is the one replaced', pick({ portableExe: portable, portableDir: folder, exists: on(portable) }).target === portable)
+  check('never the unpacked copy the app runs from', pick({ portableExe: cacheExe, portableDir: folder, exists: on(portable, cacheExe) }).target === portable)
+  check('a launcher that only passed its folder still has its exe found', pick({ portableDir: folder, exists: on(portable) }).target === portable)
+  const blind = pick({ exists: on(cacheExe) })
+  check('a copy started from its unpacked files is told why it cannot update', 'error' in blind && /unpacked/.test(blind.error))
+  check('an install elsewhere is not overwritten with the portable exe',
+    'error' in chooseUpdateTarget({ appExe: 'C:\\Program Files\\LLM Manager\\LLM Manager.exe', cacheRoot: cache, exists: () => true }))
+}
+
+console.log('\nAn update an older version put in the wrong place is found')
+{
+  const cache = 'C:\\Users\\u\\AppData\\Local\\LLMManager'
+  const cacheExe = `${cache}\\runtime-1.0.11\\LLM Manager.exe`
+  const folder = 'D:\\Apps\\LLM-Manager'
+  const portable = `${folder}\\LLM-Manager-portable.exe`
+  const on = (...files) => (f) => files.some((x) => x.toLowerCase() === f.toLowerCase())
+
+  const found = misplacedLauncher({ portableExe: cacheExe, portableDir: folder, cacheRoot: cache, exists: on(portable, cacheExe) })
+  check('a launcher in the cache, handed the real folder, is copied to it', found?.from === cacheExe && found?.to === portable, JSON.stringify(found))
+  check('an ordinary launch has nothing to repair', misplacedLauncher({ portableExe: portable, portableDir: folder, cacheRoot: cache, exists: on(portable) }) === null)
+  check('without the real folder there is nothing to repair', misplacedLauncher({ portableExe: cacheExe, cacheRoot: cache, exists: on(cacheExe) }) === null)
+  check('a real folder with no exe in it is left alone', misplacedLauncher({ portableExe: cacheExe, portableDir: folder, cacheRoot: cache, exists: on(cacheExe) }) === null)
 }
 
 await fsp.rm(work, { recursive: true, force: true }).catch(() => undefined)

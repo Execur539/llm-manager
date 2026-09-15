@@ -94,6 +94,8 @@ VIAddVersionKey "LegalCopyright" "${COPYRIGHT}"
 
 Var RuntimeDir
 Var Marker
+Var Inherited
+Var CacheRoot
 Var Staging
 Var ExitCode
 
@@ -104,7 +106,21 @@ Section
   ; The app must know where the *portable exe* lives, not where it was unpacked to. Without
   ; this it treats the extraction cache as its own folder and puts the model library there —
   ; a directory this script deletes on upgrade.
-  System::Call 'kernel32::SetEnvironmentVariable(t "LLMM_PORTABLE_DIR", t "$EXEDIR")'
+  ;
+  ; One exception. Updaters before 1.6.6 put the new launcher into the unpack cache instead of over
+  ; the portable exe, and started it from there. Its $EXEDIR is then the cache, while the folder the
+  ; user's exe is really in arrives inherited from the app that started it. That folder is kept, so
+  ; the app launched below can finish the update by copying this launcher to where it belongs.
+  ReadEnvStr $Inherited "LLMM_PORTABLE_DIR"
+  StrCpy $CacheRoot "$LOCALAPPDATA\LLMManager\"
+  StrLen $0 $CacheRoot
+  StrCpy $1 "$EXEDIR\" $0
+  ${If} $1 != $CacheRoot
+  ${OrIf} $Inherited == ""
+    System::Call 'kernel32::SetEnvironmentVariable(t "LLMM_PORTABLE_DIR", t "$EXEDIR")'
+  ${EndIf}
+  ; Its own path too, so an update replaces this exact file rather than guessing its name.
+  System::Call 'kernel32::SetEnvironmentVariable(t "LLMM_PORTABLE_EXE", t "$EXEPATH")'
 
   ; Fast path: a completed extraction of *this* build already exists.
   ${If} ${FileExists} "$Marker"

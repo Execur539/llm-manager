@@ -5,8 +5,8 @@
  * background updates, by decision. The llama.cpp backends ship inside the app bundle, so an app
  * update is a backend update.
  *
- * Applying an update swaps the exe on next launch via a small batch script, because Windows
- * will not let a running executable overwrite itself.
+ * Applying an update swaps the portable exe the user launches via a small batch script, once the
+ * app has exited, and starts the new one.
  */
 
 import { app } from 'electron'
@@ -14,11 +14,16 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { logger } from '../log'
-import { buildSwapScript, FAILURE_MARKER } from './swap-script'
+import { buildSwapScript, chooseUpdateTarget, FAILURE_MARKER, misplacedLauncher } from './swap-script'
+
+/** Where the portable launcher unpacks the app. */
+function unpackCacheRoot(): string {
+  return path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local'), 'LLMManager')
+}
 
 /** Where releases are published. Overridable so a fork can point elsewhere. */
 const UPDATE_FEED =
@@ -171,9 +176,23 @@ export async function applyUpdate(
    */
   await fsp.rm(path.join(app.getPath('userData'), FAILURE_MARKER), { force: true }).catch(() => undefined)
 
-  const currentExe = app.getPath('exe')
-  const dir = path.dirname(currentExe)
-  const staged = path.join(dir, `.update-${Date.now()}.exe`)
+  /*
+   * The file to replace is the portable exe the user launches — see chooseUpdateTarget.
+   *
+   * Decided before downloading, so a copy that cannot be updated in place says so straight away
+   * rather than after most of a gigabyte.
+   */
+  const chosen = chooseUpdateTarget({
+    portableExe: process.env.LLMM_PORTABLE_EXE,
+    portableDir: process.env.LLMM_PORTABLE_DIR,
+    appExe: app.getPath('exe'),
+    cacheRoot: unpackCacheRoot(),
+    exists: (file) => fs.existsSync(file)
+  })
+  if ('error' in chosen) return { ok: false, message: chosen.error }
+  const target = chosen.target
+  // Beside the target, so the swap is a rename within one volume rather than a copy across two.
+  const staged = path.join(path.dirname(target), `.update-${Date.now()}.exe`)
 
   const res = await fetch(url, { redirect: 'follow' })
   if (!res.ok || !res.body) throw new Error(`Download failed: HTTP ${res.status}`)
@@ -209,11 +228,89 @@ export async function applyUpdate(
    */
   const marker = path.join(app.getPath('userData'), FAILURE_MARKER)
   const script = path.join(os.tmpdir(), `llmm-update-${Date.now()}.cmd`)
-  await fsp.writeFile(script, buildSwapScript({ target: currentExe, staged, marker }), 'utf8')
+  await fsp.writeFile(script, buildSwapScript({ target, staged, marker, waitPid: process.pid }), 'utf8')
 
-  logger.info('update', 'staged update, relaunching', { staged })
+  logger.info('update', 'staged update, relaunching', { staged, target })
   spawn('cmd.exe', ['/c', script], { detached: true, stdio: 'ignore', windowsHide: true }).unref()
 
   setTimeout(() => app.quit(), 500)
   return { ok: true, message: 'Update downloaded. The app will restart to apply it.' }
+}
+
+/** A file's product version, read through PowerShell; null when it cannot be read. */
+function fileVersion(file: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+      // The path goes in through the environment, so nothing about it can be read as a command.
+      ['-NoProfile', '-NonInteractive', '-Command', '(Get-Item -LiteralPath $env:LLMM_VERSION_OF).VersionInfo.ProductVersion'],
+      { windowsHide: true, timeout: 15000, env: { ...process.env, LLMM_VERSION_OF: file } },
+      (err, stdout) => resolve(err ? null : String(stdout).trim() || null)
+    )
+  })
+}
+
+/** Delete the launcher an older updater left in the unpack cache, and the folder it sat in. */
+async function removeStrayLauncher(file: string): Promise<void> {
+  // The launcher can hold its own file for a moment after starting the app, so it is given a few tries.
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      await fsp.rm(file, { force: true })
+      break
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+  }
+  const dir = path.dirname(file)
+  // Never the folder this app is running from, nor one holding a model library — the same guard the launcher uses.
+  if (path.relative(dir, path.dirname(app.getPath('exe'))) === '') return
+  if (!/^runtime-/i.test(path.basename(dir)) || fs.existsSync(path.join(dir, 'LLMManagerModels'))) return
+  await fsp.rm(dir, { recursive: true, force: true }).catch(() => undefined)
+}
+
+/**
+ * Finish an update that an older version installed in the wrong place.
+ *
+ * Updaters before 1.6.6 replaced the unpacked copy of the app instead of the portable exe, so the
+ * new version ran once and the next launch brought the old one back. When this run was started
+ * that way (see misplacedLauncher), the launcher it came from is copied over the user's portable
+ * exe — only if that exe is older than this version — and the stray copy is removed from the cache.
+ */
+export async function repairMisplacedUpdate(): Promise<void> {
+  if (!app.isPackaged) return
+  const misplaced = misplacedLauncher({
+    portableExe: process.env.LLMM_PORTABLE_EXE,
+    portableDir: process.env.LLMM_PORTABLE_DIR,
+    cacheRoot: unpackCacheRoot(),
+    exists: (file) => fs.existsSync(file)
+  })
+  if (!misplaced) return
+
+  const { from, to } = misplaced
+  try {
+    const existing = await fileVersion(to)
+    if (existing && compareVersions(existing, app.getVersion()) >= 0) {
+      logger.info('update', 'a stray launcher was left in the unpack cache, but the portable exe is already current', { from, to, existing })
+    } else {
+      const temp = path.join(path.dirname(to), `.update-repair-${Date.now()}.exe`)
+      await fsp.copyFile(from, temp)
+      try {
+        await fsp.rename(temp, to)
+      } catch (err) {
+        await fsp.rm(temp, { force: true }).catch(() => undefined)
+        throw err
+      }
+      logger.info('update', 'finished an update an older version had installed in the wrong place', { from, to, replaced: existing })
+    }
+    // This run's own updates now go to the real exe.
+    process.env.LLMM_PORTABLE_EXE = to
+    // The stray launcher is most of a gigabyte, and nothing will start it again.
+    await removeStrayLauncher(from)
+  } catch (err) {
+    logger.warn('update', 'could not finish an update an older version installed in the wrong place', {
+      from,
+      to,
+      error: err instanceof Error ? err.message : String(err)
+    })
+  }
 }

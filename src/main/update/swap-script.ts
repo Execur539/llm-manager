@@ -7,8 +7,70 @@
  * once been executed — and it carried two faults that would have surfaced the first time it was.
  */
 
+import path from 'node:path'
+
 /** Where the helper records that it gave up, relative to the app's userData directory. */
 export const FAILURE_MARKER = 'update-failed.txt'
+
+/** The portable exe's name — stable across versions since 1.0, so a download replaces the file shortcuts point at. */
+export const PORTABLE_EXE_NAME = 'LLM-Manager-portable.exe'
+
+function isInside(root: string, target: string): boolean {
+  const rel = path.relative(root, target)
+  return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel)
+}
+
+export interface UpdateTargetInput {
+  /** LLMM_PORTABLE_EXE: the launcher that started this run, as it reports its own path. */
+  portableExe?: string
+  /** LLMM_PORTABLE_DIR: the folder the user's portable exe is in. */
+  portableDir?: string
+  /** The running app's own executable. */
+  appExe: string
+  /** %LOCALAPPDATA%\LLMManager, where the launcher unpacks the app. */
+  cacheRoot: string
+  exists: (file: string) => boolean
+}
+
+/**
+ * Which file an update replaces: the portable exe the user actually launches.
+ *
+ * Every updater before this one replaced the running app's own executable. In the portable build
+ * that is the copy unpacked under LOCALAPPDATA, not the file anyone double-clicks — so an update ran
+ * once, from the cache, and the next launch of the user's own exe started the old version again,
+ * which unpacked itself over the top and deleted the new one as stale. The real file was never
+ * touched. An install that was not started from a portable exe cannot be updated in place at all,
+ * since what the release feed offers is a portable exe, so it is told so rather than overwritten.
+ */
+export function chooseUpdateTarget(input: UpdateTargetInput): { target: string } | { error: string } {
+  const { portableExe, portableDir, appExe, cacheRoot, exists } = input
+  if (portableExe && !isInside(cacheRoot, portableExe) && exists(portableExe)) return { target: portableExe }
+  // Launchers before 1.6.6 passed their folder but not their own path; the name has not changed.
+  if (portableDir && !isInside(cacheRoot, portableDir)) {
+    const beside = path.join(portableDir, PORTABLE_EXE_NAME)
+    if (exists(beside)) return { target: beside }
+  }
+  return {
+    error: isInside(cacheRoot, appExe)
+      ? `This copy was started from its unpacked files rather than from ${PORTABLE_EXE_NAME}, so there is no exe to update. Start the app from ${PORTABLE_EXE_NAME} and update again, or download the new version from the releases page.`
+      : `This copy was not started from ${PORTABLE_EXE_NAME}, so there is nothing to update in place. Download the new version from the releases page.`
+  }
+}
+
+/**
+ * A launcher an older updater left in the unpack cache, and the user's exe it was meant to replace.
+ *
+ * Those updaters overwrote the unpacked app with the new launcher and started it from there. The
+ * launcher keeps the real folder it was handed down, so the app it starts can finish the update by
+ * copying the launcher over the exe the user launches. Null when this run did not come about that way.
+ */
+export function misplacedLauncher(input: Omit<UpdateTargetInput, 'appExe'>): { from: string; to: string } | null {
+  const { portableExe, portableDir, cacheRoot, exists } = input
+  if (!portableExe || !portableDir) return null
+  if (!isInside(cacheRoot, portableExe) || isInside(cacheRoot, portableDir)) return null
+  const to = path.join(portableDir, PORTABLE_EXE_NAME)
+  return exists(portableExe) && exists(to) ? { from: portableExe, to } : null
+}
 
 /**
  * Kept free of anything cmd would interpret — no percent signs, ampersands, pipes, angle
@@ -41,6 +103,15 @@ export interface SwapScriptOptions {
    * generated script does not start a program.
    */
   relaunch?: boolean
+  /**
+   * The app's process id, waited on before anything is moved.
+   *
+   * The file replaced is the portable launcher, which exits as soon as it has started the app, so
+   * nothing holds it open: the move would succeed at once and the new version would start while
+   * this one was still shutting down. Waited on by process id, never by image name, so another copy
+   * of the app running from somewhere else is not mistaken for this one.
+   */
+  waitPid?: number
 }
 
 /**
@@ -65,15 +136,24 @@ export function buildSwapScript({
   staged,
   marker,
   maxTries = 120,
-  relaunch = true
+  relaunch = true,
+  waitPid
 }: SwapScriptOptions): string {
   const start = relaunch ? ['start "" "%TARGET%"'] : []
+  // A whole number only, so nothing but a process id can reach the command line.
+  const wait =
+    Number.isInteger(waitPid) && (waitPid as number) > 0
+      ? [
+          `"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoProfile -NonInteractive -Command "Wait-Process -Id ${waitPid} -Timeout 120 -ErrorAction SilentlyContinue" >nul 2>&1`
+        ]
+      : []
   return [
     '@echo off',
     'setlocal',
     `set "TARGET=${target}"`,
     `set "STAGED=${staged}"`,
     `set "MARKER=${marker}"`,
+    ...wait,
     'set /a tries=0',
     '',
     ':retry',

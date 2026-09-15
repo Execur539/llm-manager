@@ -279,6 +279,9 @@ app.whenReady().then(async () => {
   // the directory exists, and unawaited so a slow disk never delays the window.
   void handlers['attachments:prune']?.()
 
+  // An update an older version installed in the wrong place is finished in the background.
+  void import('./update').then(({ repairMisplacedUpdate }) => repairMisplacedUpdate())
+
   setEmitter(emitToSurfaces)
 
   /*
