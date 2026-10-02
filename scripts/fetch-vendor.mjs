@@ -76,6 +76,12 @@ const COMPONENTS = {
           continue
         }
         const zip = await download(t.asset.browser_download_url, path.join(CACHE, t.asset.name), t.asset.size)
+        // A patched CUDA build is replaced wholesale by the official one, so say so rather than lose it quietly.
+        const patches = path.join(VENDOR, t.dest, 'PATCHES.txt')
+        if (fs.existsSync(patches)) {
+          fs.rmSync(patches)
+          console.log(`  ! vendor/${t.dest} held a patched build; run node scripts/build-llama-cuda.mjs to apply it again`)
+        }
         await unzipFlat(zip, path.join(VENDOR, t.dest))
         console.log(`  ${t.name} -> vendor/${t.dest}`)
       }

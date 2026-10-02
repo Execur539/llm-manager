@@ -1,0 +1,20 @@
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index 9087b35..9917433 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -920,10 +920,12 @@ uint32_t llama_memory_hybrid_idx_context::qsa_pooled_n_dirty_max(const llama_uba
+     GGML_ASSERT(ratio > 0);
+     GGML_ASSERT(mem != nullptr);
+
+-    // the reserve pass builds worst-case graphs from a mock ubatch with no seq/pos data;
+-    // give it the per-ubatch bound (the refill after a state load resizes on a live ubatch)
++    // the reserve pass builds worst-case graphs from a mock ubatch with no seq/pos data.
++    // a refill after a full state load re-pools every complete block in one ubatch, so reserve
++    // for that, as the full recompute did: otherwise the buffers must grow mid-run on a full GPU
+     if (ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr || ubatch.pos == nullptr) {
+-        return (ubatch.n_tokens + ratio - 1)/ratio + 1;
++        const uint32_t rows = mem->get_pooled_rows();
++        return std::max<uint32_t>((ubatch.n_tokens + ratio - 1)/ratio + 1, rows > 2 ? rows - 2 : 1);
+     }
+
+     // single-stream memories only (get_pooled_k gates the callers); like the block tables,
