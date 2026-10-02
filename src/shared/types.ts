@@ -77,6 +77,17 @@ export interface ModelArchInfo {
   /** Per-layer SSM state in bytes. Constant — it does not grow with context length. */
   ssmStateBytesPerLayer: number
   /**
+   * Key width of a sparse-attention indexer (Qwen3.8-Flash-Next: 128), or 0 without one. Every
+   * attention layer then also caches one indexer key per token, at the key-cache precision.
+   */
+  indexerKeyLength?: number
+  /**
+   * Tokens per indexer block (Qwen3.8-Flash-Next's compress ratio, 4), or 0. llama.cpp keeps one
+   * pooled f32 indexer key per block per attention layer, so it does not re-pool the context on
+   * every token.
+   */
+  indexerBlock?: number
+  /**
    * GGML tensor type ids this build has no block layout for.
    *
    * Non-empty means the weight total was reconciled against the file size rather than computed
@@ -257,6 +268,14 @@ export interface FitConstraints {
    * their advertised limit — so it is a deliberate choice rather than free headroom.
    */
   allowRopeScaling?: boolean
+  /**
+   * Key/value cache pairings the backend attends over directly, as `k-v` names such as
+   * `q8_0-q4_0`. Unset means every pairing.
+   *
+   * CUDA builds of llama.cpp compile flash-attention kernels for a fixed list of pairs. Any other
+   * pairing still runs, but the whole cache is converted to f16 on every generated token.
+   */
+  kvPairs?: string[]
   /** user overrides that must be honoured, not silently changed */
   overrides: Partial<{
     contextLength: number

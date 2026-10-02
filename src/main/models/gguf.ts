@@ -532,6 +532,17 @@ export function extractArchInfo(meta: GgufMetadata, fileSize?: number, actualWei
   const hasMtpTensors = meta.tensors.some((t) => /\.nextn\./.test(t.name))
   const mtpLayers = declaredMtp > 0 && hasMtpTensors ? declaredMtp : 0
 
+  /*
+   * A sparse-attention indexer, like Qwen3.8-Flash-Next's QSA, caches beside the KV cache on every
+   * attention layer: one indexer key per token, and one pooled key per block of `compress_ratios`
+   * tokens. The ratios are per layer, zero on the layers without an indexer.
+   */
+  const indexerKeyLength = p('attention.indexer.key_length') ?? 0
+  const ratios = kv[`${arch}.attention.compress_ratios`]
+  const indexerBlock = Array.isArray(ratios)
+    ? Math.max(0, ...ratios.filter((r): r is number => typeof r === 'number'))
+    : (p('attention.compress_ratios') ?? 0)
+
   return {
     architecture: arch,
     name: typeof kv['general.name'] === 'string' ? (kv['general.name'] as string) : null,
@@ -551,6 +562,8 @@ export function extractArchInfo(meta: GgufMetadata, fileSize?: number, actualWei
     ssmLayers,
     mtpLayers,
     ssmStateBytesPerLayer,
+    indexerKeyLength,
+    indexerBlock,
     unknownTensorTypes: [...unknownTypes],
     inputBytes,
     pleBytes,

@@ -79,8 +79,13 @@ export function kvLabel(kv: KvChoice): string {
  *
  * Ordered by bytes per element rather than by nesting, so stepping down the list is monotonic in
  * memory and the engine's "step down to buy context" logic reads the same as before.
+ *
+ * Pairings the backend cannot attend over directly are left out when it names the ones it can. A
+ * CUDA build converts the whole cache to f16 on every generated token for a pairing it did not
+ * compile, which spends more speed and VRAM than the smaller cache saves. A list naming none of
+ * the rungs leaves the ladder as it was: a slow plan beats no plan.
  */
-function kvLadder(preferred: KvType, floor: KvType): KvChoice[] {
+function kvLadder(preferred: KvType, floor: KvType, fastPairs?: readonly string[]): KvChoice[] {
   const floorIndex = clampToOrder(floor, KV_ORDER.length - 1)
   const preferredIndex = Math.min(clampToOrder(preferred, 0), floorIndex)
   const pairs: KvChoice[] = []
@@ -89,7 +94,15 @@ function kvLadder(preferred: KvType, floor: KvType): KvChoice[] {
     for (const v of KV_ORDER.slice(KV_ORDER.indexOf(k))) pairs.push({ k, v })
   }
   const size = (c: KvChoice): number => KV_ELEMENT_BYTES[c.k] + KV_ELEMENT_BYTES[c.v]
-  return pairs.sort((a, b) => size(b) - size(a))
+  pairs.sort((a, b) => size(b) - size(a))
+  if (!fastPairs) return pairs
+  const fast = pairs.filter((c) => fastPairs.includes(kvPairName(c)))
+  return fast.length ? fast : pairs
+}
+
+/** A pairing as llama.cpp's build features name it: keys first, as in `q8_0-q4_0`. */
+function kvPairName(kv: KvChoice): string {
+  return `${kv.k}-${kv.v}`
 }
 
 /** CUDA runtime + cuBLAS workspace claimed per device before any weights load. */
@@ -199,7 +212,18 @@ export function kvCacheBytes(arch: ModelArchInfo, contextLength: number, kv: KvT
   // so this is one slot's worth — but it is measured empirically to be larger than the naive
   // conv+state figure, so a correction factor keeps the estimate on the safe side.
   const recurrentState = (arch.ssmLayers ?? 0) * (arch.ssmStateBytesPerLayer ?? 0) * SSM_STATE_SAFETY
-  return attentionCache + recurrentState
+  /*
+   * A sparse-attention indexer caches on the same layers: one key per token at the key precision,
+   * and one pooled f32 key per block, which llama.cpp keeps so the indexer does not re-pool the
+   * whole context on every token. Qwen3.8-Flash-Next at 199,680 tokens: about 630 MB together.
+   */
+  const indexerKey = arch.indexerKeyLength ?? 0
+  const indexerPerToken =
+    indexerKey > 0
+      ? indexerKey * KV_ELEMENT_BYTES[choice.k] + (arch.indexerBlock ? (indexerKey * 4) / arch.indexerBlock : 0)
+      : 0
+  const indexerCache = indexerPerToken * attentionLayers * contextLength
+  return attentionCache + recurrentState + indexerCache
 }
 
 /**
@@ -905,7 +929,15 @@ function planFitInner(
   const floorIndex = clampToOrder(constraints.minKvType, KV_ORDER.length - 1)
   const kvCandidates: KvChoice[] = o.kvType
     ? [{ k: o.kvType, v: o.kvTypeV ?? o.kvType }]
-    : kvLadder(constraints.preferredKvType, constraints.minKvType)
+    : kvLadder(constraints.preferredKvType, constraints.minKvType, constraints.kvPairs)
+
+  // A pairing chosen by hand is honoured, and explained when this build has to convert it.
+  if (o.kvType && constraints.kvPairs && !constraints.kvPairs.includes(kvPairName(kvCandidates[0]))) {
+    notes.push(
+      `This llama.cpp build has no fast attention kernel for a ${kvLabel(kvCandidates[0])} cache, so it converts ` +
+        'the cache to f16 on every generated token: slower, and it needs extra VRAM. Matching key and value types avoids it.'
+    )
+  }
 
   /*
    * With everything on the GPU, an MoE model does not step its keys down to buy context.
@@ -1146,7 +1178,7 @@ function planFitInner(
    * This is the last configuration tried before layers start moving to the host, so it should be
    * the smallest one that is still safe rather than the smallest one that exists.
    */
-  const floorKv: KvChoice = kvLadder(constraints.preferredKvType, constraints.minKvType).at(-1) ?? {
+  const floorKv: KvChoice = kvLadder(constraints.preferredKvType, constraints.minKvType, constraints.kvPairs).at(-1) ?? {
     k: constraints.minKvType,
     v: constraints.minKvType
   }

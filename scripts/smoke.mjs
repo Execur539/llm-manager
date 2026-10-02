@@ -54,6 +54,8 @@ const { planImageCopy, MAX_IMAGE_EDGE } = await import('./built/imageCopy.js')
 const { toStored, fromStored, forCaps, textOf } = await import('./built/sentContent.js')
 const { exportFilename, uniquePath } = await import('./built/filenames.js')
 const { detectReasoning, reasoningRequestFields } = await import('./built/reasoning.js')
+const { findFaQuants, parseFaQuants, readFaQuants } = await import('./built/faKernels.js')
+const { hostCacheBudgetMb } = await import('./built/hostBudget.js')
 
 const GB = 1024 ** 3
 let pass = 0
@@ -131,6 +133,17 @@ section('KV cache maths')
   check('q4_0 is ~53% of q8_0', Math.abs(kvCacheBytes(arch, 131072, 'q4_0') / kv128 - 0.529) < 0.01)
   check('KV scales linearly with context', Math.abs(kvCacheBytes(arch, 2048, 'f16') * 2 - kvCacheBytes(arch, 4096, 'f16')) < 1)
   console.log(`  128K at q8_0 = ${fmtBytes(kv128)}`)
+
+  // Qwen3.8-Flash-Next's QSA: 12 attention layers, a 128-wide indexer key, blocks of 4 tokens.
+  const qsa = { ...arch, attentionLayers: 12, ssmLayers: 36, ssmStateBytesPerLayer: 0, headCountKv: 2, headDim: 256, indexerKeyLength: 128, indexerBlock: 4 }
+  const withoutIndexer = { ...qsa, indexerKeyLength: 0, indexerBlock: 0 }
+  const indexerKeys = 12 * 65536 * 128 * (34 / 32)
+  const pooledKeys = 12 * (65536 / 4) * 128 * 4
+  const indexerExtra = kvCacheBytes(qsa, 65536, 'q8_0') - kvCacheBytes(withoutIndexer, 65536, 'q8_0')
+  check('an indexer adds its key cache and its pooled keys', Math.abs(indexerExtra - (indexerKeys + pooledKeys)) < 1, fmtBytes(indexerExtra))
+  // llama.cpp logs "size = 102.00 MiB (65536 cells, 12 layers)" for this cache at q8_0.
+  check('the indexer key cache matches what llama.cpp allocates', Math.abs(indexerKeys / (1024 * 1024) - 102) < 0.01)
+  check('a model without an indexer is unchanged', kvCacheBytes(withoutIndexer, 65536, 'q8_0') === kvCacheBytes({ ...qsa, indexerKeyLength: undefined, indexerBlock: undefined }, 65536, 'q8_0'))
 }
 
 section('Hybrid attention/SSM models cache only on attention layers')
@@ -232,6 +245,91 @@ section('Hybrid attention/SSM models cache only on attention layers')
   }
   check('explains the hybrid layout', result.notes.some((n) => /hybrid architecture/i.test(n)))
   console.log(`  128K KV: ${fmtBytes(naive)} naive -> ${fmtBytes(actual)} actual`)
+}
+
+section('KV pairings without a fast attention kernel are not planned')
+{
+  const hybridKv = {
+    ...arch,
+    architecture: 'qwen35',
+    blockCount: 64,
+    headCount: 24,
+    headCountKv: 4,
+    headDim: 256,
+    attentionLayers: 16,
+    ssmLayers: 48,
+    ssmStateBytesPerLayer: 3211264,
+    weightBytes: 17.66 * GB,
+    perLayerBytes: 16 * GB,
+    nonLayerBytes: 1.66 * GB
+  }
+  const rig = hw([gpu('RTX 5080', 16, 13.4), gpu('RTX 4070 Ti', 12, 11.7, true, 1)])
+  const plans = (r) => [r.chosen, ...r.alternatives].filter(Boolean)
+  const mixed = (p) => (p.kvTypeV ?? p.kvType) !== p.kvType
+  const describe = (r) => plans(r).map((p) => `${p.label} ${p.kvType}/${p.kvTypeV ?? p.kvType}`).join(', ')
+
+  // The pairs a CUDA build compiles by default.
+  const matched = planFit(hybridKv, rig, { ...DEFAULT_CONSTRAINTS, kvPairs: ['f16-f16', 'q8_0-q8_0', 'q4_0-q4_0'] })
+  check('a build without mixed kernels is never planned a mixed cache', plans(matched).every((p) => !mixed(p)), describe(matched))
+  check('and keeps the keys at the preferred precision', matched.chosen?.kvType === 'q8_0', `${matched.chosen?.kvType}`)
+
+  const compiled = planFit(hybridKv, rig, { ...DEFAULT_CONSTRAINTS, kvPairs: ['f16-f16', 'q8_0-q8_0', 'q4_0-q4_0', 'q8_0-q4_0'] })
+  check('a build that compiled the mixed pair is still offered it', plans(compiled).some(mixed), describe(compiled))
+
+  const unrestricted = planFit(hybridKv, rig, DEFAULT_CONSTRAINTS)
+  check('with no list, every pairing stays available', plans(unrestricted).some(mixed), describe(unrestricted))
+
+  const byHand = planFit(hybridKv, rig, {
+    ...DEFAULT_CONSTRAINTS,
+    kvPairs: ['q8_0-q8_0'],
+    overrides: { kvType: 'q8_0', kvTypeV: 'q4_0' }
+  })
+  const handPlan = byHand.chosen ?? byHand.alternatives[0]
+  check('a pairing picked by hand is honoured', handPlan?.kvTypeV === 'q4_0', `${handPlan?.kvType}/${handPlan?.kvTypeV}`)
+  check('and the note says why it will be slower', byHand.notes.some((n) => /no fast attention kernel/i.test(n)), byHand.notes.join(' | '))
+
+  const nothingUsable = planFit(hybridKv, rig, { ...DEFAULT_CONSTRAINTS, kvPairs: ['bf16-bf16'] })
+  check('a list naming none of the rungs still produces a plan', plans(nothingUsable).length > 0)
+}
+
+section('The CUDA build names its attention kernels in ggml-cuda.dll')
+{
+  const expected = ['q4_0-q4_0', 'q8_0-q8_0', 'f16-f16', 'bf16-bf16']
+  const dll = Buffer.concat([
+    Buffer.from('\0Add "q8_0-q4_0" to GGML_CUDA_FA_QUANTS to compile it.\0', 'latin1'),
+    Buffer.alloc(40000, 7),
+    Buffer.from('USE_GRAPHS\0\0\0\0\0\0FA_QUANTS\0\0\0\0\0\0\0q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16\0BLACKWELL_NATIVE_FP4\0', 'latin1')
+  ])
+  check('reads the pairs past NUL padding', JSON.stringify(findFaQuants(dll)) === JSON.stringify(expected), JSON.stringify(findFaQuants(dll)))
+  check('ignores the same letters inside warning text',
+    findFaQuants(Buffer.from('Add it to GGML_CUDA_FA_QUANTS to compile it.\0', 'latin1')) === null)
+  check('rejects a value that is not a pair list', parseFaQuants('ON') === null && parseFaQuants('') === null)
+
+  // A feature that straddles the reader's 8 MB chunk boundary is still found whole.
+  const tmp = path.join(os.tmpdir(), `llmm-fa-kernels-${process.pid}.bin`)
+  fs.writeFileSync(tmp, Buffer.concat([Buffer.alloc(8 * 1024 * 1024 - 5, 1), Buffer.from('\0FA_QUANTS\0q8_0-q4_0,q8_0-q8_0\0', 'latin1')]))
+  const straddled = await readFaQuants(tmp)
+  fs.rmSync(tmp, { force: true })
+  check('reads a feature across a chunk boundary', JSON.stringify(straddled) === JSON.stringify(['q8_0-q4_0', 'q8_0-q8_0']), JSON.stringify(straddled))
+  check('a missing file reads as unknown', (await readFaQuants(path.join(os.tmpdir(), `llmm-no-such-${process.pid}.dll`))) === null)
+}
+
+section('Prompt cache budget leaves room for what the load keeps in RAM')
+{
+  const MiB = 1024 * 1024
+  const free = 107 * GB
+  const before = hostCacheBudgetMb(free)
+  check('a model with nothing in system RAM keeps a quarter of free memory', before === Math.floor((107 * 1024) / 4), `${before}`)
+
+  // Qwen3.8-Flash-Next with every routed expert in RAM: 74 GB resident, a 26.8 GB file-backed table.
+  const flashNext = hostCacheBudgetMb(free, 74 * GB, 26.8 * GB)
+  check('its experts come out of the budget first', flashNext < before, `${flashNext} vs ${before}`)
+  check('and what is left still gets at least the default', flashNext === 8192, `${flashNext}`)
+
+  check('nothing to spare leaves llama.cpp its own default', hostCacheBudgetMb(90 * GB, 80 * GB) === 0)
+  check('the cap still holds on a very large machine', hostCacheBudgetMb(512 * GB) === 49152)
+  check('a file-backed table reserves at most 8 GB', hostCacheBudgetMb(64 * GB, 0, 400 * GB) === Math.floor((64 * 1024 - 8192) / 4),
+    `${hostCacheBudgetMb(64 * GB, 0, 400 * GB)} (${Math.round((64 * GB - 8192 * MiB) / MiB / 4)})`)
 }
 
 section('Compute buffer: flash attention is a precondition at long context')
@@ -661,6 +759,32 @@ section('GGUF parser')
     check('takes vocab size from the elided token array', info.vocabSize === 32000)
   } finally {
     fs.rmSync(file, { force: true })
+  }
+
+  // Qwen3.8-Flash-Next's indexer: a key length, and a compress ratio per layer that is zero on
+  // the recurrent layers.
+  const qsaFile = path.join(os.tmpdir(), `llmm-qsa-${Date.now()}.gguf`)
+  const ratios = Array.from({ length: 48 }, (_, il) => ((il + 1) % 4 === 0 ? 4 : 0))
+  fs.writeFileSync(qsaFile, buildGguf({
+    architecture: 'qwen4exp',
+    blockCount: 48,
+    extraKv: [
+      ['qwen4exp.attention.indexer.key_length', 'u32', 128],
+      ['qwen4exp.attention.compress_ratios', 'u32[]', ratios]
+    ]
+  }))
+  const plainFile = path.join(os.tmpdir(), `llmm-plain-${Date.now()}.gguf`)
+  fs.writeFileSync(plainFile, buildGguf())
+  try {
+    const qsa = extractArchInfo(await readGguf(qsaFile))
+    check('reads the indexer key length', qsa.indexerKeyLength === 128, `${qsa.indexerKeyLength}`)
+    check('reads the indexer block size from the per-layer ratios', qsa.indexerBlock === 4, `${qsa.indexerBlock}`)
+    const plain = extractArchInfo(await readGguf(plainFile))
+    check('a model without an indexer reports none', plain.indexerKeyLength === 0 && plain.indexerBlock === 0,
+      `${plain.indexerKeyLength}/${plain.indexerBlock}`)
+  } finally {
+    fs.rmSync(qsaFile, { force: true })
+    fs.rmSync(plainFile, { force: true })
   }
 }
 

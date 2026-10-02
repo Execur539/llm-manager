@@ -101,6 +101,7 @@ export function buildGguf(opts = {}) {
   for (const [k, kind, v] of extraKv) {
     if (kind === 'u32') addU32(k, v)
     else if (kind === 'str') addStr(k, v)
+    else if (kind === 'u32[]') kv.push(Buffer.concat([str(k), u32(9), u32(4), u64(v.length), ...v.map(u32)]))
     else throw new Error(`buildGguf: unsupported extraKv kind ${kind}`)
   }
 

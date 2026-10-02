@@ -21,6 +21,7 @@ import type { Backend, FitPlan, ModelRecord, ToolDefinition } from '@shared/type
 import path from 'node:path'
 import { app } from 'electron'
 import { childEnv, llamaServerPath } from './binaries'
+import { hostCacheBudgetMb } from './host-budget'
 import { TOOL_OUTPUT_DIR } from '../storage/paths'
 import { loadSettings } from '../storage/settings'
 import { nglFor } from '../autofit/engine'
@@ -220,30 +221,6 @@ export interface Timings {
 }
 
 
-/**
- * How much system RAM to let llama.cpp use for its prompt cache and context checkpoints.
- *
- * Costs no VRAM and buys back the thing that actually hurts on a long conversation: a hybrid
- * model cannot truncate its cache to resume part-way, so it resumes from a checkpoint or it
- * reprocesses the entire prompt. Each checkpoint is on the order of 150 MB, and the default
- * budget of 8 GB is a handful of them.
- *
- * Measured against free memory rather than total, and capped, for three reasons: the figure is
- * a ceiling llama.cpp fills opportunistically rather than an allocation, other things on the
- * machine need room, and past a few dozen gigabytes the cache is holding conversations nobody
- * will return to. A machine with little free memory gets the default left alone.
- */
-function hostCacheBudgetMb(): number {
-  const freeMb = Math.floor(os.freemem() / (1024 * 1024))
-  const DEFAULT_MB = 8192
-  const CAP_MB = 49152
-  // Below this there is nothing to give, and taking a quarter of it would hurt.
-  if (freeMb < 12288) return 0
-  const quarter = Math.floor(freeMb / 4)
-  return Math.max(DEFAULT_MB, Math.min(quarter, CAP_MB))
-}
-
-
 export class LlamaRuntime extends EventEmitter {
   private child: ChildProcess | null = null
   private current: LoadedModel | null = null
@@ -361,7 +338,10 @@ export class LlamaRuntime extends EventEmitter {
      * much: 8 GB of prompt cache, 32 checkpoints, and cache-reuse switched off entirely. On a
      * machine with real headroom those are the wrong numbers, and none of them cost VRAM.
      */
-    const cacheRamMb = hostCacheBudgetMb()
+    const pleBytes = model.arch?.pleBytes ?? 0
+    // What this load will keep in system RAM; a per-layer embedding table stays file-backed.
+    const residentHost = Math.max(0, plan.predictedHostBytes - pleBytes)
+    const cacheRamMb = hostCacheBudgetMb(os.freemem(), residentHost, pleBytes)
     if (cacheRamMb > 0) args.push('--cache-ram', String(cacheRamMb))
     /*
      * Two different mechanisms, and which one applies depends on the architecture.
@@ -458,8 +438,6 @@ export class LlamaRuntime extends EventEmitter {
     const settings = loadSettings()
     if (settings.runtime.threads > 0) args.push('--threads', String(settings.runtime.threads))
 
-    const pleBytes = model.arch?.pleBytes ?? 0
-    const residentHost = Math.max(0, plan.predictedHostBytes - pleBytes)
     // A margin, because the figure is a prediction and the rest of the machine is still running.
     const fitsInRam = residentHost > 0 && residentHost * 1.15 < os.freemem()
     const loadMode = settings.runtime.loadMode === 'auto' ? (fitsInRam ? 'ram' : 'default') : settings.runtime.loadMode

@@ -34,7 +34,8 @@ import { scanLibrary, libraryDiskUsage } from './models/library'
 import { checkRelocation, keepInPlace, performMove } from './models/relocation'
 import { DEFAULT_CONSTRAINTS, planFit, verifyPrediction } from './autofit/engine'
 import { llama, estimateTokens, type ChatMessage, type ContentPart, type CompletionOptions } from './runtime/llama'
-import { missingBinaries, embeddingModelPath, vendorDiagnostics } from './runtime/binaries'
+import { missingBinaries, embeddingModelPath, vendorDiagnostics, llamaServerPath } from './runtime/binaries'
+import { cudaKvPairs, MATCHED_KV_PAIRS } from './runtime/fa-kernels'
 import { Agent } from './agent/loop'
 import { killAllJobs } from './agent/tools/exec'
 import { closeBrowser } from './agent/tools/browser'
@@ -724,6 +725,19 @@ function constraintsFromSettings(s: AppSettings): FitConstraints {
 }
 
 /**
+ * The key/value cache pairings the planner may choose on a backend.
+ *
+ * Vulkan and CPU attention read any pairing directly. A CUDA build only does so for the pairs it
+ * compiled, which ggml-cuda.dll names in its build features. When the file says nothing, matched
+ * pairs are assumed, because that is what every CUDA build compiles unless told otherwise.
+ */
+async function kvPairsFor(backend: Backend): Promise<string[] | undefined> {
+  if (backend !== 'cuda') return undefined
+  const dll = path.join(path.dirname(llamaServerPath('cuda')), 'ggml-cuda.dll')
+  return (await cudaKvPairs(dll)) ?? [...MATCHED_KV_PAIRS]
+}
+
+/**
  * The next plan to try when one did not fit: routed experts to the host first, whole layers after.
  *
  * Experts are the cheap thing to give up — a token reads ten of five hundred — so they move
@@ -733,9 +747,10 @@ function moreConservative(
   plan: FitPlan,
   arch: ModelArchInfo,
   hw: HardwareSnapshot,
-  companionBytes: number
+  companionBytes: number,
+  kvPairs: string[] | undefined
 ): FitPlan | null {
-  const base = { ...constraintsFromSettings(loadSettings()), companionBytes }
+  const base = { ...constraintsFromSettings(loadSettings()), companionBytes, kvPairs }
   // The batch sizes too: a retry that fell back to 512 would change the load's speed as well as its placement.
   const keep = {
     contextLength: plan.contextLength,
@@ -789,6 +804,7 @@ async function loadWithBackoff(
   hw: HardwareSnapshot
 ): Promise<{ loaded: Awaited<ReturnType<typeof llama.load>>; plan: FitPlan }> {
   const arch = model.arch
+  const kvPairs = await kvPairsFor(hw.backend)
   let current = plan
   for (let attempt = 0; ; attempt++) {
     try {
@@ -796,7 +812,8 @@ async function loadWithBackoff(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const outOfVram = /out of memory|failed to allocate|unable to allocate/i.test(message)
-      const next = outOfVram && arch && attempt < 3 ? moreConservative(current, arch, hw, companionSize(model)) : null
+      const next =
+        outOfVram && arch && attempt < 3 ? moreConservative(current, arch, hw, companionSize(model), kvPairs) : null
       if (!next) throw err
       logger.warn('model', `${model.filename}: load ran out of VRAM, retrying with more of it in system RAM`, {
         attempt: attempt + 1,
@@ -838,6 +855,7 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
       allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
+      kvPairs: await kvPairsFor(fresh.backend),
       overrides: batchOverrides(s)
     })
     chosen = result.chosen ?? result.alternatives[0]
@@ -1237,6 +1255,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
       allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
+      kvPairs: await kvPairsFor(fresh.backend),
       // The load dialog's own placement choices sit on top of the batch sizes from Settings.
       overrides: { ...batchOverrides(s), ...sanitizeOverrides(overrides) }
     })
