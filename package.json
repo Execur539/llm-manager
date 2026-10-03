@@ -1,6 +1,6 @@
 {
   "name": "llm-manager",
-  "version": "1.6.6",
+  "version": "1.6.7",
   "description": "LLM Manager",
   "main": "./out/main/index.js",
   "author": "Aidan Stafford",
