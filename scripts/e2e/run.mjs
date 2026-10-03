@@ -1208,6 +1208,71 @@ const scenarios = {
     })
   },
 
+  /** A folder of the user's own is listed and loaded in place: nothing is copied into the app's folder. */
+  async modelFolders() {
+    await withApp('model-folders', async ({ app, page, env }) => {
+      // A second drive's AI folder, with a model in a subfolder as models usually are.
+      const elsewhere = path.join(env.base, 'second-drive', 'LLM')
+      const holder = path.join(elsewhere, 'heretic')
+      await fsp.mkdir(holder, { recursive: true })
+      const src = path.join(holder, 'Elsewhere-3B-Q5_K_M.gguf')
+      await fsp.writeFile(src, buildGguf({ name: 'Elsewhere-3B' }))
+
+      await goTo(page, 'My models')
+      await page.waitForSelector('.model-card', { timeout: 15000 })
+      const before = await page.locator('.model-card').count()
+
+      await goTo(page, 'Settings')
+      await stubDialogs(app, { open: [elsewhere] })
+      await page.getByTestId('add-model-folder').click()
+      await page.waitForTimeout(2000)
+      report.check('model-folders', 'the added folder is listed in Settings',
+        await page.getByText(elsewhere, { exact: true }).isVisible().catch(() => false))
+      await page.getByTestId('add-model-folder').scrollIntoViewIfNeeded()
+      await shot(page, 'model-folders')
+
+      await goTo(page, 'My models')
+      await page.waitForTimeout(500)
+      const after = await page.locator('.model-card').count()
+      report.check('model-folders', 'its model appears in the library', after === before + 1, `${before} -> ${after}`)
+      const copies = (await listGgufPaths(env.modelsDir)).filter((f) => /Elsewhere/.test(f))
+      report.check('model-folders', 'nothing is copied into the models folder', copies.length === 0, copies.join(','))
+
+      // The model may now be in a folder of the user's, so the delete dialog says which.
+      await page.locator('.model-card', { hasText: 'Elsewhere' }).getByTestId('delete-model').click()
+      await page.waitForTimeout(300)
+      const dialogText = (await page.getByTestId('confirm-overlay').textContent().catch(() => '')) ?? ''
+      report.check('model-folders', 'the delete dialog names the folder', dialogText.includes(holder), dialogText.slice(0, 200))
+      await page.getByTestId('confirm-cancel').click()
+      await page.waitForTimeout(300)
+
+      // Importing a model that is already listed from an extra folder must not copy it.
+      await stubDialogs(app, { open: [src] })
+      await page.getByTestId('import-gguf').click()
+      await page.waitForTimeout(2000)
+      report.check('model-folders', 'importing a model from an extra folder does not duplicate it',
+        (await page.locator('.model-card').count()) === after &&
+          !(await listGgufPaths(env.modelsDir)).some((f) => /Elsewhere/.test(f)))
+
+      // A folder inside one already listed adds nothing and says why.
+      await goTo(page, 'Settings')
+      await stubDialogs(app, { open: [holder] })
+      await page.getByTestId('add-model-folder').click()
+      await page.waitForTimeout(1500)
+      const note = (await page.locator('.card.note').first().textContent().catch(() => '')) ?? ''
+      report.check('model-folders', 'a folder inside a listed one is refused with a reason',
+        /already in the library/i.test(note) && (await page.getByTestId('remove-model-folder').count()) === 1, note)
+
+      await page.getByTestId('remove-model-folder').click()
+      await page.waitForTimeout(2000)
+      await goTo(page, 'My models')
+      await page.waitForTimeout(500)
+      report.check('model-folders', 'removing the folder takes its model out of the library',
+        (await page.locator('.model-card').count()) === before)
+      report.check('model-folders', 'and leaves the file where it was', fs.existsSync(src))
+    })
+  },
+
   /** The agent's persistent memory: add, edit, delete, and survive a restart. */
   async memory() {
     await withApp('memory', async ({ page }) => {

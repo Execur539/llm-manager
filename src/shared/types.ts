@@ -541,6 +541,8 @@ export type CompactionStrategy = 'auto-compact' | 'sliding-window'
 
 export interface AppSettings {
   modelsDir: string | null
+  /** Further folders whose models are listed and loaded in place. Downloads and imports still go to modelsDir. */
+  extraModelDirs: string[]
   hfToken: string | null
   autoFit: {
     minKvType: KvType

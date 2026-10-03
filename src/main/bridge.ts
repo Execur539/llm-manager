@@ -31,6 +31,7 @@ import { defaultModelsDir, exeDir, TOOL_OUTPUT_DIR } from './storage/paths'
 import { loadSettings, patchSettings } from './storage/settings'
 import { detectHardware, mergeDetection, refreshFreeVram } from './hardware/gpu'
 import { scanLibrary, libraryDiskUsage } from './models/library'
+import { isInside, libraryRoots } from './models/roots'
 import { checkRelocation, keepInPlace, performMove } from './models/relocation'
 import { DEFAULT_CONSTRAINTS, planFit, verifyPrediction } from './autofit/engine'
 import { llama, estimateTokens, type ChatMessage, type ContentPart, type CompletionOptions } from './runtime/llama'
@@ -205,6 +206,11 @@ export function setEmitter(fn: Emitter): void {
 
 export function modelsDir(): string {
   return loadSettings().modelsDir ?? defaultModelsDir()
+}
+
+/** Every folder the library lists models from: the models folder, then the user's extra folders. */
+export function libraryFolders(): string[] {
+  return libraryRoots(modelsDir(), loadSettings().extraModelDirs)
 }
 
 /**
@@ -1038,6 +1044,22 @@ async function attachmentTurn(
   }
 }
 
+/** Rescan every library folder, then re-apply what the user set on each model and the DB keeps. */
+async function rescanLibrary(): Promise<ModelRecord[]> {
+  library = await scanLibrary(libraryFolders())
+  for (const m of library) {
+    const meta = all<{ favourite: number; tags: string | null; last_used_at: number | null }>(
+      'SELECT favourite, tags, last_used_at FROM model_meta WHERE model_id = ?',
+      m.id
+    )[0]
+    if (meta) {
+      m.favourite = !!meta.favourite
+      m.lastUsedAt = meta.last_used_at
+    }
+  }
+  return library
+}
+
 export const handlers: Record<string, (...args: never[]) => unknown> = {
   // ---- settings
   'settings:get': () => ({ ...loadSettings(), hfToken: getHfToken() ? '***set***' : null }),
@@ -1127,21 +1149,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   }),
 
   // ---- library
-  'library:scan': async () => {
-    library = await scanLibrary(modelsDir())
-    // Re-apply user metadata stored in the DB.
-    for (const m of library) {
-      const meta = all<{ favourite: number; tags: string | null; last_used_at: number | null }>(
-        'SELECT favourite, tags, last_used_at FROM model_meta WHERE model_id = ?',
-        m.id
-      )[0]
-      if (meta) {
-        m.favourite = !!meta.favourite
-        m.lastUsedAt = meta.last_used_at
-      }
-    }
-    return library
-  },
+  'library:scan': () => rescanLibrary(),
   'library:disk': () => libraryDiskUsage(modelsDir()),
   'library:set-favourite': (modelId: string, favourite: boolean) => {
     run(
@@ -1178,8 +1186,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
    * Import GGUF files the user already has on disk.
    *
    * Three things matter here, all of them because these files are enormous:
-   *   - A file already inside the models folder needs no work at all; the old code copied it
-   *     onto itself.
+   *   - A file already in the library needs no work at all; the old code copied it onto itself.
+   *     That covers subfolders of the models folder and the extra folders, not only its top level.
    *   - On the same volume a hard link is instantaneous and costs no extra disk, where a copy
    *     of a 20 GB model costs 20 GB and several minutes of an apparently frozen window.
    *   - A name collision must not overwrite an existing model.
@@ -1196,6 +1204,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
 
     const dest = modelsDir()
     await fsp.mkdir(dest, { recursive: true })
+    const folders = libraryFolders()
 
     const imported: string[] = []
     const skipped: string[] = []
@@ -1205,8 +1214,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     for (const src of result.filePaths) {
       const name = path.basename(src)
       try {
-        // Already in the library folder: nothing to do but rescan.
-        if (path.resolve(path.dirname(src)).toLowerCase() === path.resolve(dest).toLowerCase()) {
+        // Already in the library: nothing to do but rescan.
+        if (folders.some((dir) => isInside(src, dir))) {
           skipped.push(name)
           continue
         }
@@ -1227,9 +1236,35 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       }
     }
 
-    library = await scanLibrary(dest)
+    await rescanLibrary()
     emit('library:import-progress', { file: '', phase: 'done' })
     return { imported, skipped, failed, linked }
+  },
+  /**
+   * Add a folder whose models are listed and loaded where they are.
+   *
+   * For models kept outside the app's folder, on a drive set aside for them, say, where Import
+   * would copy each one, often onto a drive with no room for a second 100 GB copy. Nothing is
+   * written into the folder: downloads and imports still go to the models folder.
+   */
+  'library:add-folder': async (): Promise<{ added: string | null; coveredBy?: string; folders: string[] }> => {
+    const result = await dialog.showOpenDialog({ properties: ['openDirectory'] })
+    const current = loadSettings().extraModelDirs
+    if (result.canceled || !result.filePaths[0]) return { added: null, folders: current }
+    const dir = path.resolve(result.filePaths[0])
+    // Already scanned, as the models folder, an extra folder, or inside one of them.
+    const coveredBy = libraryFolders().find((root) => isInside(dir, root))
+    if (coveredBy) return { added: null, coveredBy, folders: current }
+    // A folder added earlier that sits inside the new one is now covered by it.
+    const next = patchSettings({ extraModelDirs: [...current.filter((d) => !isInside(d, dir)), dir] })
+    emit('library:update', await rescanLibrary())
+    return { added: dir, folders: next.extraModelDirs }
+  },
+  /** Stop listing a folder's models. The folder and its files are left exactly as they are. */
+  'library:remove-folder': async (dir: string): Promise<string[]> => {
+    const next = patchSettings({ extraModelDirs: loadSettings().extraModelDirs.filter((d) => d !== dir) })
+    emit('library:update', await rescanLibrary())
+    return next.extraModelDirs
   },
 
   // ---- auto-fit

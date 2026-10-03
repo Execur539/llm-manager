@@ -9,9 +9,11 @@ import path from 'node:path'
 import type { AppSettings } from '@shared/types'
 import { APPDATA_DIR, SETTINGS_FILE } from './paths'
 import { DEFAULT_SAMPLING } from '../../shared/sampling'
+import { sanitizeModelDirs } from '../models/roots'
 
 export const DEFAULT_SETTINGS: AppSettings = {
   modelsDir: null,
+  extraModelDirs: [],
   hfToken: null,
   autoFit: {
     minKvType: 'q4_0',
@@ -232,6 +234,15 @@ function clampNumerics(settings: AppSettings): AppSettings {
   return settings
 }
 
+/**
+ * Lists the scanner walks, checked on read for the same reason the numbers are clamped: a
+ * hand-edited file holding a string, a number or a relative path must not reach the library scan.
+ */
+function sanitizeLists(settings: AppSettings): AppSettings {
+  settings.extraModelDirs = sanitizeModelDirs(settings.extraModelDirs)
+  return settings
+}
+
 /*
  * Connections per download were 4, with no control for them anywhere, so a stored 4 is the old
  * default rather than anybody's choice. One HuggingFace connection measured about 15 MB/s here,
@@ -256,7 +267,7 @@ export function loadSettings(): AppSettings {
   if (cache) return cache
   try {
     const raw = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
-    cache = migrateDownloads(clampNumerics(merge(DEFAULT_SETTINGS, raw)), raw)
+    cache = migrateDownloads(sanitizeLists(clampNumerics(merge(DEFAULT_SETTINGS, raw))), raw)
   } catch {
     cache = { ...DEFAULT_SETTINGS }
   }
@@ -275,7 +286,7 @@ export function patchSettings(patch: Partial<AppSettings>): AppSettings {
   // Clamped on the way in as well as on the way out, so a caller that is not the settings UI —
   // the API server, a remote session, a hand-edited file reloaded — cannot store a value the
   // rest of the app will trip over.
-  const next = clampNumerics(merge(loadSettings(), patch))
+  const next = sanitizeLists(clampNumerics(merge(loadSettings(), patch)))
   saveSettings(next)
   return next
 }

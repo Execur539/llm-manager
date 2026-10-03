@@ -20,7 +20,7 @@ import { apiServer } from './api/server'
 import { remoteWeb } from './remote/web'
 import { llama } from './runtime/llama'
 import { vendorDiagnostics } from './runtime/binaries'
-import { handlers, invokeBridge, setEmitter, setLibrary, shutdown, modelsDir, startHardwareRefresh, stopHardwareRefresh } from './bridge'
+import { handlers, invokeBridge, setEmitter, setLibrary, shutdown, modelsDir, libraryFolders, startHardwareRefresh, stopHardwareRefresh } from './bridge'
 import { handleMediaProtocol } from './chat/media'
 import { installCrashHandlers, logger } from './log'
 
@@ -319,7 +319,7 @@ app.whenReady().then(async () => {
    */
   downloadQueue.on('update', (list) => emitToSurfaces('downloads:update', list))
   downloadQueue.on('completed', () => {
-    void scanLibrary(modelsDir()).then((models) => {
+    void scanLibrary(libraryFolders()).then((models) => {
       setLibrary(models)
       emitToSurfaces('library:update', models)
     })
@@ -345,7 +345,7 @@ app.whenReady().then(async () => {
     })
     .catch((err) => logger.warn('hardware', 'detection failed', String(err)))
 
-  void scanLibrary(modelsDir())
+  void scanLibrary(libraryFolders())
     .then((models) => {
       setLibrary(models)
       emitToSurfaces('library:update', models)

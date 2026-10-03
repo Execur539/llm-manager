@@ -232,11 +232,27 @@ async function detectCapabilities(
   }
 }
 
-export async function scanLibrary(modelsDir: string): Promise<ModelRecord[]> {
-  if (!fs.existsSync(modelsDir)) return []
+/**
+ * Every model under the given folders, the app's models folder first.
+ *
+ * All folders go through one scan because the index is rewritten from what a scan finds: scanned
+ * one folder at a time, each pass would evict the others' entries and re-parse them next time.
+ */
+export async function scanLibrary(roots: string | readonly string[]): Promise<ModelRecord[]> {
+  const dirs = (typeof roots === 'string' ? [roots] : roots).filter((d) => fs.existsSync(d))
+  if (!dirs.length) return []
 
   const index = await loadIndex()
-  const files = await findGgufFiles(modelsDir)
+  const files: string[] = []
+  const seen = new Set<string>()
+  for (const dir of dirs) {
+    for (const file of await findGgufFiles(dir)) {
+      // A folder that contains the models folder walks into it again.
+      if (seen.has(file.toLowerCase())) continue
+      seen.add(file.toLowerCase())
+      files.push(file)
+    }
+  }
 
   const records: ModelRecord[] = []
   const nextIndex: IndexEntry[] = []

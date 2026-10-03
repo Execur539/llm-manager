@@ -1882,6 +1882,84 @@ section('Settings: values other code does arithmetic on')
   fs.rmSync(fresh, { recursive: true, force: true })
 }
 
+/*
+ * Models kept outside the app's own folder, on a second drive set aside for them, could only be
+ * reached through Import, which copies each file: 100 GB more on a drive that may not have it.
+ * Extra folders are scanned in place instead.
+ */
+section('Library: model folders beyond the app\'s own')
+{
+  const { isInside, sanitizeModelDirs, libraryRoots } = await import('./built/roots.js')
+  if (process.platform === 'win32') {
+    check('a file in a folder is inside it', isInside('S:\\AI\\LLM\\m.gguf', 'S:\\AI\\LLM'))
+    check('a folder is inside itself', isInside('S:\\AI\\LLM', 'S:\\AI\\LLM\\'))
+    check('a sibling sharing the name prefix is not', !isInside('S:\\AI\\LLM2\\m.gguf', 'S:\\AI\\LLM'))
+    check('another drive is not', !isInside('D:\\AI\\LLM\\m.gguf', 'S:\\AI\\LLM'))
+    check('case does not matter on Windows', isInside('s:\\ai\\llm\\M.gguf', 'S:\\AI\\LLM'))
+
+    check('a single string where a list belongs is dropped', sanitizeModelDirs('S:\\AI').length === 0)
+    const clean = sanitizeModelDirs([42, '', '  ', 'models\\relative', 'S:\\AI\\LLM\\', 's:\\ai\\llm', 'T:\\More'])
+    check('only absolute folders survive, once each',
+      JSON.stringify(clean) === JSON.stringify(['S:\\AI\\LLM', 'T:\\More']), JSON.stringify(clean))
+
+    const roots = libraryRoots('D:\\Apps\\Models', ['D:\\Apps\\Models\\sub', 'S:\\AI\\LLM', 'S:\\AI\\LLM\\heretic', 'T:\\More'])
+    check('the models folder comes first, and folders inside another are dropped',
+      JSON.stringify(roots) === JSON.stringify(['D:\\Apps\\Models', 'S:\\AI\\LLM', 'T:\\More']), JSON.stringify(roots))
+    const outer = libraryRoots('D:\\Apps\\Models', ['D:\\Apps'])
+    check('a folder holding the models folder is kept for its own models',
+      JSON.stringify(outer) === JSON.stringify(['D:\\Apps\\Models', 'D:\\Apps']), JSON.stringify(outer))
+  }
+
+  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-folders-'))
+  process.env.LLMM_APPDATA_DIR = fresh
+  const load = async (stored) => {
+    fs.writeFileSync(path.join(fresh, 'settings.json'), JSON.stringify(stored))
+    return (await import(`./built/settings.js?folders=${encodeURIComponent(JSON.stringify(stored))}`)).loadSettings()
+  }
+  const elsewhere = path.join(fresh, 'second-drive', 'LLM')
+  check('settings from before the list existed get an empty one', JSON.stringify((await load({})).extraModelDirs) === '[]')
+  check('a hand-edited string is not walked as a list of folders',
+    JSON.stringify((await load({ extraModelDirs: elsewhere })).extraModelDirs) === '[]')
+  const kept = (await load({ extraModelDirs: [elsewhere, 7, 'relative'] })).extraModelDirs
+  check('a stored folder is kept and junk beside it is not',
+    JSON.stringify(kept) === JSON.stringify([elsewhere]), JSON.stringify(kept))
+
+  // A real scan: the app's folder, a second drive's folder, a split model, and a hidden cache folder.
+  const appModels = path.join(fresh, 'app-models')
+  const heretic = path.join(elsewhere, 'heretic')
+  fs.mkdirSync(path.join(appModels, 'org__repo'), { recursive: true })
+  fs.mkdirSync(path.join(heretic, 'Q8_0'), { recursive: true })
+  fs.mkdirSync(path.join(elsewhere, '.cache'), { recursive: true })
+  fs.writeFileSync(path.join(appModels, 'org__repo', 'A-Q4_K_M.gguf'), buildGguf())
+  fs.writeFileSync(path.join(heretic, 'B-Q5_K_M-mix.gguf'), buildGguf())
+  const small = { blockCount: 2, embeddingLength: 256, headCount: 4, headCountKv: 2, keyLength: 64, vocabSize: 1000, ssm: false }
+  fs.writeFileSync(path.join(heretic, 'Q8_0', 'B-Q8_0-00001-of-00002.gguf'), buildGguf({ ...small, tensors: [] }))
+  fs.writeFileSync(path.join(heretic, 'Q8_0', 'B-Q8_0-00002-of-00002.gguf'), Buffer.concat([
+    buildGguf({ ...small, tensors: [['blk.0.attn_q.weight', [256, 256], 1]] }),
+    Buffer.alloc(8192)
+  ]))
+  fs.writeFileSync(path.join(elsewhere, '.cache', 'C.gguf'), buildGguf())
+
+  const { scanLibrary } = await import(`./built/library.js?folders=${Date.now()}`)
+  const both = await scanLibrary([appModels, elsewhere])
+  const names = both.map((m) => m.filename).sort()
+  check('models in an extra folder are listed beside the app\'s own',
+    JSON.stringify(names) === JSON.stringify(['A-Q4_K_M.gguf', 'B-Q5_K_M-mix.gguf', 'B-Q8_0-00001-of-00002.gguf']), JSON.stringify(names))
+  check('they parse like any other model', both.every((m) => !m.error), both.map((m) => m.error).filter(Boolean).join(' | '))
+  check('a split model there keeps both its parts', both.find((m) => m.filename.startsWith('B-Q8_0'))?.parts?.length === 2)
+
+  const overlapping = await scanLibrary([appModels, elsewhere, path.dirname(elsewhere)])
+  check('a folder holding another lists nothing twice', overlapping.length === 3, `${overlapping.length}`)
+  const index = JSON.parse(fs.readFileSync(path.join(fresh, 'model-index.json'), 'utf8'))
+  check('one scan keeps every folder\'s models in the index', index.entries.length === 3, `${index.entries.length}`)
+
+  const unplugged = await scanLibrary([appModels, path.join(fresh, 'unplugged-drive')])
+  check('a folder that is not there is skipped, not fatal',
+    unplugged.length === 1 && unplugged[0].filename === 'A-Q4_K_M.gguf', unplugged.map((m) => m.filename).join(', '))
+
+  fs.rmSync(fresh, { recursive: true, force: true })
+}
+
 // ---------------------------------------------------------------- transcript order
 
 /*

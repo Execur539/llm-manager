@@ -28,7 +28,9 @@ await build({
     imageCopy: path.join(ROOT, 'src/main/chat/image-copy.ts'),
     sentContent: path.join(ROOT, 'src/main/chat/sent-content.ts'),
     faKernels: path.join(ROOT, 'src/main/runtime/fa-kernels.ts'),
-    hostBudget: path.join(ROOT, 'src/main/runtime/host-budget.ts')
+    hostBudget: path.join(ROOT, 'src/main/runtime/host-budget.ts'),
+    roots: path.join(ROOT, 'src/main/models/roots.ts'),
+    library: path.join(ROOT, 'src/main/models/library.ts')
   },
   outdir: path.join(ROOT, 'scripts/built'),
   bundle: true,

@@ -692,7 +692,9 @@ export default function Library({
         body={
           <>
             <p>
-              <strong>{pendingDelete?.filename}</strong> will be erased from disk, freeing{' '}
+              {/* Named, because a model can now live in a folder of the user's own rather than the app's. */}
+              <strong>{pendingDelete?.filename}</strong> will be erased from{' '}
+              <code>{pendingDelete?.path.replace(/[\\/][^\\/]*$/, '')}</code>, freeing{' '}
               {fmtBytes(pendingDelete?.bytes)}. This cannot be undone and the file is not sent to the Recycle Bin.
             </p>
             {pendingDelete && pendingDelete.bytes > 4 * 1024 ** 3 && (

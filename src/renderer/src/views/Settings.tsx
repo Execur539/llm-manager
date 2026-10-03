@@ -577,6 +577,39 @@ export default function Settings({
         <div className="faint" style={{ fontSize: 11, marginTop: 6 }}>
           Models live beside the app. If you move the app, it offers to bring them along on next launch.
         </div>
+
+        <div className="dim" style={{ marginTop: 14, marginBottom: 8 }}>
+          Other model folders. Their models are listed and loaded where they are, so nothing is copied;
+          downloads and imports still go to the models folder.
+        </div>
+        {settings.extraModelDirs.map((dir) => (
+          <div className="row row-card" key={dir}>
+            <div className="truncate mono" style={{ flex: 1, minWidth: 0 }} title={dir}>{dir}</div>
+            <button
+              data-testid="remove-model-folder"
+              onClick={async () => {
+                const folders = await invoke<string[]>('library:remove-folder', dir)
+                setSettings((s) => (s ? { ...s, extraModelDirs: folders } : s))
+                setInfo(`Models in ${dir} are no longer listed. The folder and its files were not touched.`)
+              }}
+            >
+              Remove
+            </button>
+          </div>
+        ))}
+        <div className="row" style={{ marginTop: 8 }}>
+          <button
+            data-testid="add-model-folder"
+            onClick={async () => {
+              const r = await invoke<{ added: string | null; coveredBy?: string; folders: string[] }>('library:add-folder')
+              setSettings((s) => (s ? { ...s, extraModelDirs: r.folders } : s))
+              if (r.added) setInfo(`Models in ${r.added} now appear under My models.`)
+              else if (r.coveredBy) setInfo(`That folder is already in the library: it is inside ${r.coveredBy}.`)
+            }}
+          >
+            Add folder…
+          </button>
+        </div>
       </div>
 
       <div className="card">
