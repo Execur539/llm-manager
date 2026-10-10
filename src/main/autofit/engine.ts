@@ -320,6 +320,41 @@ function isIntegrated(gpu: GpuDevice): boolean {
   return /\bgraphics\b/i.test(gpu.name) && !/\b(rtx|gtx|rx|arc)\b/i.test(gpu.name)
 }
 
+/**
+ * The devices a plan covers, in the order of its per-card figures (`predictedVramPerGpu`).
+ *
+ * Exported so whoever measures a load reads the same cards in the same order: the hardware list
+ * also holds devices the backend cannot use, such as an integrated GPU under CUDA.
+ */
+export function usableDevices(hw: HardwareSnapshot): GpuDevice[] {
+  const hasDiscrete = hw.gpus.some((g) => g.totalVram > 0 && !/\bgraphics\b/i.test(g.name))
+  return hw.gpus.filter((g) => usableForBackend(g, hw.backend, hasDiscrete))
+}
+
+/** A card's name that survives a restart: its position and model, so two identical cards stay apart. */
+export function gpuKey(gpu: GpuDevice): string {
+  return `${gpu.index}:${gpu.name}`
+}
+
+/**
+ * Extra headroom per card from how far a model's last load overshot its prediction.
+ *
+ * The overshoot plus a quarter again, so one correction does not land exactly on the edge it
+ * missed. Undershoots give nothing back: a plan that was too careful costs context, not a crash.
+ */
+export function learnHeadroom(
+  lastLoad: { keys: string[]; predicted: number[]; actual: number[] } | null
+): Record<string, number> {
+  const out: Record<string, number> = {}
+  if (!lastLoad) return out
+  lastLoad.keys.forEach((key, i) => {
+    const actual = lastLoad.actual[i] ?? 0
+    const over = actual - (lastLoad.predicted[i] ?? 0)
+    if (actual > 0 && over > 0) out[key] = Math.round(over * 1.25)
+  })
+  return out
+}
+
 /** Usable bytes on a device after headroom and fixed runtime overhead. */
 function deviceBudget(gpu: GpuDevice, headroomBytes: number, backend: string): number {
   // P1: prefer the measured free figure; fall back to a discounted total only when we
@@ -796,8 +831,7 @@ function planFitInner(
   }
 
   // Only devices the selected backend can actually address take part in the plan.
-  const hasDiscrete = hw.gpus.some((g) => g.totalVram > 0 && !/\bgraphics\b/i.test(g.name))
-  const usableGpus = hw.gpus.filter((g) => usableForBackend(g, hw.backend, hasDiscrete))
+  const usableGpus = usableDevices(hw)
   const excluded = hw.gpus.filter((g) => !usableGpus.includes(g) && g.totalVram > 0)
 
   if (excluded.length) {
@@ -809,7 +843,9 @@ function planFitInner(
     )
   }
 
-  const budgets = usableGpus.map((g) => deviceBudget(g, constraints.headroomBytes, hw.backend))
+  const budgets = usableGpus.map((g) =>
+    deviceBudget(g, constraints.headroomBytes + (constraints.learnedHeadroom?.[gpuKey(g)] ?? 0), hw.backend)
+  )
 
   // The vision encoder loads onto the primary device and brings its own image-processing
   // buffers, so charge it there with margin rather than splitting it across devices.

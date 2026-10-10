@@ -69,14 +69,23 @@ const GGML_TYPE_TRAITS: Record<number, [number, number]> = {
   27: [1, 8], // I64
   28: [1, 8], // F64
   29: [256, 56], // IQ1_M
-  30: [1, 2] // BF16
+  30: [1, 2], // BF16
+  // Newer types, sizes from ggml-common.h in b10900. A missing one was counted at a byte per
+  // element, and the file-size reconcile then shrank every correctly sized tensor to compensate.
+  34: [256, 54], // TQ1_0
+  35: [256, 66], // TQ2_0
+  39: [32, 17], // MXFP4
+  40: [64, 36], // NVFP4
+  41: [128, 18], // Q1_0
+  42: [64, 18] // Q2_0
 }
 
 const GGML_TYPE_NAMES: Record<number, string> = {
   0: 'F32', 1: 'F16', 2: 'Q4_0', 3: 'Q4_1', 6: 'Q5_0', 7: 'Q5_1', 8: 'Q8_0', 9: 'Q8_1',
   10: 'Q2_K', 11: 'Q3_K', 12: 'Q4_K', 13: 'Q5_K', 14: 'Q6_K', 15: 'Q8_K', 16: 'IQ2_XXS',
   17: 'IQ2_XS', 18: 'IQ3_XXS', 19: 'IQ1_S', 20: 'IQ4_NL', 21: 'IQ3_S', 22: 'IQ2_S',
-  23: 'IQ4_XS', 24: 'I8', 25: 'I16', 26: 'I32', 27: 'I64', 28: 'F64', 29: 'IQ1_M', 30: 'BF16'
+  23: 'IQ4_XS', 24: 'I8', 25: 'I16', 26: 'I32', 27: 'I64', 28: 'F64', 29: 'IQ1_M', 30: 'BF16',
+  34: 'TQ1_0', 35: 'TQ2_0', 39: 'MXFP4', 40: 'NVFP4', 41: 'Q1_0', 42: 'Q2_0'
 }
 
 export function tensorByteSize(ggmlType: number, dims: number[]): number {
@@ -425,62 +434,76 @@ export function extractArchInfo(meta: GgufMetadata, fileSize?: number, actualWei
   let hasOutputHead = false
   const quantCounts = new Map<number, number>()
   const unknownTypes = new Set<number>()
+  for (const t of meta.tensors) if (!isKnownGgmlType(t.ggmlType)) unknownTypes.add(t.ggmlType)
+
+  /*
+   * Reconcile against the file. Tensor data runs from dataOffset to EOF, so that span is the
+   * ground truth for how much weight there is. A split model passes the total across its parts.
+   *
+   * Only the tensors whose type this build cannot size are adjusted: they share whatever the known
+   * ones leave unexplained, by element count. Scaling every bucket by one ratio, as before, shrank
+   * correctly sized expert and dense layers by a quarter when a 27 GB MXFP4 table was counted as
+   * 51 GB, and the planner packed a card to within 0.15 GB of full. Known sizes are exact; when
+   * every type is known and the file is still larger, everything is scaled up, never down.
+   */
+  const actual =
+    actualWeightBytes ?? (fileSize && fileSize > meta.dataOffset ? fileSize - meta.dataOffset : undefined)
+  const sizeOf = new Map<(typeof meta.tensors)[number], number>()
+  for (const t of meta.tensors) sizeOf.set(t, t.bytes)
+  if (actual !== undefined && actual > 0) {
+    let known = 0
+    let unknownElements = 0
+    for (const t of meta.tensors) {
+      if (isKnownGgmlType(t.ggmlType)) known += t.bytes
+      else unknownElements += t.dims.reduce((x, y) => x * y, 1)
+    }
+    if (unknownElements > 0) {
+      const perElement = Math.max(0, actual - known) / unknownElements
+      for (const t of meta.tensors) {
+        if (!isKnownGgmlType(t.ggmlType)) sizeOf.set(t, t.dims.reduce((x, y) => x * y, 1) * perElement)
+      }
+    } else if (known > 0 && actual > known * 1.02) {
+      // Small deltas are padding and alignment; a larger one is a layout this build misreads.
+      const ratio = actual / known
+      for (const t of meta.tensors) sizeOf.set(t, t.bytes * ratio)
+    }
+  }
+
   for (const t of meta.tensors) {
-    if (!isKnownGgmlType(t.ggmlType)) unknownTypes.add(t.ggmlType)
-    // Only count 2D+ weight tensors toward "the" quant; 1D norms are always F32.
-    if (t.dims.length >= 2) {
-      quantCounts.set(t.ggmlType, (quantCounts.get(t.ggmlType) ?? 0) + t.bytes)
+    const bytes = sizeOf.get(t) ?? t.bytes
+    // Only count 2D+ weight tensors toward "the" quant; 1D norms are always F32. The per-layer
+    // embedding table is a lookup, not a matmul, and at a quarter of some files it would name them.
+    if (t.dims.length >= 2 && !t.name.startsWith('per_layer_token_embd.')) {
+      quantCounts.set(t.ggmlType, (quantCounts.get(t.ggmlType) ?? 0) + bytes)
     }
 
     const block = BLOCK_RE.exec(t.name)
     if (block) {
-      perLayerBytes += t.bytes
+      perLayerBytes += bytes
       // A block numbered past block_count has nowhere better to go than the last block.
       if (blockCount > 0) {
         const il = Math.min(Number(block[1]), blockCount - 1)
-        if (ROUTED_EXPERT_RE.test(t.name)) layerExpertBytes[il] += t.bytes
-        else layerDenseBytes[il] += t.bytes
+        if (ROUTED_EXPERT_RE.test(t.name)) layerExpertBytes[il] += bytes
+        else layerDenseBytes[il] += bytes
       }
       continue
     }
 
-    nonLayerBytes += t.bytes
+    nonLayerBytes += bytes
     if (INPUT_LAYER_RE.test(t.name)) {
-      inputBytes += t.bytes
-      if (t.name.startsWith('per_layer_token_embd.')) pleBytes += t.bytes
-      if (t.name === 'token_embd.weight') tokenEmbdBytes = t.bytes
+      inputBytes += bytes
+      if (t.name.startsWith('per_layer_token_embd.')) pleBytes += bytes
+      if (t.name === 'token_embd.weight') tokenEmbdBytes = bytes
     } else {
-      outputBytes += t.bytes
+      outputBytes += bytes
       if (t.name === 'output.weight') hasOutputHead = true
     }
   }
 
-  // Reconcile against the file. Tensor data runs from dataOffset to EOF, so that span is the
-  // ground truth for how much weight there actually is. If our per-type arithmetic disagrees —
-  // because of an unrecognised quantisation, or a layout change — scale to match rather than
-  // trusting a total we know is wrong. A split model passes the total across all its parts.
-  const actual =
-    actualWeightBytes ?? (fileSize && fileSize > meta.dataOffset ? fileSize - meta.dataOffset : undefined)
-  if (actual !== undefined && actual > 0) {
-    const computed = perLayerBytes + nonLayerBytes
-    const ratio = computed > 0 ? actual / computed : 0
-    // Only correct a real discrepancy; small deltas are padding and alignment.
-    if (computed > 0 && (ratio > 1.02 || ratio < 0.98)) {
-      perLayerBytes *= ratio
-      nonLayerBytes *= ratio
-      inputBytes *= ratio
-      pleBytes *= ratio
-      outputBytes *= ratio
-      tokenEmbdBytes *= ratio
-      for (let i = 0; i < blockCount; i++) {
-        layerDenseBytes[i] *= ratio
-        layerExpertBytes[i] *= ratio
-      }
-    } else if (computed === 0) {
-      // Nothing parsed at all: attribute everything to layers, which the fit engine can offload.
-      perLayerBytes = actual
-      if (blockCount > 0) layerDenseBytes.fill(actual / blockCount)
-    }
+  if (actual !== undefined && actual > 0 && perLayerBytes + nonLayerBytes === 0) {
+    // Nothing parsed at all: attribute everything to layers, which the fit engine can offload.
+    perLayerBytes = actual
+    if (blockCount > 0) layerDenseBytes.fill(actual / blockCount)
   }
 
   /*

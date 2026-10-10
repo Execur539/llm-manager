@@ -255,6 +255,11 @@ export interface FitConstraints {
   /** bytes of VRAM deliberately left unused per GPU */
   headroomBytes: number
   /**
+   * More headroom on particular cards, keyed by `gpuKey`, learned from how far this model's last
+   * load overshot its prediction there.
+   */
+  learnedHeadroom?: Record<string, number>
+  /**
    * Companion weights loaded alongside the model — currently the multimodal projector.
    * llama.cpp places the vision encoder on the primary device, so this is charged there
    * rather than split. Ignoring it is enough to turn a fitting plan into an OOM.

@@ -33,7 +33,7 @@ import { detectHardware, mergeDetection, refreshFreeVram } from './hardware/gpu'
 import { scanLibrary, libraryDiskUsage } from './models/library'
 import { isInside, libraryRoots } from './models/roots'
 import { checkRelocation, keepInPlace, performMove } from './models/relocation'
-import { DEFAULT_CONSTRAINTS, planFit, verifyPrediction } from './autofit/engine'
+import { DEFAULT_CONSTRAINTS, gpuKey, learnHeadroom, planFit, usableDevices, verifyPrediction } from './autofit/engine'
 import { llama, estimateTokens, type ChatMessage, type ContentPart, type CompletionOptions } from './runtime/llama'
 import { missingBinaries, embeddingModelPath, vendorDiagnostics, llamaServerPath } from './runtime/binaries'
 import { cudaKvPairs, MATCHED_KV_PAIRS } from './runtime/fa-kernels'
@@ -716,6 +716,29 @@ function batchOverrides(s: AppSettings): FitConstraints['overrides'] {
   return out
 }
 
+/**
+ * Extra headroom per card for a model, from how far its last load overshot its prediction.
+ *
+ * "Widening the safety margin for next time" used to be a promise nothing kept: the measured
+ * figures were stored and never read, so five retries of one model made byte-identical plans
+ * and crashed the same way. Rows from before the figures carried their card keys are ignored.
+ */
+function learnedHeadroomFor(modelId: string): Record<string, number> {
+  const row = all<{ predicted_vram: string | null; actual_vram: string | null }>(
+    'SELECT predicted_vram, actual_vram FROM model_configs WHERE model_id = ?',
+    modelId
+  )[0]
+  if (!row?.predicted_vram || !row.actual_vram) return {}
+  try {
+    const measured = JSON.parse(row.actual_vram) as { keys?: unknown; bytes?: unknown }
+    const predicted = JSON.parse(row.predicted_vram) as unknown
+    if (!Array.isArray(measured?.keys) || !Array.isArray(measured.bytes) || !Array.isArray(predicted)) return {}
+    return learnHeadroom({ keys: measured.keys as string[], predicted: predicted as number[], actual: measured.bytes as number[] })
+  } catch {
+    return {}
+  }
+}
+
 /** The auto-fit constraints as the user's settings define them. */
 function constraintsFromSettings(s: AppSettings): FitConstraints {
   return {
@@ -861,6 +884,7 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
       allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
+      learnedHeadroom: learnedHeadroomFor(model.id),
       kvPairs: await kvPairsFor(fresh.backend),
       overrides: batchOverrides(s)
     })
@@ -889,9 +913,20 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
     cpuMoeLayers: chosen.cpuMoeLayers ?? 0
   })
 
-  // Verify prediction against reality and feed the delta back into the headroom margin.
+  /*
+   * Verify prediction against reality, card by card, and keep it for the next plan of this model.
+   *
+   * Measured over the cards the plan covers, in its order. The hardware list also holds devices
+   * the backend cannot use (an integrated GPU under CUDA), and pairing by position only lined the
+   * two up by luck. The keys are stored with the figures so learnedHeadroomFor can match them to
+   * the cards present next time.
+   */
   const after = await refreshFreeVram(fresh)
-  const actual = after.gpus.map((g, i) => Math.max(0, (fresh.gpus[i]?.freeVram ?? 0) - g.freeVram))
+  const planned = usableDevices(fresh)
+  const actual = planned.map((g) => {
+    const now = after.gpus.find((x) => x.index === g.index)
+    return now ? Math.max(0, g.freeVram - now.freeVram) : 0
+  })
   const verdict = verifyPrediction(chosen, actual)
   if (verdict.suggestion) {
     logger.info('autofit', verdict.suggestion, { predicted: chosen.predictedVramPerGpu, actual })
@@ -903,7 +938,7 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
     model.id,
     JSON.stringify(chosen),
     JSON.stringify(chosen.predictedVramPerGpu),
-    JSON.stringify(actual),
+    JSON.stringify({ keys: planned.map(gpuKey), bytes: actual }),
     Date.now()
   )
   run(
@@ -1290,6 +1325,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
       allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
+      learnedHeadroom: learnedHeadroomFor(model.id),
       kvPairs: await kvPairsFor(fresh.backend),
       // The load dialog's own placement choices sit on top of the batch sizes from Settings.
       overrides: { ...batchOverrides(s), ...sanitizeOverrides(overrides) }
