@@ -26,6 +26,8 @@ const {
   DEFAULT_CONSTRAINTS,
   fmtBytes,
   verifyPrediction,
+  learnHeadroom,
+  gpuKey,
   nglFor,
   resolveBatches
 } = await import('./built/engine.js')
@@ -1047,6 +1049,86 @@ section('GGUF tensors are classed the way llama.cpp places them')
   }
 }
 
+/*
+ * A GGUF holding a type this build could not size broke every plan made from it. llama.cpp kept
+ * adding types (MXFP4, Q1_0, Q2_0...), a missing one was counted at a byte per element, and the
+ * file-size reconcile then scaled EVERY tensor by the same ratio: on a 76 GB Flash-Next quant
+ * whose 27 GB MXFP4 table was counted as 51 GB, the correctly sized experts shrank by a quarter
+ * and the planner filled a 12 GB card to within 0.15 GB, so the first prompt ran out of memory.
+ */
+section('GGUF types the planner must size exactly')
+{
+  const n = 51_200_000
+  check('MXFP4 is 17 bytes per 32', tensorByteSize(39, [160, n / 160]) === (n / 32) * 17)
+  check('Q1_0 is 18 bytes per 128', tensorByteSize(41, [128, 10]) === 180)
+  check('Q2_0 is 18 bytes per 64', tensorByteSize(42, [64, 10]) === 180)
+  check('TQ1_0 and TQ2_0 are 54 and 66 bytes per 256', tensorByteSize(34, [256, 2]) === 108 && tensorByteSize(35, [256, 2]) === 132)
+  check('NVFP4 is 36 bytes per 64', tensorByteSize(40, [64, 3]) === 108)
+
+  const common = { blockCount: 2, embeddingLength: 256, headCount: 4, headCountKv: 2, keyLength: 64, vocabSize: 1000, ssm: false }
+  const tensors = (pleType) => [
+    ['token_embd.weight', [256, 1000], 1],
+    ['per_layer_token_embd.weight', [256, 20000], pleType],
+    ['blk.0.attn_q.weight', [256, 256], 1],
+    ['blk.0.ffn_gate_exps.weight', [256, 64, 8], 1],
+    ['blk.1.attn_q.weight', [256, 256], 1],
+    ['output_norm.weight', [256], 0]
+  ]
+  const file = path.join(os.tmpdir(), `llmm-types-${Date.now()}.gguf`)
+  try {
+    const known = 256 * 1000 * 2 + 256 * 256 * 2 * 2 + 256 * 64 * 8 * 2 + 256 * 4
+    // MXFP4 table: sized exactly, and nothing else moves.
+    fs.writeFileSync(file, buildGguf({ ...common, tensors: tensors(39) }))
+    let meta = await readGguf(file)
+    const ple = (256 * 20000 / 32) * 17
+    let a = extractArchInfo(meta, meta.dataOffset + known + ple)
+    check('an MXFP4 table is counted at its real size', a.pleBytes === ple, String(a.pleBytes))
+    check('and the experts beside it are not scaled', a.layerExpertBytes[0] === 256 * 64 * 8 * 2, String(a.layerExpertBytes[0]))
+    check('the table does not name the quant', a.quant === 'F16', a.quant)
+
+    // A type no build knows: it takes the bytes the known tensors leave over, and only it.
+    fs.writeFileSync(file, buildGguf({ ...common, tensors: tensors(99) }))
+    meta = await readGguf(file)
+    a = extractArchInfo(meta, meta.dataOffset + known + 3_000_000)
+    check('an unknown type absorbs only the unexplained bytes', Math.round(a.pleBytes) === 3_000_000, String(a.pleBytes))
+    check('while known layers keep their exact size',
+      a.layerExpertBytes[0] === 256 * 64 * 8 * 2 && a.layerDenseBytes[1] === 256 * 256 * 2, JSON.stringify(a.layerDenseBytes))
+    check('and the type is still reported as unknown', a.unknownTensorTypes.includes(99))
+
+    // Every type known but the file smaller than computed: never shrink known tensors.
+    fs.writeFileSync(file, buildGguf({ ...common, tensors: tensors(1) }))
+    meta = await readGguf(file)
+    a = extractArchInfo(meta, meta.dataOffset + Math.round((known + 256 * 20000 * 2) * 0.7))
+    check('a short file never shrinks known sizes', a.layerExpertBytes[0] === 256 * 64 * 8 * 2, String(a.layerExpertBytes[0]))
+  } finally {
+    fs.rmSync(file, { force: true })
+  }
+}
+
+/*
+ * "Used 1.59 GB more VRAM than predicted. Widening the safety margin for next time." was logged
+ * five times for one model while nothing read the measurement back, so every retry made the same
+ * plan and crashed the same way.
+ */
+section('The planner learns from a load that overshot')
+{
+  const g0 = gpu('RTX 5080', 16, 14), g1 = gpu('RTX 4070 Ti', 12, 11, true, 1)
+  const learned = learnHeadroom({ keys: [gpuKey(g0), gpuKey(g1)], predicted: [9e9, 10e9], actual: [8.9e9, 11.6e9] })
+  check('an overshoot becomes headroom on that card, with a quarter to spare',
+    learned[gpuKey(g1)] === Math.round(1.6e9 * 1.25), JSON.stringify(learned))
+  check('a card that came in under gets nothing', !(gpuKey(g0) in learned))
+  check('a failed reading teaches nothing', Object.keys(learnHeadroom({ keys: ['x'], predicted: [5e9], actual: [0] })).length === 0)
+  check('two identical cards are told apart', gpuKey(g0) !== gpuKey({ ...g0, index: 1 }))
+
+  const base = planFit(arch, hw([g0, g1]), DEFAULT_CONSTRAINTS).chosen
+  // Tighter budgets can leave no default, in which case the planner offers the tradeoffs instead.
+  const r = planFit(arch, hw([g0, g1]), { ...DEFAULT_CONSTRAINTS, learnedHeadroom: { [gpuKey(g1)]: 2 * GB } })
+  const wiser = r.chosen ?? r.alternatives[0]
+  check('the next plan leaves the learned room free on that card',
+    !!base && !!wiser && wiser.predictedVramPerGpu[1] <= base.predictedVramPerGpu[1] - 1.5 * GB,
+    `${(base?.predictedVramPerGpu[1] / GB).toFixed(2)} -> ${(wiser?.predictedVramPerGpu[1] / GB).toFixed(2)} GB`)
+}
+
 section('Compaction helper: chunks, progress, loops and placement')
 {
   const msg = (role, chars) => ({ role, text: 'x'.repeat(chars) })
@@ -1952,6 +2034,16 @@ section('Library: model folders beyond the app\'s own')
   check('a folder holding another lists nothing twice', overlapping.length === 3, `${overlapping.length}`)
   const index = JSON.parse(fs.readFileSync(path.join(fresh, 'model-index.json'), 'utf8'))
   check('one scan keeps every folder\'s models in the index', index.entries.length === 3, `${index.entries.length}`)
+
+  // A projector added beside a model that is already indexed must reach it: the model file is
+  // unchanged, so a cache keyed on its size and date alone kept the model text-only for good.
+  fs.writeFileSync(path.join(heretic, 'mmproj-B-F16.gguf'), buildGguf())
+  const withProjector = (await scanLibrary([appModels, elsewhere])).find((m) => m.filename === 'B-Q5_K_M-mix.gguf')
+  check('a projector added later is picked up on the next scan',
+    withProjector?.caps.mmprojPath === path.join(heretic, 'mmproj-B-F16.gguf'), String(withProjector?.caps.mmprojPath))
+  fs.rmSync(path.join(heretic, 'mmproj-B-F16.gguf'))
+  const without = (await scanLibrary([appModels, elsewhere])).find((m) => m.filename === 'B-Q5_K_M-mix.gguf')
+  check('and dropped again when it is removed', without?.caps.mmprojPath === null, String(without?.caps.mmprojPath))
 
   const unplugged = await scanLibrary([appModels, path.join(fresh, 'unplugged-drive')])
   check('a folder that is not there is skipped, not fatal',

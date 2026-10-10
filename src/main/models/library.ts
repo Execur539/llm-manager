@@ -271,14 +271,16 @@ export async function scanLibrary(roots: string | readonly string[]): Promise<Mo
     const mtimeMs = Math.max(...stats.map((s) => s.mtimeMs))
     const st = stats[0]
 
+    // Part of the signature too: a projector added beside a model that is already indexed changes
+    // what it can do without touching the model file, and the cached record would hide it for good.
+    const mmproj = findMmproj(file, files)
     const cached = index.get(file)
-    if (cached && cached.size === size && cached.mtimeMs === mtimeMs) {
+    if (cached && cached.size === size && cached.mtimeMs === mtimeMs && cached.record.caps.mmprojPath === mmproj) {
       records.push(cached.record)
       nextIndex.push(cached)
       continue
     }
 
-    const mmproj = findMmproj(file, files)
     let record: ModelRecord
     try {
       if (entry.missing.length) {
