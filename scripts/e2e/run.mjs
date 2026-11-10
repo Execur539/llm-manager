@@ -1293,6 +1293,17 @@ const scenarios = {
         ownRow && (await page.getByTestId('continuing-message').count()) === 0)
       await stopTurn(page, 'agent-input')
 
+      // ---- a screenshot says how the picture relates to the screen
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await turn('[[mock:toolonce]] [[mock:calltool:screenshot]] look at the screen')
+      const shotCard = await page.locator('[data-testid="tool-card"]').first().innerText().catch(() => '')
+      await page.locator('[data-testid="tool-card"]').first().click().catch(() => undefined)
+      await page.waitForTimeout(300)
+      const shotText = `${shotCard} ${await transcript()}`
+      report.check('agent-stalls', 'a screenshot is taken at the real size of the display and says where it is',
+        /Screenshot of display 0, which is \d{3,5}x\d{3,5} pixels at \(-?\d+, -?\d+\)/.test(shotText), shotText.slice(0, 400))
+
       // ---- and the session is given a title
       const titles = (await page.getByTestId('conversation-item').allInnerTexts().catch(() => [])).join(' | ')
       report.check('agent-stalls', 'an agent session is titled from its first message',

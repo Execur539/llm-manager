@@ -101,6 +101,8 @@ export function describeCall(tool: string, args: Record<string, unknown>, cwd: s
       return `Move ${resolvePath(args.from)} -> ${resolvePath(args.to)}`
     case 'copy_file':
       return `Copy ${resolvePath(args.from)} -> ${resolvePath(args.to)}`
+    case 'browser_attach':
+      return `Connect to your own ${args.browser ? String(args.browser) : 'default'} browser, with your logins${args.restart ? ', closing and reopening it first' : ''}`
     case 'save_credential':
       return `Save a login named "${String(args.name ?? '')}"${args.username ? ` (username ${String(args.username)})` : ''}${args.url ? ` for ${String(args.url)}` : ''}`
     case 'reveal_credential':

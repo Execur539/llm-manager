@@ -18,6 +18,7 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import type { Tool, ToolContext } from './base'
 import { schema, str, int, bool } from './base'
+import { DPI_AWARE } from './screen-space'
 
 const exec = promisify(execFile)
 
@@ -190,14 +191,14 @@ const windowBounds: Tool = {
   name: 'window_bounds',
   description:
     'Screen rectangle of a window, so a click can be aimed relative to it rather than to the ' +
-    'whole desktop. Returns left, top, width and height in pixels.',
+    'whole desktop. Returns left, top, width and height in screen pixels.',
   tier: 'read',
   parameters: schema({ pid: int('Process id from list_windows') }, ['pid']),
   async run(args, ctx) {
     const pid = Number(args.pid)
     if (!Number.isInteger(pid) || pid <= 0) throw new Error('pid must be a process id from list_windows.')
 
-    const script = `
+    const script = `${DPI_AWARE}
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;

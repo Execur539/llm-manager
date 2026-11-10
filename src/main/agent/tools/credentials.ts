@@ -15,7 +15,14 @@ import { schema, str } from './base'
 import { deleteLogin, listLogins, resolveLogin, saveLogin } from '../credentials'
 
 /** Tools a remote session is never given, and never allowed to run. */
-export const LOCAL_ONLY_TOOLS = new Set(['save_credential', 'list_credentials', 'reveal_credential', 'delete_credential'])
+export const LOCAL_ONLY_TOOLS = new Set([
+  'save_credential',
+  'list_credentials',
+  'reveal_credential',
+  'delete_credential',
+  // The browser the owner is signed in to everything with is not for whoever signed in over the web.
+  'browser_attach'
+])
 
 const HOW_TO_USE =
   'To use a password, write {{credential:NAME}} where it belongs in the arguments of a tool call that ' +

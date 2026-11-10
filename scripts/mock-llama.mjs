@@ -282,7 +282,9 @@ const server = http.createServer(async (req, res) => {
       marker(messages, 'continuetool') && body.continue_final_message && !messages.some((m) => m.role === 'tool')
     const toolOnce = (marker(messages, 'toolonce') && !messages.some((m) => m.role === 'tool')) || continueTool
     const wantsTool =
-      (marker(messages, 'tool') || toolOnce || markerValue(messages, 'tools') !== null || namedTool) &&
+      (marker(messages, 'tool') || toolOnce || markerValue(messages, 'tools') !== null ||
+        // A named tool is called every step, unless [[mock:toolonce]] says once is enough.
+        (namedTool && !marker(messages, 'toolonce'))) &&
       body.tools?.length
     const toolCount = markerValue(messages, 'tools') ?? 1
     const delay = marker(messages, 'slow') ? 250 : 12

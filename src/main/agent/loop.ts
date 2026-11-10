@@ -40,6 +40,7 @@ import { execTools, agentScratchDir } from './tools/exec'
 import { isElevated } from './elevation'
 import { credentialTools, LOCAL_ONLY_TOOLS } from './tools/credentials'
 import { videoTools } from './tools/video'
+import { uiTools } from './tools/ui'
 import { resolveLogin } from './credentials'
 import { maskCall, redactSecrets, referencesCredential, substituteCredentials } from './credential-refs'
 import { announcesNextStep, rebuildHistory } from './history'
@@ -134,6 +135,11 @@ Rules:
   so do not wrap it in another powershell call or save it to a file first.
 - Scripts and other throwaway files go in the scratch folder named below, not in the user's
   folders. Delete them when you are finished with them.
+- To work an application, read its window with ui_inspect and press or fill its controls by name
+  with ui_click and ui_set_text. Use screenshot and the mouse tools only where a program
+  publishes no controls.
+- The browser tools use a private browser with no logins. For anything that needs one of the
+  user's accounts, call browser_attach first to use their own browser.
 - Saved logins: list_credentials shows what is stored. Where a password belongs in a tool call,
   write {{credential:NAME}} and it is filled in when the call runs; you do not need to see it.
 - When the work is done, reply in prose with what you did. Keep it short.`
@@ -220,6 +226,7 @@ export class Agent extends EventEmitter {
       ...desktopTools,
       ...credentialTools,
       ...videoTools,
+      ...uiTools,
       // Sub-agents are sequential and depth-limited, so a runaway spawn chain is impossible.
       ...makeAgentTools({
         spawnSubAgent: (prompt, cwd) => this.runSubAgent(prompt, cwd),

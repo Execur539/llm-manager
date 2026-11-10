@@ -16,6 +16,7 @@ import type { Tool } from './base'
 import { schema, str, int } from './base'
 import { TOOL_OUTPUT_DIR } from '../../storage/paths'
 import type { ContentPart } from '../../runtime/llama'
+import { recordCapture } from './screen-space'
 
 /** Scale a capture down to something a projector can actually resolve, then package it. */
 function screenPart(image: Electron.NativeImage): ContentPart {
@@ -47,35 +48,109 @@ async function powershell(script: string, timeoutMs = 20000, signal?: AbortSigna
   return stdout
 }
 
+/** The displays, primary first, each with the rectangle it occupies in real screen pixels. */
+function displayList(): { display: Electron.Display; rect: Electron.Rectangle }[] {
+  const primary = screen.getPrimaryDisplay().id
+  return screen
+    .getAllDisplays()
+    .sort((x, y) => Number(y.id === primary) - Number(x.id === primary))
+    .map((display) => ({
+      display,
+      // Electron measures in scaled units; the rest of the desktop tools work in real pixels.
+      rect: process.platform === 'win32' ? screen.dipToScreenRect(null, display.bounds) : display.bounds
+    }))
+}
+
 const takeScreenshot: Tool = {
   name: 'screenshot',
   description:
-    'Capture the screen. On a model with vision the image is shown to you directly; the file is ' +
-    'also saved and its path returned so it can be referred to later.',
+    'Capture the screen, or part of it. On a model with vision the picture is shown to you ' +
+    'directly; the file is also saved and its path returned. A whole display is shrunk to fit, so ' +
+    'small text will not be readable: to read it, capture just that area by giving x, y, width and ' +
+    'height in screen pixels. To act on what you see, prefer ui_inspect and ui_click; to point at ' +
+    'something in the picture with the mouse tools, pass them coords: "image".',
   tier: 'read',
-  parameters: schema({ display: int('Display index (default 0 = primary)') }),
+  parameters: schema({
+    display: int('Display number (default 0, the primary display)'),
+    x: int('Left edge of the area to capture, in screen pixels'),
+    y: int('Top edge of the area to capture, in screen pixels'),
+    width: int('Width of the area to capture'),
+    height: int('Height of the area to capture')
+  }),
   async run(args, ctx) {
-    const displayIndex = Number(args.display ?? 0)
-    const displays = screen.getAllDisplays()
-    const target = displays[displayIndex] ?? displays[0]
-    const { width, height } = target.size
+    const displays = displayList()
+    const region = ['x', 'y', 'width', 'height'].every((k) => Number.isFinite(Number(args[k] ?? NaN)))
+      ? { x: Number(args.x), y: Number(args.y), width: Number(args.width), height: Number(args.height) }
+      : null
+
+    // An area names its own display: whichever one its middle is on.
+    const onDisplay = region
+      ? displays.findIndex(
+          ({ rect }) =>
+            region.x + region.width / 2 >= rect.x &&
+            region.x + region.width / 2 < rect.x + rect.width &&
+            region.y + region.height / 2 >= rect.y &&
+            region.y + region.height / 2 < rect.y + rect.height
+        )
+      : -1
+    const index = onDisplay >= 0 ? onDisplay : Math.max(0, Math.min(displays.length - 1, Number(args.display ?? 0) || 0))
+    const { display, rect } = displays[index]
 
     const sources = await desktopCapturer.getSources({
       types: ['screen'],
-      thumbnailSize: { width, height }
+      // At the display's real size. Asking for its scaled size threw away half the pixels of a
+      // display set to 200% before anything had looked at them.
+      thumbnailSize: { width: rect.width, height: rect.height }
     })
-    const source = sources[displayIndex] ?? sources[0]
+    const source = sources.find((s) => s.display_id === String(display.id)) ?? sources[index] ?? sources[0]
     if (!source) throw new Error('No screen source available')
+
+    let image = source.thumbnail
+    const full = image.getSize()
+    // What the capture actually covers, in case the system handed back something smaller.
+    const perPixel = rect.width / full.width
+    let left = rect.x
+    let top = rect.y
+    if (region) {
+      const cx = Math.max(0, Math.round((region.x - rect.x) / perPixel))
+      const cy = Math.max(0, Math.round((region.y - rect.y) / perPixel))
+      const cw = Math.min(full.width - cx, Math.round(region.width / perPixel))
+      const ch = Math.min(full.height - cy, Math.round(region.height / perPixel))
+      if (cw < 8 || ch < 8) {
+        return `That area is not on display ${index}, which covers ${rect.width}x${rect.height} pixels from (${rect.x}, ${rect.y}).`
+      }
+      image = image.crop({ x: cx, y: cy, width: cw, height: ch })
+      left = rect.x + cx * perPixel
+      top = rect.y + cy * perPixel
+    }
 
     fs.mkdirSync(TOOL_OUTPUT_DIR, { recursive: true })
     const file = path.join(TOOL_OUTPUT_DIR, `screen-${crypto.randomBytes(4).toString('hex')}.png`)
-    fs.writeFileSync(file, source.thumbnail.toPNG())
+    fs.writeFileSync(file, image.toPNG())
 
-    const text = `Screenshot saved to ${file} (${width}x${height}, display "${source.name}")`
+    const captured = image.getSize()
+    const part = screenPart(image)
+    const shownWidth = Math.min(captured.width, captured.width >= captured.height ? 1568 : Math.round((1568 * captured.width) / captured.height))
+    const shown = { width: shownWidth, height: Math.round((shownWidth * captured.height) / captured.width) }
+    recordCapture({ left, top, scale: (captured.width * perPixel) / shown.width, width: shown.width, height: shown.height })
+
+    const others = displays.length > 1
+      ? ` Displays: ${displays.map(({ rect: r }, i) => `${i} is ${r.width}x${r.height} at (${r.x}, ${r.y})`).join('; ')}.`
+      : ''
+    const text =
+      `Screenshot of ${region ? `the ${Math.round(captured.width * perPixel)}x${Math.round(captured.height * perPixel)} area at (${Math.round(left)}, ${Math.round(top)}) on ` : ''}display ${index}` +
+      `${region ? '' : `, which is ${rect.width}x${rect.height} pixels at (${rect.x}, ${rect.y})`}, saved to ${file}.` +
+      others
     // Handing back the path alone was the whole problem: nothing could open it. When the model
     // can see, show it; when it cannot, say so rather than pretending the path is useful.
-    if (!ctx.vision) return `${text}. The loaded model has no vision projector, so it cannot be shown.`
-    return { text, media: [screenPart(source.thumbnail)] }
+    if (!ctx.vision) return `${text} The loaded model has no vision projector, so it cannot be shown.`
+    return {
+      text:
+        `${text} Shown to you at ${shown.width}x${shown.height}. A position in this picture is not a screen position: ` +
+        'give the mouse tools the position as you see it here with coords: "image" and they convert it.' +
+        (region ? '' : ' To read small text, capture just that area with x, y, width and height.'),
+      media: [part]
+    }
   }
 }
 
@@ -177,39 +252,6 @@ const readRegistry: Tool = {
   }
 }
 
-const clickMouse: Tool = {
-  name: 'click_mouse',
-  description:
-    'Move the mouse to screen coordinates and click. Controls the real desktop — the user sees ' +
-    'this happen. Take a screenshot first to find the coordinates.',
-  tier: 'execute',
-  parameters: schema({ x: int('Screen X'), y: int('Screen Y'), button: str("'left' or 'right' (default left)") }, ['x', 'y']),
-  async run(args, ctx) {
-    const x = Number(args.x)
-    const y = Number(args.y)
-    const right = String(args.button ?? 'left') === 'right'
-    // mouse_event flags: LEFTDOWN 0x02 LEFTUP 0x04 RIGHTDOWN 0x08 RIGHTUP 0x10
-    const down = right ? 0x08 : 0x02
-    const up = right ? 0x10 : 0x04
-    const script = `
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public class M {
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, IntPtr e);
-}
-'@
-[M]::SetCursorPos(${x}, ${y})
-Start-Sleep -Milliseconds 60
-[M]::mouse_event(${down},0,0,0,[IntPtr]::Zero)
-[M]::mouse_event(${up},0,0,0,[IntPtr]::Zero)
-'clicked'`
-    await powershell(script, 20000, ctx.signal)
-    return `Clicked ${right ? 'right' : 'left'} at (${x}, ${y}).`
-  }
-}
-
 const typeText: Tool = {
   name: 'type_text',
   description:
@@ -254,7 +296,6 @@ export const systemTools: Tool[] = [
   listProcesses,
   installedApps,
   readRegistry,
-  clickMouse,
   typeText,
   pressKey
 ]
