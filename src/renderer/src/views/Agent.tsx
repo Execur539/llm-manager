@@ -569,6 +569,12 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
         {error && (
           <div className="card error-card">
             <span className="badge bad">error</span> {error}
+            {/* The reply that failed is kept, so carrying on from it is one click from the report. */}
+            {canContinue && (
+              <button className="tiny" onClick={() => void continueAnswer()} data-testid="agent-error-continue">
+                Continue
+              </button>
+            )}
           </div>
         )}
 
@@ -674,7 +680,12 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             */}
           {canContinue && (
             <div className="msg-aside continue-row">
-              <button className="continue-button" onClick={() => void continueAnswer()} data-testid="agent-continue">
+              <button
+                className="continue-button"
+                onClick={() => void continueAnswer()}
+                title="Carry on from where this answer stopped (Enter in an empty message box)"
+                data-testid="agent-continue"
+              >
                 <Icon name="resume" size={13} />
                 Continue this answer
               </button>
@@ -769,10 +780,18 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()
-                  void send()
+                  // Enter on an empty box carries the last answer on, which saves typing "continue".
+                  if (!input.trim() && canContinue) void continueAnswer()
+                  else void send()
                 }
               }}
-              placeholder={loaded ? 'Ask the agent to do something…' : 'Load a model first'}
+              placeholder={
+                !loaded
+                  ? 'Load a model first'
+                  : canContinue
+                    ? 'Ask the agent to do something, or press Enter to continue the last answer…'
+                    : 'Ask the agent to do something…'
+              }
               disabled={!loaded || busy}
               rows={1}
               data-testid="agent-input"

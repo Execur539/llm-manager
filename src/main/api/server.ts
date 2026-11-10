@@ -434,6 +434,8 @@ export class ApiServer {
       /** Token budget for thinking; 0 ends it immediately. Both spellings are accepted. */
       reasoning_budget?: number
       thinking_budget?: number
+      reasoning_budget_tokens?: number
+      thinking_budget_tokens?: number
     }>(req)
 
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
@@ -484,7 +486,7 @@ export class ApiServer {
       chatTemplateKwargs: body.chat_template_kwargs,
       // Forwarded for the same reason, and the only way an OpenAI-style client can stop a model
       // thinking when its template enumerates levels without offering a "none".
-      reasoningBudget: body.reasoning_budget ?? body.thinking_budget
+      reasoningBudget: body.reasoning_budget_tokens ?? body.thinking_budget_tokens ?? body.reasoning_budget ?? body.thinking_budget
     }
 
     if (!body.stream) {

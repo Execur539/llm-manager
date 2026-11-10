@@ -37,7 +37,9 @@ import { DEFAULT_CONSTRAINTS, gpuKey, learnHeadroom, planFit, usableDevices, ver
 import { llama, estimateTokens, type ChatMessage, type ContentPart, type CompletionOptions } from './runtime/llama'
 import { missingBinaries, embeddingModelPath, vendorDiagnostics, llamaServerPath } from './runtime/binaries'
 import { cudaKvPairs, MATCHED_KV_PAIRS } from './runtime/fa-kernels'
+import { deleteLogin, listLogins, saveLogin } from './agent/credentials'
 import { Agent } from './agent/loop'
+import { describeVideo, videoFacts } from './agent/tools/video'
 import { killAllJobs } from './agent/tools/exec'
 import { closeBrowser } from './agent/tools/browser'
 import { listCheckpoints, rewindTo, discardCheckpoints } from './agent/checkpoints'
@@ -404,6 +406,8 @@ function getAgent(): Agent {
       emit('agent:done', { sessionId: id, reason })
     })
     agent.on('error', (e) => emit('agent:error', { sessionId: sid(), message: e }))
+    agent.on('stepRetry', (n: { message: string }) => emit('agent:step-retry', { sessionId: sid(), ...n }))
+    agent.on('notice', (n: { message: string }) => emit('agent:notice', { sessionId: sid(), ...n }))
 
     // Remembered approvals are per folder and survive restarts.
     agent.loadPermissionRules(
@@ -1056,9 +1060,34 @@ async function attachmentTurn(
   const caps = llama.loaded?.model.caps
   if (!caps) return { text: input, media: [], prepared: [] }
 
-  const built = await buildContent('', files, caps, await videoContext(), onStage)
+  /*
+   * A video is named, not shown.
+   *
+   * It used to be sampled here, before the model had read the question: a fixed budget of frames,
+   * shrunk and packed into a clip, chosen without knowing what was being asked. Most of the
+   * detail went, and what was kept was a guess. The agent has a tool for looking at a video
+   * itself, so attaching one now only says which file it is and how long, and the model looks at
+   * the parts it needs, as closely as it needs, exactly as if it had been given the path.
+   */
+  const videos = originals.filter((f) => classifyAttachment(f) === 'video')
+  const sent = files.filter((f) => classifyAttachment(f) !== 'video')
+
+  const built = await buildContent('', sent, caps, await videoContext(), onStage)
   const sections: string[] = []
   const media: ContentPart[] = []
+
+  for (const file of videos) {
+    const facts = await videoFacts(file).catch(() => null)
+    sections.push(
+      facts
+        ? `Attached video: ${file}
+${describeVideo(file, facts)}. It has not been shown to you. ` +
+            'Look at it with watch_video: with no times first for an overview, then with start and end ' +
+            'to look closer at whatever matters.'
+        : `Attached video: ${file}
+It could not be read as a video.`
+    )
+  }
 
   for (const part of built.parts) {
     if (part.type === 'text') sections.push(part.text ?? '')
@@ -1066,7 +1095,7 @@ async function attachmentTurn(
   }
 
   // Named whether or not they were also sent as media, so the agent can act on the file itself.
-  const onDisk = originals.filter((f) => classifyAttachment(f) !== 'doc')
+  const onDisk = originals.filter((f) => !['doc', 'video'].includes(classifyAttachment(f)))
   if (onDisk.length) {
     sections.push(`Attached files on disk:\n${onDisk.map((f) => `- ${f}`).join('\n')}`)
   }
@@ -1832,6 +1861,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const a = getAgent()
     syncAgentOptions()
     a.updateOptions({ cwd: session.cwd, reasoningChoice: effort })
+    // Agent sessions never said which model ran them; a chat always has.
+    if (llama.loaded) chats.setChatModel(sessionId, llama.loaded.model.id)
 
     /*
      * Show the user's message before doing anything slow with it.
@@ -2302,6 +2333,10 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     agent?.resetHistory()
     return result
   },
+  'credentials:list': () => listLogins(),
+  'credentials:save': (input: { name: string; username?: string; password: string; url?: string; notes?: string }) =>
+    saveLogin(input),
+  'credentials:delete': (name: string) => deleteLogin(name),
   'agent:memory': () => allMemory(),
   'agent:memory-add': (text: string) => addMemory(text, 'user'),
   'agent:memory-update': (id: string, text: string) => {

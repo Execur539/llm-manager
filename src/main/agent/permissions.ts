@@ -47,7 +47,15 @@ const HARD_BLOCK_PATTERNS: { re: RegExp; reason: string }[] = [
   { re: /\bbootrec\b/i, reason: 'Modifies the bootloader' },
   { re: /\b(vssadmin\s+delete\s+shadows)\b/i, reason: 'Deletes shadow copies, destroying restore points' },
   { re: /\bcipher\s+\/w/i, reason: 'Wipes free space irrecoverably' },
-  { re: /\b(shutdown|Restart-Computer)\b/i, reason: 'Shuts down or restarts the machine' }
+  /*
+   * Only where a command can begin: the start of the script, or after a separator, an opening
+   * brace or bracket, or the call operator. Matching the bare word refused a read-only event-log
+   * query for printing the heading "UNEXPECTED SHUTDOWN".
+   */
+  {
+    re: /(?:^|[;&|({\n]|&&|\|\|)\s*(?:&\s*)?["']?(?:[a-z]:\\[^\s"']*\\)?(?:shutdown(?:\.exe)?["']?(?=\s|$)|Restart-Computer\b|Stop-Computer\b)/im,
+    reason: 'Shuts down or restarts the machine'
+  }
 ]
 
 /** Directories the agent may never read, regardless of tier — app secrets live here. */
@@ -93,6 +101,14 @@ export function describeCall(tool: string, args: Record<string, unknown>, cwd: s
       return `Move ${resolvePath(args.from)} -> ${resolvePath(args.to)}`
     case 'copy_file':
       return `Copy ${resolvePath(args.from)} -> ${resolvePath(args.to)}`
+    case 'save_credential':
+      return `Save a login named "${String(args.name ?? '')}"${args.username ? ` (username ${String(args.username)})` : ''}${args.url ? ` for ${String(args.url)}` : ''}`
+    case 'reveal_credential':
+      return `Show the saved password for "${String(args.name ?? '')}" in the conversation`
+    case 'delete_credential':
+      return `Delete the saved login "${String(args.name ?? '')}"`
+    case 'run_elevated':
+      return `Run as administrator:\n${String(args.command ?? '')}`
     case 'run_command':
     case 'run_background':
       return `Run in ${args.cwd ? resolvePath(args.cwd) : cwd}:\n${String(args.command ?? '')}`
@@ -107,7 +123,11 @@ export function describeCall(tool: string, args: Record<string, unknown>, cwd: s
     case 'type_text':
       return `Type into the focused window: ${truncate(String(args.text ?? ''), 120)}`
     case 'click_mouse':
-      return `Click at (${args.x}, ${args.y})`
+      return `${args.double ? 'Double-click' : 'Click'} at (${args.x}, ${args.y})${String(args.coords ?? '') === 'image' ? ' in the last screenshot' : ''}`
+    case 'ui_click':
+      return `${String(args.action ?? 'click')} ${args.name ? `"${String(args.name)}"` : `control ${String(args.element ?? '')}`}${args.window ? ` in window "${String(args.window)}"` : ''}`
+    case 'ui_set_text':
+      return `Put ${byteLabel(args.text)} of text into ${args.name ? `"${String(args.name)}"` : `control ${String(args.element ?? '')}`}${args.window ? ` in window "${String(args.window)}"` : ''}:\n${truncate(String(args.text ?? ''), 200)}`
     default: {
       const summary = Object.entries(args)
         .map(([k, v]) => `${k}=${truncate(typeof v === 'string' ? v : JSON.stringify(v), 80)}`)
@@ -160,12 +180,12 @@ export class PermissionEngine {
     return this.rules
   }
 
-  private matches(tool: string, resolved: string, cwd: string): boolean {
+  private matches(tool: string, resolved: string, cwd: string, exactOnly = false): boolean {
     return this.rules.some(
       (r) =>
         r.tool === tool &&
         pathsEqual(r.scope, cwd) &&
-        (r.exact === undefined || r.exact === resolved)
+        (r.exact === undefined ? !exactOnly : r.exact === resolved)
     )
   }
 
@@ -197,7 +217,15 @@ export class PermissionEngine {
 
     if (tier === 'read') return { allowed: true }
 
-    if (this.matches(tool, resolved, cwd)) return { allowed: true }
+    /*
+     * A call that uses a saved login is only waved through by approval of that exact call.
+     *
+     * "Always allow run_command here" was given for commands, not for commands carrying a
+     * password. Without this a blanket rule would let any command take any saved login with
+     * nothing on screen.
+     */
+    const usesLogin = /\{\{\s*credential\s*:/i.test(JSON.stringify(args))
+    if (this.matches(tool, resolved, cwd, usesLogin)) return { allowed: true }
 
     const signature = `${tool}::${resolved}`
     if (this.deniedThisTurn.has(signature)) {

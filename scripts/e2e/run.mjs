@@ -1209,6 +1209,97 @@ const scenarios = {
   },
 
   /** A folder of the user's own is listed and loaded in place: nothing is copied into the app's folder. */
+  /**
+   * A turn must not end just because the model announced a step or the server dropped a reply.
+   *
+   * These were the two ways an agent turn stopped with "Let me check…" on screen and nothing
+   * after it: the rebuilt history taught the model to stop there, and a reply the server could
+   * not parse was taken for a finished one.
+   */
+  async agentStalls() {
+    await withApp('agent-stalls', async ({ page }) => {
+      await loadModel(page)
+      await goTo(page, 'Agent')
+
+      const transcript = () => page.getByTestId('agent-messages').innerText()
+      const turn = async (text) => {
+        await page.getByTestId('agent-input').fill(text)
+        await page.getByTestId('agent-send').click()
+        await page.waitForTimeout(400)
+        await page.waitForFunction(
+          () => !document.querySelector('[data-testid="agent-input"]')?.hasAttribute('disabled'),
+          null,
+          { timeout: 40000 }
+        )
+        await page.waitForTimeout(300)
+      }
+
+      // ---- a reply the server gives up on is tried again
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await turn('[[mock:streamerror:1]] say hello')
+      let text = await transcript()
+      report.check('agent-stalls', 'a reply the server dropped is tried again and answered',
+        /mock model/i.test(text) || text.length > 60, text.slice(-160))
+      report.check('agent-stalls', 'the thinking from the dropped reply is not left on screen',
+        !text.includes('Let me check the adapter'), text.slice(-160))
+      report.check('agent-stalls', 'the retry is mentioned',
+        ((await page.locator('.card.note.dismissible').first().textContent().catch(() => '')) ?? '').includes('tried again'))
+      report.check('agent-stalls', 'one dropped reply is not reported as an error',
+        (await page.locator('.error-card').count()) === 0)
+
+      // ---- two in a row are reported, with a way to carry on
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await turn('[[mock:streamerror:3]] say hello')
+      const errorText = (await page.locator('.error-card').first().textContent().catch(() => '')) ?? ''
+      report.check('agent-stalls', 'a reply dropped twice is reported with the reason the server gave',
+        errorText.includes('does not match the expected format'), errorText)
+      report.check('agent-stalls', 'the report offers Continue',
+        (await page.getByTestId('agent-error-continue').count()) === 1)
+      await shot(page, 'agent-dropped-reply')
+
+      // ---- an announced step is acted on
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await turn('[[mock:announce]] why is the network down')
+      text = await transcript()
+      report.check('agent-stalls', 'a reply that only announces a step is followed up',
+        text.includes('Let me check the event log.') && text.includes('ACTED: the event log is clean.'), text.slice(-200))
+      report.check('agent-stalls', 'the instruction to act is not shown as something the user said',
+        !text.includes('did not call a tool'), text.slice(-200))
+
+      // ---- the next turn is sent the tool use as tool use
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await turn('[[mock:toolonce]] list the current directory')
+      await turn('[[mock:shape]] and again')
+      text = await transcript()
+      const shape = text.match(/SHAPE: ([a-z\[\]0-9 ]+)/)?.[1]?.trim() ?? ''
+      report.check('agent-stalls', 'an earlier turn is rebuilt with its tool call and result',
+        shape === 'system user assistant[1] tool assistant user', shape || text.slice(-200))
+
+      // ---- a Continue that goes straight to a tool call hands the screen back
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await turn('[[mock:continuetool]] [[mock:slow]] look into it')
+      await page.getByTestId('agent-continue').click()
+      await page.waitForSelector('[data-testid="tool-card"]', { timeout: 25000 })
+      // What streams after the call is a new message, not more of the one that was continued.
+      const ownRow = await page
+        .waitForSelector('[data-testid="streaming-message"]', { timeout: 15000 })
+        .then(() => true, () => false)
+      report.check('agent-stalls', 'after a continued answer calls a tool, the next step is drawn as its own message',
+        ownRow && (await page.getByTestId('continuing-message').count()) === 0)
+      await stopTurn(page, 'agent-input')
+
+      // ---- and the session is given a title
+      const titles = (await page.getByTestId('conversation-item').allInnerTexts().catch(() => [])).join(' | ')
+      report.check('agent-stalls', 'an agent session is titled from its first message',
+        titles.includes('list the current directory') && !titles.includes('New session'), titles.slice(0, 200))
+    })
+  },
+
   async modelFolders() {
     await withApp('model-folders', async ({ app, page, env }) => {
       // A second drive's AI folder, with a model in a subfolder as models usually are.

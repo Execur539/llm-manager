@@ -25,6 +25,13 @@ export interface UpdateTargetInput {
   portableExe?: string
   /** LLMM_PORTABLE_DIR: the folder the user's portable exe is in. */
   portableDir?: string
+  /**
+   * The portable exe an earlier run was started from, when this one was not started from any.
+   *
+   * A taskbar pin made while the app is running points at the unpacked copy, and a run started
+   * from it is told nothing about the exe it came out of. That exe is still where it was.
+   */
+  rememberedExe?: string
   /** The running app's own executable. */
   appExe: string
   /** %LOCALAPPDATA%\LLMManager, where the launcher unpacks the app. */
@@ -43,13 +50,14 @@ export interface UpdateTargetInput {
  * since what the release feed offers is a portable exe, so it is told so rather than overwritten.
  */
 export function chooseUpdateTarget(input: UpdateTargetInput): { target: string } | { error: string } {
-  const { portableExe, portableDir, appExe, cacheRoot, exists } = input
+  const { portableExe, portableDir, rememberedExe, appExe, cacheRoot, exists } = input
   if (portableExe && !isInside(cacheRoot, portableExe) && exists(portableExe)) return { target: portableExe }
   // Launchers before 1.6.6 passed their folder but not their own path; the name has not changed.
   if (portableDir && !isInside(cacheRoot, portableDir)) {
     const beside = path.join(portableDir, PORTABLE_EXE_NAME)
     if (exists(beside)) return { target: beside }
   }
+  if (rememberedExe && !isInside(cacheRoot, rememberedExe) && exists(rememberedExe)) return { target: rememberedExe }
   return {
     error: isInside(cacheRoot, appExe)
       ? `This copy was started from its unpacked files rather than from ${PORTABLE_EXE_NAME}, so there is no exe to update. Start the app from ${PORTABLE_EXE_NAME} and update again, or download the new version from the releases page.`

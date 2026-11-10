@@ -30,6 +30,8 @@ const EVENT_CHANNELS = [
   'agent:reasoning',
   // The stream that follows extends an existing answer rather than starting a new one.
   'agent:continuing',
+  'agent:step-retry',
+  'agent:notice',
   'agent:prompt-progress',
   'agent:media-progress',
   'agent:context',

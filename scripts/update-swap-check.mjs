@@ -183,6 +183,13 @@ console.log('\nAn update replaces the portable exe the user launches')
   const portable = `${folder}\\LLM-Manager-portable.exe`
   const on = (...files) => (f) => files.some((x) => x.toLowerCase() === f.toLowerCase())
   const pick = (input) => chooseUpdateTarget({ appExe: cacheExe, cacheRoot: cache, ...input })
+  {
+    const remembered = pick({ rememberedExe: 'D:\\Apps\\LLM-Manager\\LLM-Manager-portable.exe', exists: () => true })
+    check('a run started from a taskbar pin updates the exe an earlier run came from',
+      'target' in remembered && remembered.target === 'D:\\Apps\\LLM-Manager\\LLM-Manager-portable.exe')
+    check('a remembered exe that has gone is not used',
+      'error' in pick({ rememberedExe: 'D:\\gone\\LLM-Manager-portable.exe', exists: () => false }))
+  }
 
   check('the exe the launcher names is the one replaced', pick({ portableExe: portable, portableDir: folder, exists: on(portable) }).target === portable)
   check('never the unpacked copy the app runs from', pick({ portableExe: cacheExe, portableDir: folder, exists: on(portable, cacheExe) }).target === portable)

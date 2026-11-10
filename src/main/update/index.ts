@@ -25,6 +25,36 @@ function unpackCacheRoot(): string {
   return path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local'), 'LLMManager')
 }
 
+/** Where the path of the portable exe is kept between runs. */
+const ORIGIN_FILE = 'portable-origin.json'
+
+/**
+ * The portable exe this install is launched from: this run's, or the last one known.
+ *
+ * Written whenever a run is started from a portable exe outside the unpack cache, and read back by
+ * runs that were not — which is what a taskbar pin produces, since Windows pins the unpacked app
+ * rather than the launcher that started it.
+ */
+export function portableOrigin(): string | undefined {
+  const file = path.join(app.getPath('userData'), ORIGIN_FILE)
+  const current = process.env.LLMM_PORTABLE_EXE
+  const cache = unpackCacheRoot().toLowerCase() + path.sep
+  if (current && !current.toLowerCase().startsWith(cache) && fs.existsSync(current)) {
+    try {
+      fs.writeFileSync(file, JSON.stringify({ exe: current }))
+    } catch {
+      /* remembered next time */
+    }
+    return current
+  }
+  try {
+    const saved = (JSON.parse(fs.readFileSync(file, 'utf8')) as { exe?: unknown }).exe
+    return typeof saved === 'string' && fs.existsSync(saved) ? saved : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** Where releases are published. Overridable so a fork can point elsewhere. */
 const UPDATE_FEED =
   process.env.LLMM_UPDATE_FEED ?? 'https://api.github.com/repos/Execur539/llm-manager/releases/latest'
@@ -185,6 +215,7 @@ export async function applyUpdate(
   const chosen = chooseUpdateTarget({
     portableExe: process.env.LLMM_PORTABLE_EXE,
     portableDir: process.env.LLMM_PORTABLE_DIR,
+    rememberedExe: portableOrigin(),
     appExe: app.getPath('exe'),
     cacheRoot: unpackCacheRoot(),
     exists: (file) => fs.existsSync(file)

@@ -448,6 +448,25 @@ export default function Library({
           Import GGUF…
         </button>
         <button
+          title="List the models in another folder here, without moving or copying them"
+          onClick={() => {
+            void invoke<{ added: string | null; coveredBy?: string; folders: string[] }>('library:add-folder')
+              .then(async (r) => {
+                if (!r) return
+                if (r.added) {
+                  await onRefresh()
+                  toast(`Models in ${r.added} are now listed here.`, 'success')
+                } else if (r.coveredBy) {
+                  toast(`That folder is already covered by ${r.coveredBy}.`, 'info')
+                }
+              })
+              .catch((err: unknown) => toast(`Could not add the folder: ${String(err)}`, 'error'))
+          }}
+          data-testid="library-add-folder"
+        >
+          Add folder…
+        </button>
+        <button
           onClick={() => {
             void invoke<{ removed: number; bytes: number }>('library:clean-partials')
               .then(async (r) => {

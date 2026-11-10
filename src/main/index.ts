@@ -71,6 +71,32 @@ function createWindow(): void {
   })
 
   /*
+   * A taskbar pin starts the portable exe, not the copy it unpacked.
+   *
+   * Windows pins whatever process owns the window, which here is the unpacked app in a folder
+   * named after its version — a pin that cannot be updated in place and that breaks when the next
+   * version unpacks elsewhere. Telling the shell what to relaunch makes a new pin point at the
+   * launcher instead. Skipped under test, where there is no launcher.
+   */
+  if (process.platform === 'win32' && !process.env.LLMM_E2E) {
+    void import('./update').then(({ portableOrigin }) => {
+      const exe = portableOrigin()
+      if (!exe || !mainWindow || mainWindow.isDestroyed()) return
+      try {
+        mainWindow.setAppDetails({
+          appId: 'dev.llmmanager.app',
+          relaunchCommand: `"${exe}"`,
+          relaunchDisplayName: 'LLM Manager',
+          appIconPath: exe,
+          appIconIndex: 0
+        })
+      } catch (err) {
+        logger.warn('window', 'could not set the taskbar relaunch command', { error: String(err) })
+      }
+    })
+  }
+
+  /*
    * Under test, appear without taking focus.
    *
    * The end-to-end suite runs several app instances at once, and `show()` pulls focus to each as

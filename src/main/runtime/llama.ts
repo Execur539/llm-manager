@@ -152,10 +152,30 @@ export interface StreamedToolCall {
   id: string
   name: string
   args: Record<string, unknown>
+  /** Set when the arguments were not valid JSON: why, and what arrived. `args` is then empty. */
+  invalid?: string
+}
+
+/**
+ * The server gave up part-way through a reply.
+ *
+ * llama-server reports a failure after the stream has started as a `data: {"error": …}` frame and
+ * then closes the connection. The usual cause is its own parser rejecting what the model wrote —
+ * a tool call that does not match the template's format. Frames without `choices` used to be
+ * skipped, so this arrived as a stream that simply ended and the turn finished as though the
+ * model had chosen to stop, with the call it was in the middle of making gone.
+ */
+export class ServerStreamError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ServerStreamError'
+  }
 }
 
 export type StreamEvent =
   | { type: 'text'; text: string }
+  /** Why generation ended: 'stop', 'length' (ran out of tokens or context) or 'tool_calls'. */
+  | { type: 'finish'; reason: string }
   /**
    * The model's chain of thought.
    *
@@ -726,6 +746,8 @@ export class LlamaRuntime extends EventEmitter {
     // Sent under both names: the server has accepted `reasoning_budget` and `thinking_budget`
     // at different points, and an unrecognised field is ignored rather than rejected.
     if (opts.reasoningBudget !== undefined) {
+      body.reasoning_budget_tokens = opts.reasoningBudget
+      body.thinking_budget_tokens = opts.reasoningBudget
       body.reasoning_budget = opts.reasoningBudget
       body.thinking_budget = opts.reasoningBudget
     }
@@ -793,21 +815,24 @@ export class LlamaRuntime extends EventEmitter {
     /** Indices already reported as in progress, so a new call is always announced at once. */
     const announcedCalls = new Set<number>()
     let lastPartialAt = 0
+    /** Set once the server says the reply is over, by a finish reason or [DONE]. */
+    let finished = false
     /** Fast enough to look like typing, slow enough not to flood the bridge. */
     const PARTIAL_INTERVAL_MS = 120
 
     const flushCalls = function* (): Generator<StreamEvent> {
       for (const [, c] of pending) {
         let parsed: Record<string, unknown> = {}
+        let invalid: string | undefined
         try {
           parsed = c.args.trim() ? (JSON.parse(c.args) as Record<string, unknown>) : {}
-        } catch {
-          // Grammar-constrained output should not land here, but a template-native handler
-          // can still emit something unparsable; surface it as an empty-arg call so the
-          // loop reports a usable error rather than throwing.
-          parsed = {}
+        } catch (err) {
+          // Grammar-constrained output should not land here, but a template-native handler can
+          // still emit something unparsable. Running the tool with no arguments told the model
+          // only that a path or a command was missing; saying what was wrong lets it fix the call.
+          invalid = `${err instanceof Error ? err.message : String(err)} — received: ${c.args.slice(0, 400)}`
         }
-        yield { type: 'tool_call', call: { id: c.id, name: c.name, args: parsed } }
+        yield { type: 'tool_call', call: { id: c.id, name: c.name, args: parsed, ...(invalid ? { invalid } : {}) } }
       }
       pending.clear()
     }
@@ -826,6 +851,7 @@ export class LlamaRuntime extends EventEmitter {
           if (!trimmed.startsWith('data:')) continue
           const payload = trimmed.slice(5).trim()
           if (payload === '[DONE]') {
+            finished = true
             yield* flushCalls()
             this.lastTimings = finalise(startedAt, ttft, completionTokens, promptTokens)
             return
@@ -841,12 +867,18 @@ export class LlamaRuntime extends EventEmitter {
               finish_reason?: string
             }[]
             usage?: { prompt_tokens?: number; completion_tokens?: number }
+            error?: { message?: string } | string
             prompt_progress?: { total?: number; cache?: number; processed?: number; time_ms?: number }
           }
           try {
             json = JSON.parse(payload)
           } catch {
             continue // partial frame; the next chunk completes it
+          }
+
+          if (json.error) {
+            const detail = typeof json.error === 'string' ? json.error : (json.error.message ?? JSON.stringify(json.error))
+            throw new ServerStreamError(detail)
           }
 
           /*
@@ -946,9 +978,15 @@ export class LlamaRuntime extends EventEmitter {
           }
 
           if (choice?.finish_reason) {
+            finished = true
             yield* flushCalls()
+            yield { type: 'finish', reason: choice.finish_reason }
           }
         }
+      }
+      // A stream that just stops, with no finish reason and no [DONE], was cut off rather than ended.
+      if (!finished && !opts.signal?.aborted) {
+        throw new ServerStreamError('the server closed the connection before the reply was finished')
       }
       yield* flushCalls()
       // Prompt tokens carried through here too. A stream that ends by the body simply closing —

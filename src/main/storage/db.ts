@@ -308,6 +308,25 @@ export const MIGRATIONS: { id: number; sql: string }[] = [
     );
     CREATE INDEX IF NOT EXISTS idx_message_content_chat ON message_content(chat_id);
     `
+  },
+  {
+    id: 10,
+    sql: `
+    -- Logins the agent keeps between conversations.
+    --
+    -- The password is in "secret", encrypted by the operating system's key store where it has one,
+    -- because this file is readable by every read-tier tool and gets copied by backups. Names are
+    -- compared without case so "GitHub" and "github" cannot both exist.
+    CREATE TABLE IF NOT EXISTS credentials (
+      name TEXT PRIMARY KEY COLLATE NOCASE,
+      username TEXT,
+      secret TEXT NOT NULL,
+      url TEXT,
+      notes TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    `
   }
 ]
 

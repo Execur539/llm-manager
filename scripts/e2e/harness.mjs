@@ -140,7 +140,15 @@ export async function launchApp(env, extraEnv = {}) {
   page.on('pageerror', (err) => consoleErrors.push(`uncaught: ${err.message}`))
 
   await page.waitForLoadState('domcontentloaded')
-  await page.waitForSelector('.nav-item', { timeout: 20000 })
+  try {
+    await page.waitForSelector('.nav-item', { timeout: 20000 })
+  } catch (err) {
+    // Say why the interface never appeared, not only that it did not.
+    err.message += `
+console: ${consoleErrors.join(' | ') || '(nothing logged)'}`
+    await app.close().catch(() => undefined)
+    throw err
+  }
 
   // Native dialogs are stubbed the moment the app is up, defaulting to "cancelled".
   //

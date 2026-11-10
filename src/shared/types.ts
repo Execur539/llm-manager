@@ -419,6 +419,10 @@ export interface ToolCall {
   id: string
   name: string
   args: Record<string, unknown>
+  /** Shared by the calls one step of the model made together, so a rebuilt history can regroup them. */
+  batch?: string
+  /** Set when the arguments the model wrote were not valid JSON; the call is answered without being run. */
+  invalid?: string
 }
 
 export interface ToolResult {

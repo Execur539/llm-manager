@@ -30,7 +30,9 @@ await build({
     faKernels: path.join(ROOT, 'src/main/runtime/fa-kernels.ts'),
     hostBudget: path.join(ROOT, 'src/main/runtime/host-budget.ts'),
     roots: path.join(ROOT, 'src/main/models/roots.ts'),
-    library: path.join(ROOT, 'src/main/models/library.ts')
+    library: path.join(ROOT, 'src/main/models/library.ts'),
+    history: path.join(ROOT, 'src/main/agent/history.ts'),
+    credentialRefs: path.join(ROOT, 'src/main/agent/credential-refs.ts')
   },
   outdir: path.join(ROOT, 'scripts/built'),
   bundle: true,

@@ -32,10 +32,15 @@ export default function Settings({
   const [paths, setPaths] = useState<{ exeDir: string; modelsDir: string } | null>(null)
   const [mcp, setMcp] = useState<McpStatus[]>([])
   const [memory, setMemory] = useState<MemoryEntry[]>([])
+  /** Saved logins, without their passwords. Null where they cannot be managed (a remote session). */
+  const [logins, setLogins] = useState<{ name: string; username: string; url: string | null; notes: string | null }[] | null>(null)
+  const [newLogin, setNewLogin] = useState({ name: '', username: '', password: '', url: '' })
   const [hfToken, setHfToken] = useState('')
   const [update, setUpdate] = useState<{ available: boolean; latestVersion: string | null; notes: string | null; downloadUrl: string | null; bytes?: number; error?: string; previousFailure?: string } | null>(null)
   const [version, setVersion] = useState('')
   const [info, setInfo] = useState<string | null>(null)
+  /** Why the last attempt to install an update did not start, shown where it was pressed. */
+  const [updateError, setUpdateError] = useState<string | null>(null)
   const [confirmHardBlocks, setConfirmHardBlocks] = useState(false)
   /** Bytes of the update fetched so far, or null when no download is running. */
   const [downloading, setDownloading] = useState<{ done: number; total: number } | null>(null)
@@ -73,6 +78,8 @@ export default function Settings({
     setPaths(await invoke('app:paths'))
     setMcp(await invoke<McpStatus[]>('mcp:list'))
     setMemory(await invoke<MemoryEntry[]>('agent:memory'))
+    // Refused over the web interface, where this card is simply not shown.
+    setLogins(await invoke<NonNullable<typeof logins>>('credentials:list').catch(() => null))
     setVersion(await invoke<string>('app:version'))
   }
 
@@ -538,6 +545,72 @@ export default function Settings({
         {!memory.length && <div className="empty" style={{ fontSize: 12 }}>Nothing remembered yet.</div>}
       </div>
 
+      {logins && (
+        <div className="card" data-testid="saved-logins">
+          <div className="card-title">Saved logins</div>
+          <div className="dim" style={{ marginBottom: 10 }}>
+            Usernames and passwords the agent can sign in with. It uses a password by reference when a tool
+            runs and is not shown it, and you are asked before each new use. Passwords are encrypted on this
+            computer.
+          </div>
+          {logins.map((l) => (
+            <div className="row row-card" key={l.name}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <strong>{l.name}</strong>
+                <span className="dim"> · {l.username || 'no username'}{l.url ? ` · ${l.url}` : ''}</span>
+              </div>
+              <button onClick={async () => { await invoke('credentials:delete', l.name); await refresh() }}>Delete</button>
+            </div>
+          ))}
+          {!logins.length && <div className="empty" style={{ fontSize: 12 }}>No logins saved yet.</div>}
+          <div className="row" style={{ marginTop: 10, flexWrap: 'wrap' }}>
+            <input
+              placeholder="Name (e.g. github)"
+              value={newLogin.name}
+              onChange={(e) => setNewLogin({ ...newLogin, name: e.target.value })}
+              style={{ flex: 1, minWidth: 120 }}
+              data-testid="login-name"
+            />
+            <input
+              placeholder="Username"
+              value={newLogin.username}
+              onChange={(e) => setNewLogin({ ...newLogin, username: e.target.value })}
+              style={{ flex: 1, minWidth: 120 }}
+              data-testid="login-username"
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={newLogin.password}
+              onChange={(e) => setNewLogin({ ...newLogin, password: e.target.value })}
+              style={{ flex: 1, minWidth: 120 }}
+              data-testid="login-password"
+            />
+            <input
+              placeholder="Site or app (optional)"
+              value={newLogin.url}
+              onChange={(e) => setNewLogin({ ...newLogin, url: e.target.value })}
+              style={{ flex: 1, minWidth: 120 }}
+            />
+            <button
+              disabled={!newLogin.name.trim() || !newLogin.password}
+              onClick={async () => {
+                try {
+                  await invoke('credentials:save', newLogin)
+                  setNewLogin({ name: '', username: '', password: '', url: '' })
+                  await refresh()
+                } catch (err) {
+                  setInfo(`Could not save the login: ${err instanceof Error ? err.message : String(err)}`)
+                }
+              }}
+              data-testid="login-save"
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="card">
         <div className="card-title">HuggingFace</div>
         <div className="row">
@@ -684,16 +757,29 @@ export default function Settings({
                   // Set before awaiting: the first progress frame can be a second or more away
                   // on a slow link, and the button must stop looking clickable immediately.
                   setDownloading({ done: 0, total: update.bytes ?? 0 })
-                  const r = await invoke<{ ok: boolean; message: string }>('update:apply', update.downloadUrl)
-                  if (!r?.ok) {
+                  setUpdateError(null)
+                  try {
+                    const r = await invoke<{ ok: boolean; message: string }>('update:apply', update.downloadUrl)
+                    if (!r?.ok) {
+                      setDownloading(null)
+                      setUpdateError(r?.message ?? 'The update could not be applied.')
+                    }
+                  } catch (err) {
                     setDownloading(null)
-                    setInfo(r?.message ?? 'The update could not be applied.')
+                    setUpdateError(err instanceof Error ? err.message : String(err))
                   }
                 }}
                 data-testid="update-apply"
               >
                 Download and install
               </button>
+            )}
+            {/* Here, not in the banner at the top of the page: that is a screen away from this
+                button, and a press that only changed something out of sight looked like nothing. */}
+            {updateError && (
+              <div className="card error-card" style={{ marginTop: 10 }} data-testid="update-error">
+                <span className="badge bad">not installed</span> {updateError}
+              </div>
             )}
           </div>
         )}

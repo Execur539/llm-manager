@@ -1380,7 +1380,12 @@ export function verifyPrediction(plan: FitPlan, actualPerGpu: number[]): {
     suggestion = `Used ${over} more VRAM than predicted (${Math.round((worstRatio - 1) * 100)}% over). Widening the safety margin for next time.`
   } else if (worstRatio < 0.85) {
     const spare = fmtBytes(Math.abs(Math.min(...deltas)))
-    suggestion = `Used ${spare} less VRAM than predicted. There is room to raise the context on this model.`
+    // What the spare room is good for depends on what the plan left off the cards. Suggesting a
+    // bigger context to someone whose model is half in system RAM points them the wrong way.
+    const offGpu = (plan.cpuMoeLayers ?? 0) > 0 || plan.gpuLayers < plan.totalLayers
+    suggestion = offGpu
+      ? `Used ${spare} less VRAM than predicted. There is room to keep more of this model on the GPUs.`
+      : `Used ${spare} less VRAM than predicted. There is room to raise the context on this model.`
   }
   return { deltas, worstRatio, suggestion }
 }

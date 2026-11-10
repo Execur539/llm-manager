@@ -673,7 +673,11 @@ section('Hard-block list')
     'Set-MpPreference -DisableRealtimeMonitoring $true',
     'bcdedit /set nointegritychecks on',
     'vssadmin delete shadows /all',
-    'shutdown /r /t 0'
+    'shutdown /r /t 0',
+    'shutdown.exe -s -t 0',
+    'Get-Date; Stop-Computer -Force',
+    'if ($x) { Restart-Computer }',
+    '& "C:\\Windows\\System32\\shutdown.exe" /s'
   ]
   for (const cmd of blocked) {
     check(`blocks: ${cmd.slice(0, 40)}`, checkHardBlock(cmd).blocked)
@@ -684,11 +688,119 @@ section('Hard-block list')
     'git status',
     'rm -rf ./node_modules',
     'Remove-Item -Recurse .\\dist',
-    'python train.py --format csv'
+    'python train.py --format csv',
+    // The word in a heading, a filter or a file name is not the command.
+    "echo '=== BUGCHECK / UNEXPECTED SHUTDOWN ==='; Get-WinEvent -FilterHashtable @{LogName='System'; Id=41}",
+    "Get-WinEvent -LogName System | Where-Object { $_.Message -match 'shutdown' }",
+    'Get-Content .\\shutdown-notes.txt'
   ]
   for (const cmd of allowed) {
     check(`allows: ${cmd.slice(0, 40)}`, !checkHardBlock(cmd).blocked)
   }
+}
+
+section('Agent history: tool use is rebuilt as tool use')
+{
+  const { rebuildHistory, announcesNextStep } = await import('./built/history.js')
+  const call = (id, batch, command) => ({ id, name: 'run_command', args: { command }, ...(batch ? { batch } : {}) })
+  const tool = (id, c, content) => ({ id, role: 'tool', content, toolCalls: [c], createdAt: 0 })
+  const stored = [
+    { id: 'u1', role: 'user', content: 'Why is the network down?', createdAt: 0 },
+    { id: 'a1', role: 'assistant', content: 'Let me look at the adapters.', reasoning: 'Start with the adapters.', createdAt: 0 },
+    tool('t1', call('c1', 'b1', 'Get-NetAdapter'), 'adapters'),
+    tool('t2', call('c2', 'b1', 'Get-NetIPConfiguration'), 'config'),
+    // A step that called a tool without a word or a thought stores no message of its own.
+    tool('t3', call('c3', 'b2', 'Get-PnpDevice'), 'devices'),
+    { id: 'a2', role: 'assistant', content: 'The adapter is in an error state.', createdAt: 0 },
+    { id: 'u2', role: 'user', content: 'Fix it.', createdAt: 0 }
+  ]
+  const out = rebuildHistory(stored, { preserveReasoning: true })
+  const shape = out.map((m) => `${m.role}${m.tool_calls ? `[${m.tool_calls.map((c) => c.id).join(',')}]` : ''}`).join(' ')
+  check('calls go back on the turn that made them, one step at a time',
+    shape === 'user assistant[c1,c2] tool tool assistant[c3] tool assistant user', shape)
+  check('no tool result is sent as a message from the user',
+    !out.some((m) => m.role === 'user' && typeof m.content === 'string' && m.content.startsWith('[tool result]')))
+  check('a result names the call it answers', out[2].tool_call_id === 'c1' && out[3].tool_call_id === 'c2' && out[5].tool_call_id === 'c3')
+  check('arguments go back as the JSON they were', out[1].tool_calls[0].function.arguments === '{"command":"Get-NetAdapter"}')
+  check('reasoning stays with the turn that had it', out[1].reasoning_content === 'Start with the adapters.')
+  check('reasoning is left out when it is not preserved',
+    rebuildHistory(stored, { preserveReasoning: false })[1].reasoning_content === undefined)
+
+  // Sessions stored before calls carried a batch are grouped by adjacency.
+  const old = [
+    { id: 'u1', role: 'user', content: 'q', createdAt: 0 },
+    tool('t1', call('c1', null, 'a'), 'one'),
+    tool('t2', call('c2', null, 'b'), 'two')
+  ]
+  const oldOut = rebuildHistory(old, { preserveReasoning: false })
+  check('older sessions rebuild too', oldOut.map((m) => m.role).join(' ') === 'user assistant tool tool' && oldOut[1].tool_calls.length === 2)
+
+  // An image a tool returned follows its result as its own turn, as it did live.
+  const withImage = rebuildHistory([stored[0], stored[1], stored[2]], {
+    preserveReasoning: false,
+    sentContentFor: (id) => (id === 't1' ? [{ type: 'image_url', image_url: { url: 'data:x' } }, { type: 'text', text: '[image returned by run_command]' }] : undefined)
+  })
+  check('an image a tool returned follows its result',
+    withImage.map((m) => m.role).join(' ') === 'user assistant tool user' && Array.isArray(withImage[3].content))
+
+  const announces = [
+    ['Found the likely root cause. Let me get the exact problem code.', ''],
+    ['', 'The device is in error 43.\n\nLet me check elevation status.'],
+    ["Two driver packages are installed. Now I'll compare their versions.", ''],
+    ['Okay, let me run the diagnostics:', '']
+  ]
+  for (const [content, reasoning] of announces) {
+    check(`an announced step is noticed: ${(content || reasoning).slice(-40)}`, announcesNextStep(content, reasoning))
+  }
+  const finished = [
+    ['Wi-Fi is working again. Let me know if it drops out.', ''],
+    ['Should I restart the adapter?', ''],
+    ['The adapter was restarted and the connection is back.', "Let me write the summary."],
+    ['', '']
+  ]
+  for (const [content, reasoning] of finished) {
+    check(`a finished reply is left alone: ${content.slice(-40) || '(empty)'}`, !announcesNextStep(content, reasoning))
+  }
+}
+
+section('Saved logins are used by reference')
+{
+  const { substituteCredentials, redactSecrets, referencesCredential, maskCall } = await import('./built/credentialRefs.js')
+  const saved = { github: { username: 'octo', password: 'hunter2!' }, 'Home Router': { username: 'admin', password: 'r0uter' } }
+  const lookup = (name) => saved[Object.keys(saved).find((k) => k.toLowerCase() === name.toLowerCase())] ?? null
+
+  const one = substituteCredentials({ selector: '#pw', text: '{{credential:github}}' }, lookup)
+  check('a reference becomes the password when the call runs', one.args.text === 'hunter2!' && one.missing.length === 0)
+  check('the username is available the same way',
+    substituteCredentials({ text: '{{credential:github:username}}' }, lookup).args.text === 'octo')
+  const nested = substituteCredentials(
+    { command: 'curl -u {{credential:Home Router:username}}:{{ credential : home router }} http://192.168.1.1', list: ['{{credential:github:password}}'] },
+    lookup
+  )
+  check('references inside a command, a list and odd spacing are all filled',
+    nested.args.command === 'curl -u admin:r0uter http://192.168.1.1' && nested.args.list[0] === 'hunter2!', JSON.stringify(nested.args))
+  check('which passwords went in is reported, usernames are not',
+    nested.secrets.includes('r0uter') && nested.secrets.includes('hunter2!') && !nested.secrets.includes('admin'))
+  const gone = substituteCredentials({ text: '{{credential:bank}}' }, lookup)
+  check('a login that is not saved is reported, not typed as a placeholder', gone.missing[0] === 'bank' && gone.args.text === '{{credential:bank}}')
+  check('a call with no reference is recognised as such',
+    !referencesCredential({ command: 'echo {{not a credential}}' }) && referencesCredential({ a: { b: ['{{credential:x}}'] } }))
+  check('a password echoed back by a tool is struck out',
+    redactSecrets('typed hunter2! into #pw', ['hunter2!']) === 'typed [saved password] into #pw')
+  const masked = maskCall({ id: '1', name: 'save_credential', args: { name: 'github', username: 'octo', password: 'hunter2!' } })
+  check('the call that saves a login is shown and stored without the password',
+    masked.args.password !== 'hunter2!' && masked.args.username === 'octo')
+  check('other calls are left exactly as they are',
+    maskCall({ id: '2', name: 'run_command', args: { command: 'x', password: 'p' } }).args.password === 'p')
+
+  // A blanket "always allow this tool" does not cover a call that carries a saved login.
+  const asked = []
+  const engine = new PermissionEngine({ hardBlocksDisabled: () => false, ask: async (req) => { asked.push(req.resolved); return 'allow-tool' } })
+  await engine.authorise('run_command', 'execute', { command: 'echo hi' }, 'C:\\work')
+  await engine.authorise('run_command', 'execute', { command: 'echo again' }, 'C:\\work')
+  check('a tool allowed for a folder runs without asking again', asked.length === 1)
+  await engine.authorise('run_command', 'execute', { command: 'login {{credential:github}}' }, 'C:\\work')
+  check('but a call that uses a saved login still asks', asked.length === 2, String(asked.length))
 }
 
 section('Permission tiers')

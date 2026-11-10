@@ -299,9 +299,15 @@ export function setChatCwd(chatId: string, cwd: string): void {
  * Give a chat a title from its first user message, so the sidebar is readable without the
  * user having to name anything.
  */
+/** Record which model a conversation last ran on. */
+export function setChatModel(chatId: string, modelId: string | null): void {
+  run('UPDATE chats SET model_id = ? WHERE id = ?', modelId, chatId)
+}
+
 export function autoTitle(chatId: string): void {
   const row = get<ChatRow>('SELECT * FROM chats WHERE id = ?', chatId)
-  if (!row || row.title !== 'New chat') return
+  // Both placeholders: agent sessions start as 'New session', and were never given a title.
+  if (!row || (row.title !== 'New chat' && row.title !== 'New session')) return
   const first = get<MessageRow>(
     "SELECT * FROM messages WHERE chat_id = ? AND role = 'user' ORDER BY created_at, rowid LIMIT 1",
     chatId

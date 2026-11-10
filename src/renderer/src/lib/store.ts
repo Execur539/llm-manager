@@ -835,8 +835,30 @@ function wire(): void {
   on<{ sessionId?: string; message?: string } | string>('agent:error', (payload) => {
     const id = typeof payload === 'string' ? activeId : payload.sessionId || activeId
     state.errors[id] = typeof payload === 'string' ? payload : (payload.message ?? 'Unknown error')
+    // A note that a step was being retried is out of date once the turn has failed.
+    delete state.notices[id]
     state.running[id] = false
     delete state.extending[id]
+    emitChange()
+  })
+
+  /*
+   * A step the server failed to deliver is being run again.
+   *
+   * Everything streamed for it is dropped: it was the start of a reply that was never finished,
+   * and the retry writes its own from the beginning.
+   */
+  on<{ sessionId?: string; message: string }>('agent:step-retry', (d) => {
+    const id = d.sessionId || activeId
+    state.partial[id] = ''
+    state.reasoningPartial[id] = ''
+    state.pendingCalls[id] = []
+    state.notices[id] = d.message
+    emitChange()
+  })
+
+  on<{ sessionId?: string; message: string }>('agent:notice', (d) => {
+    state.notices[d.sessionId || activeId] = d.message
     emitChange()
   })
 

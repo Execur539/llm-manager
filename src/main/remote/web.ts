@@ -61,7 +61,11 @@ const DESKTOP_ONLY = new Set([
    * result, so the only effect a remote invocation has is on someone else's screen.
    */
   'diagnostics:reveal',
-  'shell:reveal'
+  'shell:reveal',
+  // Saved logins are managed at the machine they are saved on, and nowhere else.
+  'credentials:list',
+  'credentials:save',
+  'credentials:delete'
 ])
 
 /*

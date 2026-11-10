@@ -184,7 +184,29 @@ function paramsReply(body) {
   })
 }
 
+/**
+ * The roles of the messages a request carried, so a test can see how a history was rebuilt.
+ *
+ * `assistant[2]` is an assistant turn carrying two tool calls.
+ */
+function shapeReply(messages) {
+  return (
+    'SHAPE: ' +
+    messages.map((m) => `${m.role}${m.tool_calls?.length ? `[${m.tool_calls.length}]` : ''}`).join(' ')
+  )
+}
+
+/** How many replies have been cut off by [[mock:streamerror:N]] so far. */
+let streamErrorsSent = 0
+
 function pickReply(messages) {
+  if (marker(messages, 'shape')) return shapeReply(messages)
+  if (marker(messages, 'announce')) {
+    // Announces a step and stops, until it is told to act on it.
+    const last = messages.at(-1)
+    const told = typeof last?.content === 'string' && last.content.includes('did not call a tool')
+    return told ? 'ACTED: the event log is clean.' : 'I found the cause. Let me check the event log.'
+  }
   if (marker(messages, 'long')) return LONG_REPLY
   if (marker(messages, 'unicode')) return UNICODE_REPLY
   if (marker(messages, 'markdown')) return MARKDOWN_REPLY
@@ -254,8 +276,14 @@ const server = http.createServer(async (req, res) => {
 
     const namedTool = markerName(messages, 'calltool')
     const forcedArgs = markerJson(messages, 'toolargs')
+    // [[mock:toolonce]] calls a tool until one has answered, then replies in words.
+    // [[mock:continuetool]] answers in words, then goes straight to a tool call when continued.
+    const continueTool =
+      marker(messages, 'continuetool') && body.continue_final_message && !messages.some((m) => m.role === 'tool')
+    const toolOnce = (marker(messages, 'toolonce') && !messages.some((m) => m.role === 'tool')) || continueTool
     const wantsTool =
-      (marker(messages, 'tool') || markerValue(messages, 'tools') !== null || namedTool) && body.tools?.length
+      (marker(messages, 'tool') || toolOnce || markerValue(messages, 'tools') !== null || namedTool) &&
+      body.tools?.length
     const toolCount = markerValue(messages, 'tools') ?? 1
     const delay = marker(messages, 'slow') ? 250 : 12
     const reply = marker(messages, 'params')
@@ -302,6 +330,20 @@ const server = http.createServer(async (req, res) => {
       model: MODEL,
       choices: [{ index: 0, delta, finish_reason: finish }]
     })
+
+    /*
+     * A reply the server gives up on part-way through, the way llama.cpp does when its parser
+     * rejects a tool call: some thinking, then an error frame, then the connection closes with no
+     * finish reason and no [DONE]. [[mock:streamerror:N]] does this to the first N replies.
+     */
+    const failures = markerValue(messages, 'streamerror')
+    if (failures !== null && streamErrorsSent < failures) {
+      streamErrorsSent++
+      send(frame({ reasoning_content: 'Let me check the adapter' }))
+      await sleep(30)
+      send({ error: { code: 500, message: 'mock: the reply does not match the expected format', type: 'server_error' } })
+      return res.end()
+    }
 
     if (wantsTool) {
       const calls = buildToolCalls(body.tools, toolCount, namedTool, forcedArgs)
