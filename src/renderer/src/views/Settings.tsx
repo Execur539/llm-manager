@@ -231,6 +231,28 @@ export default function Settings({
               onCommit={(n) => void patch({ speculative: { ...settings.speculative, nMax: n } })}
             />
           </dd>
+          {/*
+            * Drafts taken from text already in the conversation, so any model can use it. It only
+            * pays when the reply repeats what was read, such as a file being rewritten.
+            */}
+          <dt>Draft from the conversation</dt>
+          <dd>
+            <select
+              className="kv-select"
+              value={settings.speculative.ngram}
+              onChange={(e) =>
+                void patch({
+                  speculative: { ...settings.speculative, ngram: e.target.value as AppSettings['speculative']['ngram'] }
+                })
+              }
+              data-testid="speculative-ngram"
+            >
+              <option value="off">off</option>
+              <option value="ngram-mod">n-gram (mod)</option>
+              <option value="ngram-simple">n-gram (simple)</option>
+            </select>
+            <span className="faint">same answers · helps when the reply copies text it has read · next load</span>
+          </dd>
           <dt>Extend past trained context</dt>
           <dd>
             <input
@@ -310,6 +332,58 @@ export default function Settings({
               hint="0 = automatic, which counts real cores rather than hyper-threads"
               onCommit={(n) => void patch({ runtime: { ...settings.runtime, threads: n } })}
             />
+          </dd>
+          <dt>Prompt threads</dt>
+          <dd>
+            <NumberField
+              value={settings.runtime.threadsBatch}
+              min={0}
+              max={256}
+              hint="--threads-batch · 0 = same as above · next load"
+              onCommit={(n) => void patch({ runtime: { ...settings.runtime, threadsBatch: n } })}
+            />
+          </dd>
+          <dt>Pin threads to cores</dt>
+          <dd>
+            <select
+              className="kv-select"
+              value={settings.runtime.pinThreads}
+              onChange={(e) =>
+                void patch({ runtime: { ...settings.runtime, pinThreads: e.target.value as 'off' | 'close' | 'spread' } })
+              }
+              data-testid="pin-threads"
+            >
+              <option value="off">off — let Windows place them</option>
+              <option value="close">close — fill cores in order</option>
+              <option value="spread">spread — even across all cores</option>
+            </select>
+            <span className="faint">next load</span>
+          </dd>
+          {/*
+            * For mixture-of-experts models whose experts live in system RAM: the most recently used
+            * experts are kept on the GPU and computed there. VRAM it takes comes out of the context.
+            */}
+          <dt>GPU expert cache</dt>
+          <dd>
+            <NumberField
+              value={settings.runtime.expertCache}
+              min={-1}
+              max={512}
+              hint="experts kept on the GPU per layer · -1 = as many as fit · 0 = off · same answers · next load"
+              onCommit={(n) => void patch({ runtime: { ...settings.runtime, expertCache: n } })}
+            />
+          </dd>
+          <dt>Re-lay CPU weights</dt>
+          <dd>
+            <input
+              type="checkbox"
+              checked={settings.runtime.repack !== false}
+              onChange={(e) => void patch({ runtime: { ...settings.runtime, repack: e.target.checked } })}
+              data-testid="repack"
+            />
+            <span className="faint" style={{ marginLeft: 6 }}>
+              faster CPU kernels; off lets long prompts move that work to the GPU · next load
+            </span>
           </dd>
           <dt>Batch size</dt>
           <dd>

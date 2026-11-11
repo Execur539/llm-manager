@@ -222,7 +222,7 @@ llama.on('reread', (r: RereadReport) => {
   if (!r.key?.startsWith('agent:') || r.key.startsWith('agent:sub-')) return
   emit('agent:notice', {
     sessionId: r.key.slice('agent:'.length),
-    message: `Read ${r.read.toLocaleString()} of ${r.total.toLocaleString()} tokens again before this reply: ${r.reason}.`
+    message: `Read ${r.read.toLocaleString()} of ${r.total.toLocaleString()} tokens before this reply: ${r.reason}.`
   })
 })
 
@@ -1030,6 +1030,7 @@ function constraintsFromSettings(s: AppSettings): FitConstraints {
     targetContext: s.autoFit.targetContext,
     idealContext: s.autoFit.idealContext,
     headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
+    expertCacheSlots: s.runtime.expertCache,
     allowRopeScaling: s.autoFit.allowRopeScaling,
     overrides: batchOverrides(s)
   }
@@ -1168,6 +1169,7 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
       targetContext: s.autoFit.targetContext,
       idealContext: s.autoFit.idealContext,
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
+      expertCacheSlots: s.runtime.expertCache,
       allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
       learnedHeadroom: learnedHeadroomFor(model.id),
@@ -1634,6 +1636,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       targetContext: s.autoFit.targetContext,
       idealContext: s.autoFit.idealContext,
       headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
+      expertCacheSlots: s.runtime.expertCache,
       allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
       learnedHeadroom: learnedHeadroomFor(model.id),

@@ -1,5 +1,6 @@
 /**
- * Rebuild the CUDA llama.cpp that LLM Manager ships, with Qwen3.8-Flash-Next's QSA work applied.
+ * Rebuild the CUDA llama.cpp that LLM Manager ships, with Qwen3.8-Flash-Next's QSA work applied and the
+ * GPU expert cache and fused gate+up of scripts/llama-patches/moe-expert-cache.patch.
  *
  * fetch-vendor installs the official b10900 release. Two upstream pull requests make QSA cheaper at
  * long context and are not merged yet, so this builds that same release with them applied and swaps
@@ -10,7 +11,10 @@
  * The build also compiles flash-attention kernels for the mixed key/value pairs the planner can
  * choose. The official build has none, and converts such a cache to f16 on every token instead.
  *
- * Needs git, CMake, Visual Studio 2022 with C++, and a CUDA 13 toolkit. It downloads the llama.cpp
+ * The expert-cache patch also changes the CPU backend, so every ggml-cpu-*.dll variant is rebuilt too,
+ * with clang like the official windows-cpu job (LLMM_LLVM_PATH, or the portable LLVM under D:\Apps\LLVM).
+ *
+ * Needs git, CMake, Visual Studio 2022 with C++, a CUDA 13 toolkit and LLVM (clang). It downloads the llama.cpp
  * source at the tag, the two pull requests, and CCCL 3.2 during configure.
  *
  *   node scripts/build-llama-cuda.mjs [--src D:\CODE\llama.cpp-qsa]
@@ -32,10 +36,12 @@ const PULLS = [
   { number: 28699, commit: '141f3f564', title: 'qwen4exp: incremental pooled-key cache for the QSA indexer' },
   { number: 28770, commit: '41a4ad00d', title: 'CUDA: enable sparse fa for qwen4' }
 ]
-const LOCAL_PATCHES = ['qsa-pooled-reserve.patch']
+const LOCAL_PATCHES = ['qsa-pooled-reserve.patch', 'moe-expert-cache.patch']
 // The matched pairs every CUDA build compiles, plus the mixed pairs the planner can choose.
 const FA_QUANTS = ['q4_0-q4_0', 'q8_0-q8_0', 'f16-f16', 'bf16-bf16', 'q8_0-q4_0', 'f16-q8_0', 'f16-q4_0']
 const OUTPUTS = ['llama.dll', 'ggml-cuda.dll']
+// The variants the official release ships; each is swapped for the patched clang build.
+const CPU_VARIANTS = ['x64', 'sse42', 'sandybridge', 'ivybridge', 'piledriver', 'haswell', 'skylakex', 'cannonlake', 'cascadelake', 'icelake', 'cooperlake', 'alderlake', 'sapphirerapids', 'zen4']
 
 const argIndex = process.argv.indexOf('--src')
 const SRC = path.resolve(argIndex > 0 ? process.argv[argIndex + 1] : path.join(ROOT, '..', 'llama.cpp-qsa'))
@@ -51,6 +57,14 @@ function cudaToolkit() {
     : []
   if (!found.length) throw new Error('No CUDA 13 toolkit found; set LLMM_CUDA_PATH')
   return path.join(root, found[0])
+}
+
+function llvmBin() {
+  if (process.env.LLMM_LLVM_PATH) return process.env.LLMM_LLVM_PATH
+  const root = 'D:\\Apps\\LLVM'
+  const found = fs.existsSync(root) ? fs.readdirSync(root).filter((d) => d.startsWith('clang+llvm-')).sort() : []
+  if (!found.length) throw new Error('No LLVM found; set LLMM_LLVM_PATH to its bin folder')
+  return path.join(root, found[found.length - 1], 'bin')
 }
 
 function visualStudio() {
@@ -109,7 +123,18 @@ fs.writeFileSync(
       '-DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_APP=OFF',
       '|| exit /b 1'
     ].join(' '),
-    `cmake --build build --target ${OUTPUTS.map((f) => path.basename(f, '.dll')).join(' ')} || exit /b 1`
+    `cmake --build build --target ${OUTPUTS.map((f) => path.basename(f, '.dll')).join(' ')} || exit /b 1`,
+    // CPU backends: clang, every variant, as the official windows-cpu job builds them. clang 23 makes
+    // incompatible-pointer-types an error, which upstream's older clang only warns about.
+    `set "PATH=${llvmBin()};%PATH%"`,
+    [
+      'cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake',
+      '-DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=ON -DGGML_CUDA=OFF',
+      '"-DCMAKE_C_FLAGS=-Wno-error=incompatible-pointer-types"',
+      '-DBUILD_SHARED_LIBS=ON -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_APP=OFF',
+      '|| exit /b 1'
+    ].join(' '),
+    `cmake --build build-cpu --target ${CPU_VARIANTS.map((v) => `ggml-cpu-${v}`).join(' ')} || exit /b 1`
   ].join('\r\n')
 )
 try {
@@ -120,16 +145,17 @@ try {
 
 // 4. Swap the two files in, and record what they are beside them.
 for (const file of OUTPUTS) fs.copyFileSync(path.join(SRC, 'build', 'bin', file), path.join(VENDOR_CUDA, file))
+for (const v of CPU_VARIANTS) fs.copyFileSync(path.join(SRC, 'build-cpu', 'bin', `ggml-cpu-${v}.dll`), path.join(VENDOR_CUDA, `ggml-cpu-${v}.dll`))
 fs.writeFileSync(
   path.join(VENDOR_CUDA, 'PATCHES.txt'),
   [
-    `llama.dll and ggml-cuda.dll in this folder are ${BASE.tag} (${BASE.commit}) rebuilt with:`,
+    `llama.dll, ggml-cuda.dll and ggml-cpu-*.dll in this folder are ${BASE.tag} (${BASE.commit}) rebuilt with:`,
     ...PULLS.map((pr) => `  ggml-org/llama.cpp#${pr.number} ${pr.commit} ${pr.title}`),
     ...LOCAL_PATCHES.map((p) => `  scripts/llama-patches/${p}`),
     `  GGML_CUDA_FA_QUANTS=${FA_QUANTS.join(';')}`,
-    `  CUDA ${path.basename(cuda)}, CCCL 3.2 (GGML_CUDA_CUB_3DOT2)`,
+    `  CUDA ${path.basename(cuda)}, CCCL 3.2 (GGML_CUDA_CUB_3DOT2); CPU variants with clang (${path.basename(path.dirname(llvmBin()))})`,
     'Every other file is the official release. Rebuild with: node scripts/build-llama-cuda.mjs',
     ''
   ].join('\n')
 )
-console.log(`\nswapped ${OUTPUTS.join(' and ')} into vendor/llama.cpp/cuda`)
+console.log(`\nswapped ${OUTPUTS.join(', ')} and ${CPU_VARIANTS.length} CPU variants into vendor/llama.cpp/cuda`)

@@ -266,6 +266,11 @@ export interface FitConstraints {
    */
   companionBytes?: number
   /**
+   * Slots per MoE layer in the GPU expert cache, charged to the card that holds the layer when its
+   * experts stay in system RAM: (slots + 1) of that layer's experts. 0 = no cache, -1 = as many as fit.
+   */
+  expertCacheSlots?: number
+  /**
    * Allow planning a context longer than the model was trained for, via rope scaling.
    *
    * Off by default. It works, but the scaling is applied at every length rather than only past
@@ -366,6 +371,8 @@ export interface FitPlan {
    * the first block. Zero for dense models and for plans where every expert fits on the GPUs.
    */
   cpuMoeLayers?: number
+  /** GPU expert-cache slots per host-expert layer this plan was costed with (LLAMA_MOE_EXPERT_CACHE). */
+  expertCacheSlots?: number
   /** Raw tensor overrides passed straight through to llama.cpp. */
   overrideTensors?: string
   /** Each card's predicted share by kind, in the same order as `predictedVramPerGpu`. */
@@ -574,6 +581,11 @@ export interface AppSettings {
     enabled: boolean
     /** Tokens drafted per step. */
     nMax: number
+    /**
+     * Self-speculation from n-grams already in the conversation (llama.cpp `--spec-type`), for any
+     * model. Strong when the reply repeats text it has seen, such as rewriting a file. 'off' = none.
+     */
+    ngram: 'off' | 'ngram-mod' | 'ngram-simple'
   }
   runtime: {
     /**
@@ -587,6 +599,20 @@ export interface AppSettings {
     loadMode: 'auto' | 'ram' | 'mmap'
     /** CPU threads for generation; 0 lets llama.cpp choose, which counts physical cores. */
     threads: number
+    /** CPU threads while reading prompts (`--threads-batch`); 0 = the same as generation. */
+    threadsBatch: number
+    /** Pin each CPU thread to its own core (OpenMP places), close together or spread out. */
+    pinThreads: 'off' | 'close' | 'spread'
+    /**
+     * GPU slots per MoE layer for experts that live in system RAM (LLAMA_MOE_EXPERT_CACHE): the most
+     * recently used experts are computed on the GPU instead. 0 = off, -1 = as many as the free VRAM holds.
+     */
+    expertCache: number
+    /**
+     * Let llama.cpp re-lay CPU-side weights for its fastest CPU kernels. Re-laid weights can no
+     * longer be copied to the GPU for long prompts, so turning this off moves that work there.
+     */
+    repack: boolean
     /**
      * Logical batch (`--batch-size`): the most prompt tokens handed to llama.cpp per step. 0 = automatic.
      */

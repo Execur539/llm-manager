@@ -565,6 +565,20 @@ function deviceSegments(
  *     rest of those blocks are;
  *   - each block's slice of the KV cache lives with the block.
  */
+/*
+ * GPU expert-cache slots per host-expert layer for the plan being computed.
+ *
+ * Set by planFit for the length of one synchronous planning call rather than threaded through every
+ * placement helper. llama.cpp puts a layer's cache beside its router, so it is charged to the card
+ * that holds the layer: (slots + 1) of the layer's experts, the extra one being the zero slot.
+ */
+let planExpertCacheSlots = 0
+
+function expertCacheBytes(arch: ModelArchInfo, expertsBytes: number): number {
+  if (planExpertCacheSlots <= 0 || arch.expertCount <= 0) return 0
+  return ((planExpertCacheSlots + 1) * expertsBytes) / arch.expertCount
+}
+
 function attempt(
   arch: ModelArchInfo,
   hw: HardwareSnapshot,
@@ -597,7 +611,7 @@ function attempt(
       hostBytes += costs.dense[il] + costs.experts[il] + kvPerBlock
       continue
     }
-    const onGpu = costs.dense[il] + (expertsOnHost ? 0 : costs.experts[il])
+    const onGpu = costs.dense[il] + (expertsOnHost ? expertCacheBytes(arch, costs.experts[il]) : costs.experts[il])
     // Staging travels with the block, because that is where llama.cpp allocates it.
     const staging = expertsOnHost ? hostExpertStaging(arch, batchSize) : 0
     weightsOnGpu += onGpu
@@ -1308,12 +1322,85 @@ export function resolveBatches(batch?: number, ubatch?: number): { batch: number
   return { batch: 512, ubatch: 512 }
 }
 
+function withCacheSlots(arch: ModelArchInfo, slots: number, plan: () => FitResult): FitResult {
+  planExpertCacheSlots = Math.max(0, Math.min(slots, Math.max(0, arch.expertCount - 1)))
+  try {
+    const result = plan()
+    const chosen = result.chosen
+    if (chosen && planExpertCacheSlots > 0 && (chosen.cpuMoeLayers ?? 0) > 0) {
+      const costs = layerCosts(arch)
+      let bytes = 0
+      for (let il = 0; il < (chosen.cpuMoeLayers ?? 0); il++) bytes += expertCacheBytes(arch, costs.experts[il])
+      result.chosen = {
+        ...chosen,
+        expertCacheSlots: planExpertCacheSlots,
+        rationale: [
+          ...chosen.rationale,
+          `GPU expert cache: the ${planExpertCacheSlots} most recently used of ${arch.expertCount} experts per layer are kept on the GPUs (${fmtBytes(bytes)}) and computed there.`
+        ]
+      }
+    }
+    return result
+  } finally {
+    planExpertCacheSlots = 0
+  }
+}
+
+/*
+ * The GPU expert cache, sized to what the cards have left.
+ *
+ * When a mixture-of-experts model spills experts to system RAM, VRAM spent on cache slots buys far
+ * more speed than the same VRAM spent on whole expert layers: on Qwen3.8-Flash-Next 16 GB of cache
+ * took generation from 18 to 41 tokens/s. So every expert stays in RAM, the context the plain plan
+ * chose is kept, and the cache takes the rest. The slot count is searched rather than computed
+ * because each layer's share lands on the card that holds the layer, so the cards fill unevenly.
+ */
+const EXPERT_CACHE_MIN_SLOTS = 16
+const EXPERT_CACHE_MARGIN_SLOTS = 8
+
+function autoExpertCache(arch: ModelArchInfo, hw: HardwareSnapshot, constraints: FitConstraints): FitResult {
+  const plain = withCacheSlots(arch, 0, () => planFitInner(arch, hw, constraints))
+  const chosen = plain.chosen
+  if (!chosen || arch.expertCount <= 0 || (chosen.cpuMoeLayers ?? 0) <= 0) return plain
+
+  const o = constraints.overrides
+  const pinned: FitConstraints = {
+    ...constraints,
+    overrides: {
+      ...o,
+      cpuMoeLayers: o.cpuMoeLayers ?? arch.blockCount,
+      contextLength: chosen.contextLength,
+      kvType: chosen.kvType,
+      kvTypeV: chosen.kvTypeV
+    }
+  }
+  const keeps = (r: FitResult): boolean =>
+    !!r.chosen && r.chosen.contextLength === chosen.contextLength && r.chosen.kvType === chosen.kvType
+  const at = (slots: number): FitResult => withCacheSlots(arch, slots, () => planFitInner(arch, hw, pinned))
+
+  if (!keeps(at(EXPERT_CACHE_MIN_SLOTS))) return plain
+  let lo = EXPERT_CACHE_MIN_SLOTS
+  let hi = arch.expertCount - 1
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (keeps(at(mid))) lo = mid
+    else hi = mid - 1
+  }
+  // A margin against allocator slack, unless every expert already fits.
+  const slots = lo >= arch.expertCount - 1 ? lo : Math.max(EXPERT_CACHE_MIN_SLOTS, lo - EXPERT_CACHE_MARGIN_SLOTS)
+  return at(slots)
+}
+
 export function planFit(
   arch: ModelArchInfo,
   hw: HardwareSnapshot,
   constraints: FitConstraints = DEFAULT_CONSTRAINTS
 ): FitResult {
-  const result = planFitInner(arch, hw, constraints)
+  const requested = Math.floor(constraints.expertCacheSlots ?? 0)
+  const result =
+    requested < 0
+      ? autoExpertCache(arch, hw, constraints)
+      : withCacheSlots(arch, requested, () => planFitInner(arch, hw, constraints))
   const { batch, ubatch } = resolveBatches(constraints.overrides.batchSize, constraints.overrides.ubatchSize)
   /*
    * Name the cards each plan's per-card figures belong to.

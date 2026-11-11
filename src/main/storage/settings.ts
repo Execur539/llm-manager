@@ -75,7 +75,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
      * guess discards everything after it, so drafting far ahead pays less than it looks on
      * anything but very predictable text.
      */
-    nMax: 3
+    nMax: 3,
+    /*
+     * Drafts from text already in the conversation. Off by default: same answers and 3.7x faster on a
+     * file rewrite on one GPU, but with the expert cache split over two GPUs its long drafts skip the
+     * cache and copy experts between cards, which measured slower (25 against 32 tokens/s).
+     */
+    ngram: 'off'
   },
   reasoning: {
     /*
@@ -111,6 +117,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   runtime: {
     loadMode: 'auto',
     threads: 0,
+    threadsBatch: 0,
+    pinThreads: 'spread',
+    // -1 sizes it to the VRAM the plan leaves; see autoExpertCache in autofit/engine.ts.
+    expertCache: -1,
+    repack: true,
     batchSize: 0,
     ubatchSize: 0,
     warmConversations: true,
@@ -208,6 +219,8 @@ const NUMERIC_BOUNDS: { path: [keyof AppSettings, string]; min: number; max: num
   { path: ['server', 'port'], min: 1, max: 65_535 },
   { path: ['downloads', 'connections'], min: 1, max: 16 },
   { path: ['runtime', 'threads'], min: 0, max: 256 },
+  { path: ['runtime', 'threadsBatch'], min: 0, max: 256 },
+  { path: ['runtime', 'expertCache'], min: -1, max: 512 },
   { path: ['runtime', 'batchSize'], min: 0, max: 65_536 },
   { path: ['runtime', 'ubatchSize'], min: 0, max: 65_536 },
   // A video may not take the whole window: the question about it has to fit too.

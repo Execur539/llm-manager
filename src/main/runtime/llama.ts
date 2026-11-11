@@ -32,6 +32,28 @@ import { logger } from '../log'
 // Relative, not `@shared`: the main-process bundle has no such alias for value imports.
 import { DEFAULT_TEMPERATURE, DEFAULT_TOP_P, SAMPLING_FIELDS, type SamplingOptions } from '../../shared/sampling'
 
+/**
+ * Environment for llama-server from the runtime settings.
+ *
+ * Pinning goes through OpenMP, which the shipped CPU backends use for their threads, so llama.cpp's
+ * own --cpu-mask does not reach them. The expert cache lives in the patched llama.dll, which the
+ * official llama-server has no flag for, so it is configured by environment.
+ */
+function runtimeEnv(plan: FitPlan): NodeJS.ProcessEnv {
+  const r = loadSettings().runtime
+  const env: NodeJS.ProcessEnv = {}
+  // Pinning more threads than cores puts two on one core, which measured 1.6 tokens/s instead of 28.
+  const cores = Math.max(1, Math.floor(os.cpus().length / 2))
+  if ((r.pinThreads === 'close' || r.pinThreads === 'spread') && r.threads <= cores) {
+    env.OMP_PLACES = 'cores'
+    env.OMP_PROC_BIND = r.pinThreads
+  }
+  // The plan carries the slot count it was costed with, so the process cannot take more VRAM than planned.
+  const slots = Math.floor(Number(plan.expertCacheSlots) || 0)
+  if (slots > 0) env.LLAMA_MOE_EXPERT_CACHE = String(slots)
+  return env
+}
+
 /** Location of the stand-in server used when LLMM_MOCK_LLAMA=1. */
 function mockServerPath(): string {
   return process.env.LLMM_MOCK_SCRIPT ?? path.join(app.getAppPath(), 'scripts', 'mock-llama.mjs')
@@ -573,6 +595,8 @@ export class LlamaRuntime extends EventEmitter {
      */
     const settings = loadSettings()
     if (settings.runtime.threads > 0) args.push('--threads', String(settings.runtime.threads))
+    if (settings.runtime.threadsBatch > 0) args.push('--threads-batch', String(settings.runtime.threadsBatch))
+    if (settings.runtime.repack === false) args.push('--no-repack')
 
     // A margin, because the figure is a prediction and the rest of the machine is still running.
     const fitsInRam = residentHost > 0 && residentHost * 1.15 < os.freemem()
@@ -631,9 +655,19 @@ export class LlamaRuntime extends EventEmitter {
      * tensors are there or they are not, and `mtpLayers` is only set when both the metadata and
      * the tensors agree.
      */
+    const specTypes: string[] = []
     if ((model.arch?.mtpLayers ?? 0) > 0 && (plan.draftMax ?? 0) > 0) {
-      args.push('--spec-type', 'draft-mtp', '--spec-draft-n-max', String(plan.draftMax ?? 3))
+      specTypes.push('draft-mtp')
+      args.push('--spec-draft-n-max', String(plan.draftMax ?? 3))
     }
+    /*
+     * Self-speculation from n-grams: drafts come from text already in the conversation, so it needs
+     * no head and costs nothing when there is no match. It pays when the reply repeats what it has
+     * read, such as a file being rewritten; on ordinary prose it rarely fires.
+     */
+    const ngram = loadSettings().speculative.ngram
+    if (ngram === 'ngram-mod' || ngram === 'ngram-simple') specTypes.push(ngram)
+    if (specTypes.length) args.push('--spec-type', specTypes.join(','))
     return args
   }
 
@@ -718,7 +752,7 @@ export class LlamaRuntime extends EventEmitter {
     const useMock = process.env.LLMM_MOCK_LLAMA === '1'
     const exe = useMock ? process.execPath : llamaServerPath(backend)
     const spawnArgs = useMock ? [mockServerPath(), ...args] : args
-    const env = useMock ? { ...childEnv(), ELECTRON_RUN_AS_NODE: '1' } : childEnv()
+    const env = useMock ? { ...childEnv(), ELECTRON_RUN_AS_NODE: '1' } : { ...childEnv(), ...runtimeEnv(plan) }
 
     const child = spawn(exe, spawnArgs, { windowsHide: true, env })
     this.child = child
@@ -964,6 +998,9 @@ export class LlamaRuntime extends EventEmitter {
 
     const shape = shapeOf(opts)
     const previous = this.lastShape
+    // What the server held before this request, with a read-ahead's stand-in message left out.
+    const previousBase =
+      previous && this.lastWasReadAhead ? { ...previous, messages: previous.messages.slice(0, -1) } : null
     this.lastShape = shape
     this.lastWasReadAhead = !!opts.processOnly
     /** Prompt tokens the server took from its cache; known from the first progress frame. */
@@ -1073,7 +1110,7 @@ export class LlamaRuntime extends EventEmitter {
             }
             if (reusedTokens === null) {
               reusedTokens = pp.cache ?? 0
-              this.reportReuse(previous, shape, reusedTokens, pp.total, !!opts.processOnly)
+              this.reportReuse(previous, shape, reusedTokens, pp.total, !!opts.processOnly, previousBase)
             }
             /*
              * The prompt total is the context this turn starts from, and it is known here —
@@ -1185,16 +1222,41 @@ export class LlamaRuntime extends EventEmitter {
    * Reported as soon as the server says how much it kept, which is before it has read the rest:
    * the explanation is most useful during the wait it explains.
    */
-  private reportReuse(previous: SentShape | null, shape: SentShape, reused: number, total: number, warming: boolean): void {
+  private reportReuse(
+    previous: SentShape | null,
+    shape: SentShape,
+    reused: number,
+    total: number,
+    warming: boolean,
+    readAheadBase: SentShape | null
+  ): void {
     const read = Math.max(0, total - reused)
     const what = warming ? 'warming' : 'prompt'
     if (!isLargeReread(read, total)) {
       logger.info('prompt', `${what}: read ${read} of ${total} tokens, ${reused} reused`, { key: shape.key })
       return
     }
+    /*
+     * Two long reads are nobody's fault and are not a reading-again.
+     *
+     * A conversation's first message has nothing before it to have been read. And a message sent
+     * while the conversation was still being read ahead finds only part of it done: the first
+     * release of this reported exactly that as the user's message having been sent differently,
+     * which was true of the stand-in and told them nothing.
+     */
+    const firstTurn = !shape.messages.some((m) => m.startsWith('assistant\u0002'))
+    const unfinished = !!readAheadBase && extendsPrevious(readAheadBase, shape)
+    if (unfinished || (firstTurn && !warming)) {
+      const note = unfinished ? 'it was still being read ahead when this was sent' : 'the first message of a conversation'
+      logger.info('prompt', `${what}: read ${read} of ${total} tokens, ${reused} reused: ${note}`, { key: shape.key })
+      if (unfinished && !firstTurn && !warming) {
+        this.emit('reread', { read, reused, total, reason: 'the conversation was still being read in when the message was sent', key: shape.key })
+      }
+      return
+    }
     const why = explainReread(previous, shape)
     const report: RereadReport = { read, reused, total, reason: why.reason, detail: why.detail, key: shape.key }
-    logger.warn('prompt', `${what}: read ${read} of ${total} tokens again, ${reused} reused: ${why.reason}`, {
+    logger.warn('prompt', `${what}: read ${read} of ${total} tokens, ${reused} reused: ${why.reason}`, {
       key: shape.key,
       detail: why.detail
     })
