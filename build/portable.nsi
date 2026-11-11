@@ -98,6 +98,8 @@ Var Inherited
 Var CacheRoot
 Var Staging
 Var ExitCode
+Var Drive
+Var FreeMb
 
 Section
   StrCpy $RuntimeDir "$LOCALAPPDATA\LLMManager\runtime-${VERSION}"
@@ -131,6 +133,21 @@ Section
 
   ; Slow path, first run only. Clear any half-finished attempt before unpacking.
   RMDir /r "$RuntimeDir"
+
+  ; The previous version is normally removed last, once this one is in place. On a drive too
+  ; full to hold both it goes first instead: an update that cannot unpack is worse than a few
+  ; seconds with no copy on disk, and the launcher being run still holds everything needed.
+  StrCpy $Drive "$LOCALAPPDATA" 3
+  ${DriveSpace} "$Drive" "/D=F /S=M" $FreeMb
+  ${If} $FreeMb < ${NEED_MB}
+    Call CleanOldRuntimes
+    ${DriveSpace} "$Drive" "/D=F /S=M" $FreeMb
+    ${If} $FreeMb < ${NEED_MB}
+      MessageBox MB_ICONSTOP "LLM Manager needs about ${NEED_MB} MB free on $Drive to unpack, and there is $FreeMb MB.$\n$\nFree some space on that drive and run it again."
+      Abort
+    ${EndIf}
+  ${EndIf}
+
   CreateDirectory "$RuntimeDir"
 
   ; The archives and their extractor are staged outside the runtime directory, so a failure part
@@ -219,7 +236,13 @@ Function CleanOldRuntimes
       ; Contains a model library — never delete.
       Goto next
     ${EndIf}
-    RMDir /r "$LOCALAPPDATA\LLMManager\$1"
+    ; Renamed first: Windows refuses to rename a folder with a file in use inside it, so a copy
+    ; of the app that is still running is left whole rather than half deleted. The new name is
+    ; one the sweep below removes if anything survives this.
+    ClearErrors
+    Rename "$LOCALAPPDATA\LLMManager\$1" "$LOCALAPPDATA\LLMManager\staging-old-$1"
+    IfErrors next
+    RMDir /r "$LOCALAPPDATA\LLMManager\staging-old-$1"
   next:
     FindNext $0 $1
     Goto loop

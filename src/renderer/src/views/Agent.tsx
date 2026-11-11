@@ -184,6 +184,23 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
     void invoke('settings:patch', { ultra: { samples: next } }).catch(() => undefined)
   }
 
+  /*
+   * The part every session starts with is read as soon as there is a model to read it.
+   *
+   * The instructions and the tool list are thousands of tokens, and a freshly loaded model has
+   * read none of them. Waiting for a click in the message box left a few seconds' head start on
+   * a read that takes several times that; opening this view, or loading a model while it is
+   * open, is the earlier sign. Any message sent meanwhile simply takes over from where it got to.
+   */
+  const loadedPath = loaded?.model
+  useEffect(() => {
+    if (!loadedPath) return
+    const effort = sendableChoice(loaded?.caps?.reasoning, stream.reasoning[effortId] ?? null)
+    void invoke('agent:warm', activeId ?? undefined, effort).catch(() => undefined)
+    // Once per model, not per conversation: clicking into a conversation covers the rest.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadedPath])
+
   const refreshSessions = async (): Promise<void> => {
     setSessions(await invoke<ChatSummary[]>('chat:list', 'agent'))
   }

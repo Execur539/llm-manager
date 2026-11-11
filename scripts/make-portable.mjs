@@ -307,11 +307,25 @@ async function main() {
     return `${((await fsp.stat(APP_ARCHIVE)).size / 1024 ** 2).toFixed(0)} MB`
   })
 
+  // What a first run needs free: both archives staged beside everything they unpack to, and a margin.
+  const treeBytes = async (dir) => {
+    let total = 0
+    for (const entry of await fsp.readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      total += entry.isDirectory() ? await treeBytes(full) : (await fsp.stat(full)).size
+    }
+    return total
+  }
+  const needMb = Math.ceil(
+    ((await fsp.stat(APP_ARCHIVE)).size + (await fsp.stat(VENDOR_ARCHIVE)).size + (await treeBytes(UNPACKED))) / 1024 ** 2 + 200
+  )
+
   // ---- 3. the launcher, which only has to carry them
   await stage('launcher', () =>
     run(makensis, [
       '/V2',
       `/DVERSION=${VERSION}`,
+      `/DNEED_MB=${needMb}`,
       `/DVERSION4=${VERSION4}`,
       `/DCOPYRIGHT=${COPYRIGHT}`,
       `/DAPP_ARCHIVE=${APP_ARCHIVE}`,
