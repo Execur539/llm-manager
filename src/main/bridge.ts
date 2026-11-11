@@ -40,6 +40,7 @@ import { llama, estimateTokens, type ChatMessage, type ContentPart, type Complet
 import type { RereadReport } from './runtime/reuse-meter'
 import { listStates, prune, readMeta, removeState, restoreState, saveState } from './runtime/state-cache'
 import { stateCacheFolder } from './runtime/llama'
+import crypto from 'node:crypto'
 import { missingBinaries, embeddingModelPath, vendorDiagnostics, llamaServerPath } from './runtime/binaries'
 import { cudaKvPairs, MATCHED_KV_PAIRS } from './runtime/fa-kernels'
 import { deleteLogin, listLogins, saveLogin } from './agent/credentials'
@@ -256,6 +257,8 @@ function warm(req: CompletionOptions): boolean {
     if (signal.aborted) return
     // A kept state is a file read; reading the conversation is the fallback.
     if (await restoreSaved(req, signal)) return
+    await seedInstructions(req, signal, true)
+    if (signal.aborted) return
     await readAhead(req, signal)
   })
   return true
@@ -304,7 +307,7 @@ function statePins(dir: string): Set<string> {
 async function parkHeld(nextKey: string | null, signal?: AbortSignal): Promise<void> {
   const store = llama.stateStore
   const held = llama.heldKey
-  if (!store || !held || held === nextKey) return
+  if (!store || !held || held === nextKey || !conversationStates()) return
   // A conversation in the middle of a reply is not parked; its turn leaves the server holding it again.
   if (held.startsWith('agent:') && agentTurnAbort) return
   if (held.startsWith('chat:') && inFlightChats.has(held.slice('chat:'.length))) return
@@ -319,7 +322,9 @@ async function parkHeld(nextKey: string | null, signal?: AbortSignal): Promise<v
     }
     llama.assumeHeld(req)
     const budget = Math.max(1, loadSettings().runtime.stateCache.budgetGb) * 1024 ** 3
-    const removed = prune(store.dir, budget, statePins(store.dir))
+    const pins = statePins(store.dir)
+    for (const s of listStates(store.dir)) if (s.key.startsWith(INSTRUCTIONS_PREFIX)) pins.add(s.key)
+    const removed = prune(store.dir, budget, pins)
     logger.info('prompt', `saved ${held} to disk`, { tokens: result.meta.tokens, bytes: result.meta.bytes, removed })
   } catch (err) {
     logger.warn('prompt', `could not save ${held} to disk`, err)
@@ -330,7 +335,7 @@ async function parkHeld(nextKey: string | null, signal?: AbortSignal): Promise<v
 async function restoreSaved(req: CompletionOptions, signal?: AbortSignal): Promise<boolean> {
   const store = llama.stateStore
   const key = req.cacheKey
-  if (!store || !key || !readMeta(store.dir, key)) return false
+  if (!store || !key || !conversationStates() || !readMeta(store.dir, key)) return false
   try {
     const result = await restoreState({ ...store, key, req, signal })
     if (!result.ok) {
@@ -355,7 +360,72 @@ async function restoreSaved(req: CompletionOptions, signal?: AbortSignal): Promi
 async function resumeSaved(req: CompletionOptions): Promise<void> {
   if (!llama.stateStore || !req.messages.length || llama.holds(req)) return
   await parkHeld(req.cacheKey ?? null)
-  await restoreSaved(req)
+  if (await restoreSaved(req)) return
+  // Someone is waiting: load the instructions if they are on disk, but do not stop to save them.
+  await seedInstructions(req, new AbortController().signal, false)
+}
+
+/** Whether conversations are kept on disk; the agent's instructions are kept regardless. */
+function conversationStates(): boolean {
+  return !!loadSettings().runtime.stateCache?.enabled
+}
+
+/*
+ * The agent's instructions, kept on disk.
+ *
+ * Every Agent conversation begins with the same system prompt and tool list, thousands of tokens
+ * the model had to read again after every load. Their state is saved once, under a key made from
+ * exactly that text and the effort it was rendered with, and loaded back in place of reading it
+ * when a model has just been loaded. A loaded state only has to be how the conversation begins,
+ * so the one file serves every conversation started with those instructions.
+ */
+const INSTRUCTIONS_PREFIX = 'agent-instructions:'
+const INSTRUCTIONS_KEEP = 3
+
+function instructionsRequest(req: CompletionOptions): CompletionOptions | null {
+  if (!req.cacheKey?.startsWith('agent:') || req.messages[0]?.role !== 'system') return null
+  const id = crypto
+    .createHash('sha256')
+    .update(JSON.stringify([req.messages[0], req.tools ?? [], req.reasoningEffort ?? null, req.chatTemplateKwargs ?? null]))
+    .digest('hex')
+    .slice(0, 16)
+  return { ...req, messages: [req.messages[0]], cacheKey: INSTRUCTIONS_PREFIX + id }
+}
+
+/** With nothing held yet, load the instructions from disk, or read them and save them when `save`. */
+async function seedInstructions(req: CompletionOptions, signal: AbortSignal, save: boolean): Promise<void> {
+  const store = llama.stateStore
+  // Anything already held began with the same instructions, and the server reuses that by itself.
+  if (!store || loadSettings().runtime.keepInstructions === false || llama.heldKey) return
+  const inst = instructionsRequest(req)
+  if (!inst?.cacheKey) return
+  try {
+    if (readMeta(store.dir, inst.cacheKey)) {
+      const result = await restoreState({ ...store, key: inst.cacheKey, req: inst, signal })
+      if (result.ok) {
+        llama.assumeHeld(inst)
+        logger.info('prompt', 'restored the agent instructions from disk', { tokens: result.meta.tokens, bytes: result.meta.bytes })
+        return
+      }
+      logger.info('prompt', `the agent instructions were not restored from disk: ${result.why}`)
+    }
+    if (!save || signal.aborted) return
+    await readAhead(inst, signal)
+    if (signal.aborted) return
+    const saved = await saveState({ ...store, key: inst.cacheKey, req: inst, signal })
+    if (!saved.ok) {
+      logger.info('prompt', `the agent instructions were not saved to disk: ${saved.why}`)
+      return
+    }
+    llama.assumeHeld(inst)
+    const kept = listStates(store.dir)
+      .filter((s) => s.key.startsWith(INSTRUCTIONS_PREFIX))
+      .sort((a, b) => b.usedAt - a.usedAt)
+    for (const old of kept.slice(INSTRUCTIONS_KEEP)) removeState(store.dir, old.key)
+    logger.info('prompt', 'saved the agent instructions to disk', { tokens: saved.meta.tokens, bytes: saved.meta.bytes })
+  } catch (err) {
+    logger.warn('prompt', 'could not keep the agent instructions on disk', err)
+  }
 }
 
 async function readAhead(req: CompletionOptions, signal: AbortSignal): Promise<void> {
@@ -383,29 +453,111 @@ function effortFields(choice: ReasoningChoice | null | undefined): ReturnType<ty
  */
 const TIDY_AT = 0.6
 
-/** After a chat turn: summarise if the window is filling, then read the shorter conversation in. */
-function tidyChat(chatId: string, reasoning: ReasoningChoice | null): void {
-  const loaded = llama.loaded
-  if (!loaded || !canWarm()) return
-  if ((chats.getContextUsed(chatId) ?? 0) < loaded.plan.contextLength * TIDY_AT) return
-  void llama.runIdle(async (signal) => {
-    const history = chats.loadMessages(chatId)
-    await restoreConversationMedia(chatId, history)
-    const preserveReasoning = loadSettings().reasoning.preserve
-    const report = await compactChat(chatId, history, {
-      automatic: true,
-      threshold: TIDY_AT,
-      preserveReasoning,
-      reasoning,
-      signal,
-      background: true
-    })
-    if (!report.ok || signal.aborted) return
-    await readAhead(
-      { messages: chatMessagesFor(chatId, history, preserveReasoning), cacheKey: `chat:${chatId}`, ...effortFields(reasoning) },
+/*
+ * Chats are named by the model.
+ *
+ * After the first reply, and every few turns after that, the model is asked for a title in the
+ * background. The question is added to the end of the conversation exactly as a read-ahead's
+ * stand-in is, so the server reuses everything before it and the next message reuses it again;
+ * it costs a few tokens read and a few written, while the reply is being read. A later ask shows
+ * the current title and lets the model keep it, so a name changes only when the conversation has.
+ */
+const RETITLE_EVERY = 3
+
+function titleDue(chatId: string): boolean {
+  const state = chats.titleState(chatId)
+  if (!state || state.byUser || state.userTurns < 1) return false
+  return state.userTurns === 1 || (state.userTurns - 1) % RETITLE_EVERY === 0
+}
+
+async function retitleChat(chatId: string, reasoning: ReasoningChoice | null, signal: AbortSignal): Promise<void> {
+  const state = chats.titleState(chatId)
+  if (!state || state.byUser) return
+  const history = chats.loadMessages(chatId)
+  if (!history.length) return
+  await restoreConversationMedia(chatId, history)
+  if (signal.aborted) return
+  const conversation: CompletionOptions = {
+    messages: chatMessagesFor(chatId, history, loadSettings().reasoning.preserve),
+    cacheKey: `chat:${chatId}`,
+    ...effortFields(reasoning)
+  }
+  const named = state.userTurns > 1
+  const ask = named
+    ? `(Not part of the conversation: this chat is titled "${state.title}". If that still says what it is about, ` +
+      'reply with exactly that title. Otherwise reply with only a better one: 2 to 6 words, in the language of ' +
+      'the conversation, no quotes.)'
+    : '(Not part of the conversation: name this chat for the sidebar. Reply with only the title: 2 to 6 words, ' +
+      'in the language of the conversation, no quotes.)'
+  /*
+   * No thinking, without touching the prompt start.
+   *
+   * Switching thinking off through the template (enable_thinking, an 'none' effort) renders the
+   * system prompt differently on Qwen3.8, and the whole conversation was read again: measured,
+   * 0 of 580 tokens reused. A budget of 0 alone did not stop it thinking. A reply that starts with
+   * a closed <think></think> pair keeps every token before the question and answers in ~10 tokens.
+   * Templates without those tags get room to think briefly instead.
+   */
+  const support = llama.loaded?.model.caps.reasoning
+  const thinks = !!support && support.kind !== 'none'
+  const prefill: ChatMessage[] = thinks && support?.thinkTags ? [{ role: 'assistant', content: '<think>\n\n</think>\n\n' }] : []
+  try {
+    const answer = await llama.complete({
+      ...conversation,
+      messages: [...conversation.messages, { role: 'user', content: ask }, ...prefill],
+      continueFinal: prefill.length > 0,
+      reasoningBudget: 0,
+      temperature: 0.3,
+      maxTokens: thinks && !prefill.length ? 256 : 32,
+      background: true,
       signal
-    )
+    })
+    if (signal.aborted) return
+    const applied = chats.setModelTitle(chatId, answer)
+    if (applied) {
+      logger.info('chat', `the model named ${chatId}`, { title: applied })
+      emit('chat:titled', { chatId, title: applied })
+    }
+  } catch (err) {
+    if (!signal.aborted) logger.info('chat', `could not name ${chatId}: ${err instanceof Error ? err.message : String(err)}`)
+  } finally {
+    // The server holds the conversation with the question after it, as after a read-ahead; the
+    // next message reuses everything before the question.
+    llama.assumeHeld(conversation)
+  }
+}
+
+/** After a chat turn: name it if due, and summarise if the window is filling. One background job. */
+function afterChatTurn(chatId: string, reasoning: ReasoningChoice | null): void {
+  const loaded = llama.loaded
+  if (!loaded || agentTurnAbort || inFlightChats.size > 0 || llama.idleBusy) return
+  const retitle = titleDue(chatId)
+  const tidy = canWarm() && (chats.getContextUsed(chatId) ?? 0) >= loaded.plan.contextLength * TIDY_AT
+  if (!retitle && !tidy) return
+  void llama.runIdle(async (signal) => {
+    if (retitle) await retitleChat(chatId, reasoning, signal)
+    if (tidy && !signal.aborted) await tidyChatNow(chatId, reasoning, signal)
   })
+}
+
+/** Summarise a chat whose window is filling, then read the shorter conversation in. */
+async function tidyChatNow(chatId: string, reasoning: ReasoningChoice | null, signal: AbortSignal): Promise<void> {
+  const history = chats.loadMessages(chatId)
+  await restoreConversationMedia(chatId, history)
+  const preserveReasoning = loadSettings().reasoning.preserve
+  const report = await compactChat(chatId, history, {
+    automatic: true,
+    threshold: TIDY_AT,
+    preserveReasoning,
+    reasoning,
+    signal,
+    background: true
+  })
+  if (!report.ok || signal.aborted) return
+  await readAhead(
+    { messages: chatMessagesFor(chatId, history, preserveReasoning), cacheKey: `chat:${chatId}`, ...effortFields(reasoning) },
+    signal
+  )
 }
 
 /** The same after an agent turn. */
@@ -624,6 +776,7 @@ function getAgent(): Agent {
       emit('agent:tool-call-partial', { sessionId: sid(), ...p })
     )
     agent.on('toolResult', (r) => emit('agent:tool-result', { sessionId: sid(), result: r }))
+    agent.on('title', (t: { sessionId: string; title: string }) => emit('chat:titled', { chatId: t.sessionId, title: t.title }))
     agent.on('subToolCall', (c) => emit('agent:sub-tool-call', { sessionId: sid(), call: c }))
     agent.on('compacting', (info) => emit('agent:compacting', { sessionId: sid(), ...(info as object) }))
     agent.on('compacted', (info) => emit('agent:compacted', { sessionId: sid(), ...(info as object) }))
@@ -2132,7 +2285,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       setContextUsed(t.promptTokens + t.completionTokens)
       chats.setContextUsed(chatId, t.promptTokens + t.completionTokens)
     }
-    if (!stopped) tidyChat(chatId, effort)
+    if (!stopped) afterChatTurn(chatId, effort)
     return assistantMsg
   },
 
@@ -2473,8 +2626,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const states = dir ? listStates(dir) : []
     return {
       enabled: !!settings?.enabled,
-      // Whether the loaded model was started able to save; the setting applies from the next load.
-      active: !!llama.stateStore,
+      // Whether the loaded model was started able to save conversations; the setting applies from the next load.
+      active: !!llama.stateStore && !!settings?.enabled,
       modelLoaded: !!llama.loaded,
       folder: dir ?? '',
       budgetGb: settings?.budgetGb ?? 20,

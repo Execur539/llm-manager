@@ -373,6 +373,18 @@ export default function Settings({
               onCommit={(n) => void patch({ runtime: { ...settings.runtime, expertCache: n } })}
             />
           </dd>
+          <dt>Keep agent instructions on disk</dt>
+          <dd>
+            <input
+              type="checkbox"
+              checked={settings.runtime.keepInstructions !== false}
+              onChange={(e) => void patch({ runtime: { ...settings.runtime, keepInstructions: e.target.checked } })}
+              data-testid="keep-instructions"
+            />
+            <span className="faint" style={{ marginLeft: 6 }}>
+              a freshly loaded model loads the Agent's instructions from a file instead of reading them again · next load
+            </span>
+          </dd>
           <dt>Re-lay CPU weights</dt>
           <dd>
             <input

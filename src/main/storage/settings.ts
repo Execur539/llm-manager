@@ -118,6 +118,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     loadMode: 'auto',
     threads: 0,
     threadsBatch: 0,
+    keepInstructions: true,
     pinThreads: 'spread',
     // -1 sizes it to the VRAM the plan leaves; see autoExpertCache in autofit/engine.ts.
     expertCache: -1,

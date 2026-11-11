@@ -67,6 +67,7 @@ import { checkpointFiles } from './checkpoints'
 import { mcpManager } from './mcp'
 import { readMemory } from './memory'
 import * as chats from '../chat/repo'
+import { cleanTitle } from '../chat/title'
 import { APPDATA_DIR } from '../storage/paths'
 import { type CompactionHelper, type TranscriptItem } from './compaction'
 import { summariseTranscript } from './summarise'
@@ -153,6 +154,8 @@ Rules:
   user's accounts, call browser_attach first to use their own browser.
 - Saved logins: list_credentials shows what is stored. Where a password belongs in a tool call,
   write {{credential:NAME}} and it is filled in when the call runs; you do not need to see it.
+- Name the conversation with set_title in your first reply, and rename it whenever the task
+  turns out to be different or moves on, so the title always says what is being worked on.
 - When the work is done, reply in prose with what you did. Keep it short.`
 
 /** Sent right after a reply that announced a step without taking it. */
@@ -250,7 +253,17 @@ export class Agent extends EventEmitter {
       ...makeAgentTools({
         spawnSubAgent: (prompt, cwd) => this.runSubAgent(prompt, cwd),
         canSpawn: () => this.depth < 2,
-        askUser: (question, options) => this.ask(question, options)
+        askUser: (question, options) => this.ask(question, options),
+        setTitle: (sessionId, title) => {
+          if (this.depth > 0) return 'Only the main conversation has a title; carry on with the task.'
+          const state = chats.titleState(sessionId)
+          if (!state) return 'This conversation has no title to set.'
+          if (state.byUser) return `The user named this conversation "${state.title}" themselves, so it keeps that name.`
+          const applied = chats.setModelTitle(sessionId, title)
+          if (!applied) return state.title === cleanTitle(title) ? `Already titled: ${state.title}` : 'No usable title in that; give 2 to 6 words.'
+          this.emit('title', { sessionId, title: applied })
+          return `Titled: ${applied}`
+        }
       })
     ])
     this.permissions = new PermissionEngine({

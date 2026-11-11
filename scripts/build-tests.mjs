@@ -14,6 +14,7 @@ await build({
     hf: path.join(ROOT, 'src/main/downloads/hf.ts'),
     gguf: path.join(ROOT, 'src/main/models/gguf.ts'),
     reasoning: path.join(ROOT, 'src/main/models/reasoning.ts'),
+    title: path.join(ROOT, 'src/main/chat/title.ts'),
     gpu: path.join(ROOT, 'src/main/hardware/gpu.ts'),
     filenames: path.join(ROOT, 'src/main/storage/filenames.ts'),
     db: path.join(ROOT, 'src/main/storage/db.ts'),

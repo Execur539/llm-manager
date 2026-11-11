@@ -295,10 +295,19 @@ export interface Timings {
  * Beside the models folder unless a folder is named: states are gigabytes, and the models folder
  * is on the drive that was chosen for holding gigabytes.
  */
-export function stateCacheFolder(): string | null {
+function stateFolderPath(): string {
   const s = loadSettings()
-  if (!s.runtime.stateCache?.enabled) return null
-  return s.runtime.stateCache.folder || path.join(path.dirname(s.modelsDir ?? defaultModelsDir()), 'LLMManagerStates')
+  return s.runtime.stateCache?.folder || path.join(path.dirname(s.modelsDir ?? defaultModelsDir()), 'LLMManagerStates')
+}
+
+export function stateCacheFolder(): string | null {
+  return loadSettings().runtime.stateCache?.enabled ? stateFolderPath() : null
+}
+
+/** Where the server may save states: conversations when those are kept, the agent's instructions by default. */
+export function slotSaveFolder(): string | null {
+  const r = loadSettings().runtime
+  return r.stateCache?.enabled || r.keepInstructions !== false ? stateFolderPath() : null
 }
 
 export class LlamaRuntime extends EventEmitter {
@@ -710,7 +719,7 @@ export class LlamaRuntime extends EventEmitter {
      * be loaded back: the same file, the same context and cache types, the same server build.
      */
     this.stateDir = null
-    const stateDir = stateCacheFolder()
+    const stateDir = slotSaveFolder()
     if (stateDir) {
       try {
         fs.mkdirSync(stateDir, { recursive: true })

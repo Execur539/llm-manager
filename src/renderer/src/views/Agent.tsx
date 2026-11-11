@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AgentMessage, ToolCall, ToolResult } from '@shared/types'
 import { continuedMessage } from '@shared/continuation'
-import { invoke, fmtDuration } from '../lib/api'
+import { invoke, on, fmtDuration } from '../lib/api'
 import {
   select,
   setRunning,
@@ -204,6 +204,9 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   const refreshSessions = async (): Promise<void> => {
     setSessions(await invoke<ChatSummary[]>('chat:list', 'agent'))
   }
+
+  // The agent names its session with set_title, mid-turn, and renames it as the task moves on.
+  useEffect(() => on('chat:titled', () => void refreshSessions()), [])
 
   useEffect(() => {
     void refreshSessions()

@@ -56,6 +56,7 @@ const { planImageCopy, MAX_IMAGE_EDGE } = await import('./built/imageCopy.js')
 const { toStored, fromStored, forCaps, textOf } = await import('./built/sentContent.js')
 const { exportFilename, uniquePath } = await import('./built/filenames.js')
 const { detectReasoning, reasoningRequestFields } = await import('./built/reasoning.js')
+const { cleanTitle, TITLE_MAX } = await import('./built/title.js')
 const { findFaQuants, parseFaQuants, readFaQuants } = await import('./built/faKernels.js')
 const { hostCacheBudgetMb } = await import('./built/hostBudget.js')
 
@@ -124,6 +125,24 @@ const segmentsAddUp = (plan) =>
   !!plan?.vramSegments &&
   plan.vramSegments.length === plan.predictedVramPerGpu.length &&
   plan.vramSegments.every((s, d) => Math.abs(s.weights + s.kv + s.compute - plan.predictedVramPerGpu[d]) < 1)
+
+// ---------------------------------------------------------------- chat titles
+
+section('Titles the model gives are tidied for the sidebar')
+{
+  const cases = [
+    ['"Fixing the GPU expert cache"', 'Fixing the GPU expert cache'],
+    ['Title: **Disk space cleanup**\n\nThis chat is about disks.', 'Disk space cleanup'],
+    ['<think>\n\n</think>\n\nFixing Pandas OOM on 2GB CSV', 'Fixing Pandas OOM on 2GB CSV'],
+    ['# Rust borrow checker help.', 'Rust borrow checker help'],
+    ['  Planning a trip to Japan  ', 'Planning a trip to Japan'],
+    ['“Kochrezept für Lasagne”', 'Kochrezept für Lasagne']
+  ]
+  for (const [input, want] of cases) check(`${JSON.stringify(input).slice(0, 40)} becomes ${JSON.stringify(want)}`, cleanTitle(input) === want, cleanTitle(input))
+  check('an answer with no text gives no title', cleanTitle('\n\n  ') === '')
+  const long = cleanTitle('A very long title that the model wrote even though it was asked for six words only please')
+  check('a long title is cut at a word, within the limit', long.length <= TITLE_MAX && !long.endsWith(' ') && 'A very long title that the model wrote even though it was asked'.startsWith(long), long)
+}
 
 // ---------------------------------------------------------------- auto-fit
 
@@ -1465,6 +1484,9 @@ section('Reasoning detection')
   const c = detectReasoning(toggle)
   check('a toggle-only template is detected', c.kind === 'toggle', c.kind)
   check('a toggle exposes no levels', c.levels.length === 0)
+  // A closed pair is prefilled to skip thinking without changing the prompt start (chat titles).
+  check('a template with <think> tags says so', c.thinkTags === true)
+  check('a template without them does not', b.thinkTags === false)
 
   // Hermes-3 and friends.
   check('a plain template reports none', detectReasoning('{{ messages }}').kind === 'none')

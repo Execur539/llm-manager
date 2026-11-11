@@ -343,6 +343,23 @@ export const MIGRATIONS: { id: number; sql: string }[] = [
     ALTER TABLE chats ADD COLUMN prompt_state TEXT;
     ALTER TABLE messages ADD COLUMN follow_up TEXT;
     `
+  },
+  {
+    id: 12,
+    sql: `
+    -- Whether the user named the conversation themselves. The model names conversations and
+    -- renames them as the task becomes clearer, but never over a name the user typed.
+    --
+    -- Existing conversations count as named by the user unless their title is still a placeholder
+    -- or the start of their first message, which is all the app used to give them.
+    ALTER TABLE chats ADD COLUMN title_by_user INTEGER NOT NULL DEFAULT 0;
+    UPDATE chats SET title_by_user = 1
+      WHERE title NOT IN ('New chat', 'New session')
+        AND title <> COALESCE(
+          (SELECT substr(trim(replace(replace(replace(replace(replace(replace(m.content, char(13), ' '), char(10), ' '), char(9), ' '), '    ', ' '), '  ', ' '), '  ', ' ')), 1, 60) FROM messages m
+             WHERE m.chat_id = chats.id AND m.role = 'user' ORDER BY m.created_at, m.rowid LIMIT 1),
+          '');
+    `
   }
 ]
 

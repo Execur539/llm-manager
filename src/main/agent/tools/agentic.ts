@@ -16,6 +16,8 @@ export interface AgentToolDeps {
   canSpawn: () => boolean
   /** Put a question to the user and block until they answer. */
   askUser: (question: string, options: string[]) => Promise<string>
+  /** Rename a conversation; what to tell the model happened. */
+  setTitle: (sessionId: string, title: string) => string
 }
 
 interface TaskRow {
@@ -201,5 +203,24 @@ export function makeAgentTools(deps: AgentToolDeps): Tool[] {
     }
   }
 
-  return [delegate, addTask, completeTask, listTasks, remember, recall, forget, ask]
+  /*
+   * The model names the conversation, and keeps the name accurate.
+   *
+   * The first message is often not what the task turns out to be, so renaming is invited rather
+   * than allowed once: the title is meant to say what is being worked on now.
+   */
+  const setTitle: Tool = {
+    name: 'set_title',
+    description:
+      'Name this conversation in the sidebar: 2 to 6 words saying what the task is. Call it in ' +
+      'your first reply, and again whenever the task turns out to be something else or moves on, ' +
+      'so the name always matches the work. A name the user typed themselves is kept.',
+    tier: 'read',
+    parameters: schema({ title: str('The title, 2 to 6 words, in the language of the conversation') }, ['title']),
+    async run(args, ctx) {
+      return deps.setTitle(ctx.sessionId, String(args.title ?? ''))
+    }
+  }
+
+  return [delegate, addTask, completeTask, listTasks, remember, recall, forget, ask, setTitle]
 }

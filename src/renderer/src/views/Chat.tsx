@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
 import type { AgentMessage } from '@shared/types'
-import { invoke, fmtRelative } from '../lib/api'
+import { invoke, on, fmtRelative } from '../lib/api'
 import {
   select,
   setRunning,
@@ -104,6 +104,9 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
     void refreshChats()
     void invoke<Collection[]>('rag:collections').then(setCollections).catch(() => undefined)
   }, [])
+
+  // The model names chats in the background once a reply is in, and renames them later.
+  useEffect(() => on('chat:titled', () => void refreshChats()), [])
 
   // Reload history whenever the selected conversation changes — including on remount, which is
   // what restores the view after navigating away mid-response. The database is authoritative

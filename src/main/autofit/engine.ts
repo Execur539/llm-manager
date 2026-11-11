@@ -271,13 +271,14 @@ const MOE_FIT_MARGIN = 0.92
  *
  * Measured on Qwen3.8-Flash-Next at batch 512: 1,913 MiB of compute buffer on a card holding 43
  * such blocks against 527 MiB on one holding 5, which is 36.5 MiB per block over a fixed base.
- * That works out at about seven copies of a batch of hidden states, which is the shape the graph
- * has — so it is expressed that way rather than as the raw megabytes, and follows the batch size
- * and embedding width to other models.
+ * It does not grow in step with the batch: with all 48 blocks' experts in RAM the two cards'
+ * compute buffers measured 1.9 GiB at batch 512 and 3.8 GiB at 2048, where seven copies per token
+ * predicted 7 GB of staging alone. Fitted to both, rounded up: about 36.6 MiB per block at 512 and
+ * 64 MiB at 2048, in hidden-state copies so it follows the embedding width to other models.
  */
 function hostExpertStaging(arch: ModelArchInfo, batchSize: number): number {
   if (arch.expertCount <= 0) return 0
-  return 7 * batchSize * arch.embeddingLength * 4
+  return (2800 + 1.85 * batchSize) * arch.embeddingLength * 4
 }
 
 /**

@@ -43,6 +43,12 @@ export interface ReasoningSupport {
    * raises. Only a name found in the template's own accepted set is ever sent back to it.
    */
   offValue: string | null
+  /**
+   * Whether the template writes thinking between <think> tags. A closed pair can then be put at the
+   * start of a reply to skip thinking without changing anything before it, which every way of
+   * switching thinking off through the template does (and with it, the whole prompt is read again).
+   */
+  thinkTags?: boolean
 }
 
 export const NO_REASONING: ReasoningSupport = {
@@ -260,11 +266,12 @@ export function detectReasoning(chatTemplate: string | null | undefined): Reason
   const defaultLevel = parsedDefault && ordered.includes(parsedDefault) ? parsedDefault : (ordered.at(-1) ?? null)
 
   // One level is not a choice; treat it as a plain toggle if the template offers one.
+  const thinkTags = chatTemplate.includes('<think>')
   if (ordered.length >= 2) {
-    return { kind: 'effort', levels: ordered, defaultLevel, canDisable, offValue }
+    return { kind: 'effort', levels: ordered, defaultLevel, canDisable, offValue, thinkTags }
   }
   if (canDisable) {
-    return { kind: 'toggle', levels: [], defaultLevel: null, canDisable: true, offValue }
+    return { kind: 'toggle', levels: [], defaultLevel: null, canDisable: true, offValue, thinkTags }
   }
   return NO_REASONING
 }

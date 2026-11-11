@@ -22,7 +22,7 @@ const INDEX_FILE = path.join(APPDATA_DIR, 'model-index.json')
  * a schema version, adding a capability leaves every already-scanned model with that field
  * missing, and the gap only shows up wherever the UI happens to read it.
  */
-const INDEX_SCHEMA = 3
+const INDEX_SCHEMA = 4
 
 interface IndexEntry {
   path: string

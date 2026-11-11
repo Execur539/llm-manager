@@ -22,6 +22,8 @@ const EVENT_CHANNELS = [
   'chat:media-progress',
   'chat:context',
   'chat:message',
+  // The model named or renamed a conversation, either kind.
+  'chat:titled',
   'chat:notes',
   'chat:compacting',
   'chat:compaction-progress',

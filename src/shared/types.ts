@@ -156,6 +156,8 @@ export interface ReasoningSupport {
    * can end the thought block itself — but the level name is only ever sent when it is here.
    */
   offValue: string | null
+  /** Whether the template writes thinking between <think> tags (absent on records from before 1.7.1). */
+  thinkTags?: boolean
 }
 
 export interface ModelCapabilities {
@@ -599,6 +601,11 @@ export interface AppSettings {
     loadMode: 'auto' | 'ram' | 'mmap'
     /** CPU threads for generation; 0 lets llama.cpp choose, which counts physical cores. */
     threads: number
+    /**
+     * Keep the state of the Agent's instructions (system prompt and tools) on disk, so a freshly
+     * loaded model restores them from a file instead of reading thousands of tokens again.
+     */
+    keepInstructions: boolean
     /** CPU threads while reading prompts (`--threads-batch`); 0 = the same as generation. */
     threadsBatch: number
     /** Pin each CPU thread to its own core (OpenMP places), close together or spread out. */

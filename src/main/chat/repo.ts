@@ -6,6 +6,7 @@
  * written once.
  */
 
+import { cleanTitle } from './title'
 import crypto from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
@@ -38,6 +39,7 @@ interface ChatRow {
   context_used: number | null
   summary: string | null
   summary_upto: string | null
+  title_by_user: number
 }
 
 interface MessageRow {
@@ -108,8 +110,34 @@ export function listChats(kind?: 'chat' | 'agent'): ChatSummary[] {
   }))
 }
 
+/** A name the user gave; the model never renames over it. */
 export function renameChat(id: string, title: string): void {
-  run('UPDATE chats SET title = ?, updated_at = ? WHERE id = ?', title, Date.now(), id)
+  run('UPDATE chats SET title = ?, title_by_user = 1, updated_at = ? WHERE id = ?', title, Date.now(), id)
+}
+
+/**
+ * A name the model gave, tidied into a sidebar title.
+ *
+ * Returns the title now shown, or null when nothing changed: the user named the conversation
+ * themselves, there is no such conversation, or the model's text held no usable title.
+ */
+export function setModelTitle(id: string, text: string): string | null {
+  const title = cleanTitle(text)
+  if (!title) return null
+  const row = get<ChatRow>('SELECT * FROM chats WHERE id = ?', id)
+  if (!row || row.title_by_user || row.title === title) return null
+  // Not a change of activity, so the conversation keeps its place in the list.
+  run('UPDATE chats SET title = ? WHERE id = ?', title, id)
+  return title
+}
+
+/** What deciding whether to ask the model for a title needs. */
+export function titleState(id: string): { title: string; byUser: boolean; userTurns: number } | null {
+  const row = get<ChatRow & { turns: number }>(
+    "SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id AND m.role = 'user') AS turns FROM chats c WHERE id = ?",
+    id
+  )
+  return row ? { title: row.title, byUser: !!row.title_by_user, userTurns: row.turns } : null
 }
 
 export function deleteChat(id: string): void {
@@ -330,8 +358,9 @@ export function autoTitle(chatId: string): void {
     chatId
   )
   if (!first) return
+  // A stand-in until the model names it, so it is not marked as a name the user chose.
   const title = first.content.replace(/\s+/g, ' ').trim().slice(0, 60)
-  if (title) renameChat(chatId, title)
+  if (title) run('UPDATE chats SET title = ?, updated_at = ? WHERE id = ?', title, Date.now(), chatId)
 }
 
 // ---------------------------------------------------------------- attachments
