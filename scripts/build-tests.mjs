@@ -32,7 +32,10 @@ await build({
     roots: path.join(ROOT, 'src/main/models/roots.ts'),
     library: path.join(ROOT, 'src/main/models/library.ts'),
     history: path.join(ROOT, 'src/main/agent/history.ts'),
-    credentialRefs: path.join(ROOT, 'src/main/agent/credential-refs.ts')
+    credentialRefs: path.join(ROOT, 'src/main/agent/credential-refs.ts'),
+    reuseMeter: path.join(ROOT, 'src/main/runtime/reuse-meter.ts'),
+    promptState: path.join(ROOT, 'src/main/agent/prompt-state.ts'),
+    stateCache: path.join(ROOT, 'src/main/runtime/state-cache.ts')
   },
   outdir: path.join(ROOT, 'scripts/built'),
   bundle: true,

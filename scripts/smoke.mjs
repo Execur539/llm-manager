@@ -1597,6 +1597,161 @@ section('Reasoning: a choice the model cannot express')
   check('null stays null', sendableChoice(levels, null) === null)
 }
 
+section('Prompt reuse: why a conversation was read again')
+{
+  const { shapeOf, explainReread, extendsPrevious, isLargeReread } = await import('./built/reuseMeter.js')
+  const tools = [{ name: 'read_file', description: 'Read a file', tier: 'read', parameters: {} }]
+  const sys = (date) => ({ role: 'system', content: `You are the agent.\nToday's date: ${date}` })
+  const u1 = { role: 'user', content: 'Why is the network down?' }
+  const a1 = { role: 'assistant', content: 'The adapter is disabled.' }
+  const u2 = { role: 'user', content: 'Fix it.' }
+  const first = shapeOf({ cacheKey: 'agent:s1', messages: [sys('2026-11-10'), u1], tools, reasoningEffort: 'xhigh' })
+  const next = (over = {}) =>
+    shapeOf({ cacheKey: 'agent:s1', messages: [sys('2026-11-10'), u1, a1, u2], tools, reasoningEffort: 'xhigh', ...over })
+
+  check('a turn that only adds messages reuses everything before them', extendsPrevious(first, next()))
+  check('nothing is reusable before the first request', !extendsPrevious(null, next()))
+  check('a changed effort level is named', /effort level/.test(explainReread(first, next({ reasoningEffort: 'low' })).reason))
+  check('a switched-off thinking flag is named the same way',
+    /effort level or thinking/.test(explainReread(first, next({ chatTemplateKwargs: { enable_thinking: false } })).reason))
+  check('a changed tool list is named',
+    explainReread(first, next({ tools: [...tools, { name: 'x', description: '', tier: 'read', parameters: {} }] })).reason === 'the list of tools changed')
+  const dated = explainReread(first, next({ messages: [sys('2026-11-11'), u1, a1, u2] }))
+  check('a changed system prompt is named, with where it changed', dated.reason === 'the system prompt changed' && /2026-11-10/.test(dated.detail) && /2026-11-11/.test(dated.detail), JSON.stringify(dated))
+  check('an earlier message sent differently is named by its position',
+    /message 2 of the conversation \(user\)/.test(explainReread(first, next({ messages: [sys('2026-11-10'), { role: 'user', content: 'Why is it down?' }, a1, u2] })).reason))
+  check('another conversation having been in memory is named',
+    explainReread(first, shapeOf({ cacheKey: 'agent:s2', messages: [sys('2026-11-10'), { role: 'user', content: 'Hello' }], tools, reasoningEffort: 'xhigh' })).reason === 'a different conversation was in memory')
+  check('a conversation cut back is named',
+    explainReread(next(), first).reason === 'the conversation was cut back to an earlier point')
+  check('when nothing sent differs, the server is the one that lost it', /server no longer held/.test(explainReread(first, next()).reason))
+
+  // Media is compared without holding megabytes of it.
+  const img = (data) => ({ role: 'user', content: [{ type: 'image_url', image_url: { url: `data:image/png;base64,${data}` } }, { type: 'text', text: 'look' }] })
+  const withA = shapeOf({ messages: [img('A'.repeat(5000))] })
+  check('the same image is the same', extendsPrevious(withA, shapeOf({ messages: [img('A'.repeat(5000)), a1] })))
+  check('a different image is different', !extendsPrevious(withA, shapeOf({ messages: [img('B'.repeat(5000)), a1] })))
+  check('an image signature stays small', withA.messages[0].length < 400, String(withA.messages[0].length))
+
+  check('a few hundred tokens is not worth a notice', !isLargeReread(800, 50000))
+  check('a small share of a long prompt is not either', !isLargeReread(3000, 50000))
+  check('thousands of tokens and a real share is', isLargeReread(30000, 50000))
+}
+
+section('Agent prompt: what never changes, and what is told once')
+{
+  const { factsBlock, factsUpdate, noteFor, toldFacts, withNote, afterSummary, parsePromptState } = await import('./built/promptState.js')
+  const facts = (over = {}) => ({ cwd: 'D:\\work', scratch: 'C:\\Temp\\scratch', admin: false, date: '2026-11-10', memories: ['Prefers PowerShell'], planMode: false, ...over })
+  const fresh = { system: 'SYSTEM', tools: [], announced: [] }
+
+  const first = noteFor(fresh, facts(), new Set(), false, 'u1')
+  check('the first message carries the whole of it',
+    /Working directory: D:\\work/.test(first.note) && /Today's date: 2026-11-10/.test(first.note) && /- Prefers PowerShell/.test(first.note) && !/Plan mode/.test(first.note), first.note)
+  check('and says it is from the app', /not written by the user/.test(first.note))
+  check('what was told is recorded against the message that told it', first.state.announced.length === 1 && first.state.announced[0].messageId === 'u1')
+
+  const live = new Set(['u1', 'a1'])
+  const same = noteFor(first.state, facts(), live, false, 'u2')
+  check('a turn with nothing new carries nothing', same.note === null && same.state === first.state)
+
+  const nextDay = noteFor(first.state, facts({ date: '2026-11-11' }), live, false, 'u2')
+  check('a new date is told on its own', /date is now 2026-11-11/.test(nextDay.note) && !/Working directory/.test(nextDay.note), nextDay.note)
+  const after = noteFor(nextDay.state, facts({ date: '2026-11-11' }), new Set(['u1', 'a1', 'u2']), false, 'u3')
+  check('and only once', after.note === null)
+
+  const plan = factsUpdate(facts(), facts({ planMode: true }))
+  check('plan mode switching on is told, with what it means', /Plan mode is ON/.test(plan) && /refused/.test(plan), plan)
+  check('and switching off', /Plan mode is now off/.test(factsUpdate(facts({ planMode: true }), facts())))
+  check('a session started in plan mode is told in its first message', /Plan mode is ON/.test(factsBlock(facts({ planMode: true }))))
+  const mem = factsUpdate(facts(), facts({ memories: ['Prefers PowerShell', 'Router is at 192.168.1.1'] }))
+  check('a new remembered note sends the list in full', /in full/.test(mem) && /Router is at/.test(mem) && /Prefers PowerShell/.test(mem), mem)
+  check('an emptied list is said to be empty', /now empty/.test(factsUpdate(facts(), facts({ memories: [] }))))
+  check('nothing changed is nothing to say', factsUpdate(facts(), facts()) === null)
+
+  // The message that told the model something can be edited away or rewound past.
+  check('with the telling message gone, the model has been told nothing', toldFacts(nextDay.state, new Set(['x']), false) === null)
+  check('with only the update gone, it believes the first telling', toldFacts(nextDay.state, live, false).date === '2026-11-10')
+  const retold = noteFor(nextDay.state, facts({ date: '2026-11-11' }), new Set(), false, 'u9')
+  check('so the whole of it is told again, and dead records are dropped',
+    /Working directory/.test(retold.note) && retold.state.announced.length === 1 && retold.state.announced[0].messageId === 'u9')
+
+  // Behind a summary, what stands is what had been told when it was written.
+  const summarised = afterSummary(nextDay.state, facts({ date: '2026-11-11' }), new Set(['u5']))
+  check('a summary keeps what had been told', summarised.summaryFacts.date === '2026-11-11' && summarised.announced.length === 0)
+  check('which the next message then has no need to repeat', noteFor(summarised, facts({ date: '2026-11-11' }), new Set(['u5']), true, 'u6').note === null)
+  check('but without the summary there is nothing standing', toldFacts(summarised, new Set(['u5']), false) === null)
+
+  check('the note goes above the message', withNote('NOTE', 'hello') === 'NOTE\n\nhello' && withNote(null, 'hello') === 'hello')
+  const round = parsePromptState(JSON.stringify(nextDay.state))
+  check('stored state reads back', round.system === 'SYSTEM' && round.announced.length === 2)
+  check('anything else reads back as nothing', parsePromptState('{"system":1}') === null && parsePromptState('not json') === null && parsePromptState(null) === null)
+}
+
+section('Agent history: what the loop said after a reply is sent again')
+{
+  const { rebuildHistory } = await import('./built/history.js')
+  const out = rebuildHistory([
+    { id: 'u1', role: 'user', content: 'Check the log.', createdAt: 0 },
+    { id: 'a1', role: 'assistant', content: 'Let me check the event log.', followUp: 'Call it now.', createdAt: 0 },
+    { id: 't1', role: 'tool', content: 'log', toolCalls: [{ id: 'c1', name: 'run_command', args: { command: 'Get-EventLog' }, batch: 'b1' }], createdAt: 0 },
+    { id: 'a2', role: 'assistant', content: 'Nothing unusual.', createdAt: 0 }
+  ], { preserveReasoning: false })
+  const shape = out.map((m) => `${m.role}${m.tool_calls?.length ? '[call]' : ''}`).join(' ')
+  check('it follows the reply it answered, and the call after it gets a turn of its own',
+    shape === 'user assistant user assistant[call] tool assistant' && out[2].content === 'Call it now.', shape)
+}
+
+section('Saved conversation states: what is kept, and what goes first')
+{
+  const sc = await import('./built/stateCache.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'llmm-states-'))
+  try {
+    check('a file name is plain and the same every time',
+      /^state-[0-9a-f]{20}$/.test(sc.fileStem('agent:abc')) && sc.fileStem('agent:abc') === sc.fileStem('agent:abc') && sc.fileStem('agent:abc') !== sc.fileStem('chat:abc'))
+    check('text is not media', !sc.hasMedia([{ role: 'user', content: 'hi' }, { role: 'user', content: [{ type: 'text', text: 'hi' }] }]))
+    check('an image is', sc.hasMedia([{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA' } }] }]))
+
+    const put = (key, bytes, usedAt) => {
+      fs.writeFileSync(path.join(dir, `${sc.fileStem(key)}.bin`), 'x')
+      fs.writeFileSync(path.join(dir, `${sc.fileStem(key)}.json`),
+        JSON.stringify({ key, fingerprint: 'f', prefixChars: 1, prefixHash: 'h', tokens: 1, bytes, savedAt: usedAt, usedAt }))
+    }
+    put('chat:old', 40, 1)
+    put('chat:pinned', 40, 2)
+    put('chat:new', 40, 3)
+    // A record without its state, and a state without its record, are neither of them a saved state.
+    fs.writeFileSync(path.join(dir, `${sc.fileStem('chat:orphan')}.json`), JSON.stringify({ key: 'chat:orphan', bytes: 40, usedAt: 0 }))
+    fs.writeFileSync(path.join(dir, `${sc.fileStem('chat:norecord')}.bin`), 'x')
+    fs.writeFileSync(path.join(dir, 'pins.json'), '["chat:pinned"]')
+
+    check('only whole states are listed', sc.listStates(dir).map((s) => s.key).sort().join() === 'chat:new,chat:old,chat:pinned')
+    check('a state is read back by its conversation', sc.readMeta(dir, 'chat:new')?.bytes === 40 && sc.readMeta(dir, 'chat:orphan') === null)
+    check('nothing goes while the folder is within its budget', sc.prune(dir, 120, new Set(['chat:pinned'])).length === 0)
+    const removed = sc.prune(dir, 80, new Set(['chat:pinned']))
+    check('over it, the least recently used goes first', removed.join() === 'chat:old', removed.join())
+    const again = sc.prune(dir, 10, new Set(['chat:pinned']))
+    check('a pinned one never goes, whatever the budget', again.join() === 'chat:new' && sc.readMeta(dir, 'chat:pinned') !== null, again.join())
+    sc.removeState(dir, 'chat:pinned')
+    check('removing takes the state and its record', sc.listStates(dir).length === 0)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+section('Summarising a conversation from inside it')
+{
+  const { inPlaceInstruction, hasRoomInPlace, usableSummary, IN_PLACE_ROOM_TOKENS } = await import('./built/compaction.js')
+  check('the instruction says it is the app speaking, and forbids tools',
+    /not written by the user/.test(inPlaceInstruction('agent')) && /do not call any tools/.test(inPlaceInstruction('agent')))
+  check('an agent session is asked for files and commands', /commands run/.test(inPlaceInstruction('agent')) && !/commands run/.test(inPlaceInstruction('chat')))
+  check('there is room when the reply and the instruction fit', hasRoomInPlace(100000, 131072))
+  check('and none when they would not', !hasRoomInPlace(131072 - IN_PLACE_ROOM_TOKENS, 131072) && !hasRoomInPlace(10, 0))
+  const real = Array.from({ length: 60 }, (_, i) => `The user asked for change ${i} and file${i}.ts was edited.`).join(' ')
+  check('an account of the work is usable', usableSummary(real))
+  check('a stub is not', !usableSummary('I cannot summarise this conversation.'))
+  check('a reply stuck repeating itself is not', !usableSummary(Array.from({ length: 80 }, () => 'The file was edited and then the file was edited.').join('\n')))
+}
+
 section('Export filenames')
 {
   const F = (t) => exportFilename(t, 'fallback')

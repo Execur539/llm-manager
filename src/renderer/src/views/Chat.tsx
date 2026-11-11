@@ -31,6 +31,7 @@ import PromptProgress from '../components/PromptProgress'
 import MediaStage from '../components/MediaStage'
 import ContextMeter from '../components/ContextMeter'
 import CompactingNotice from '../components/CompactingNotice'
+import KeepReadyButton from '../components/KeepReadyButton'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
@@ -263,6 +264,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               Compact
             </button>
           )}
+          <KeepReadyButton stateKey={activeId ? `chat:${activeId}` : null} />
           {activeId && (
             <button
               onClick={() => {
@@ -414,6 +416,13 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onPaste={attachments.paste}
+              // Clicking in to type is the earliest sign a message is coming: the model starts
+              // reading the conversation now, if it is not already holding it, rather than at Send.
+              onFocus={() => {
+                if (!loaded || busy || !activeId) return
+                const effort = sendableChoice(loaded?.caps?.reasoning, stream.reasoning[effortId] ?? null)
+                void invoke('chat:warm', activeId, effort).catch(() => undefined)
+              }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()

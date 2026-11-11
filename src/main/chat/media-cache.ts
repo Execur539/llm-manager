@@ -69,6 +69,30 @@ export function sentContentFor(messageId: string, caps: ModelCapabilities | unde
   return typeof content === 'string' ? content : forCaps(content, caps)
 }
 
+/**
+ * What a message sent, with the words the user typed replaced by new ones.
+ *
+ * For a message edited after it was sent. What it sent is often more than those words, a note
+ * from the app above them or files beside them, and a rebuilt history sends the record rather
+ * than the transcript: left alone, the model was sent the old words again. Undefined when the
+ * message sent only its text, or the old words are not where they are expected to be.
+ */
+export function sentWithText(messageId: string, oldText: string, newText: string): string | ContentPart[] | undefined {
+  const content = cache.get(messageId)
+  if (!content || !oldText) return undefined
+  if (typeof content === 'string') {
+    return content.endsWith(oldText) ? content.slice(0, content.length - oldText.length) + newText : undefined
+  }
+  for (let i = content.length - 1; i >= 0; i--) {
+    const part = content[i]
+    if (part.type !== 'text' || !part.text?.endsWith(oldText)) continue
+    const copy = [...content]
+    copy[i] = { ...part, text: part.text.slice(0, part.text.length - oldText.length) + newText }
+    return copy
+  }
+  return undefined
+}
+
 /** The text of what a message sent, attached documents included, when more than its stored text. */
 export function sentTextFor(messageId: string): string | undefined {
   const content = cache.get(messageId)

@@ -18,11 +18,14 @@ import net from 'node:net'
 import os from 'node:os'
 import { EventEmitter } from 'node:events'
 import type { Backend, FitPlan, ModelRecord, ToolDefinition } from '@shared/types'
+import { explainReread, extendsPrevious, isLargeReread, shapeOf, type RereadReport, type SentShape } from './reuse-meter'
 import path from 'node:path'
+import fs from 'node:fs'
+import crypto from 'node:crypto'
 import { app } from 'electron'
 import { childEnv, llamaServerPath } from './binaries'
 import { hostCacheBudgetMb } from './host-budget'
-import { TOOL_OUTPUT_DIR } from '../storage/paths'
+import { TOOL_OUTPUT_DIR, defaultModelsDir } from '../storage/paths'
 import { loadSettings } from '../storage/settings'
 import { nglFor } from '../autofit/engine'
 import { logger } from '../log'
@@ -145,6 +148,29 @@ export interface CompletionOptions extends SamplingOptions {
    * false alongside it.
    */
   continueFinal?: boolean
+  /**
+   * The conversation this request belongs to.
+   *
+   * Sent nowhere. It is how a prompt that had to be read again is traced to its cause, and how a
+   * conversation is known to be the one the server still holds.
+   */
+  cacheKey?: string
+  /**
+   * Read the prompt and stop, without writing a reply.
+   *
+   * The server still samples one token, which is thrown away. What is kept is its cache: the
+   * conversation is read now, while nobody is waiting, instead of when the next message is sent.
+   */
+  processOnly?: boolean
+  /**
+   * Forbid tool calls while still sending the tools.
+   *
+   * Leaving the tools out would change the start of the prompt, and the whole conversation
+   * would be read again; the server keeps them in the prompt and refuses to call them.
+   */
+  toolChoice?: 'none'
+  /** Work done while nobody is waiting; any other request stops it and goes first. */
+  background?: boolean
   signal?: AbortSignal
 }
 
@@ -241,11 +267,33 @@ export interface Timings {
 }
 
 
+/**
+ * Where conversations' saved states are kept, or null when keeping them is switched off.
+ *
+ * Beside the models folder unless a folder is named: states are gigabytes, and the models folder
+ * is on the drive that was chosen for holding gigabytes.
+ */
+export function stateCacheFolder(): string | null {
+  const s = loadSettings()
+  if (!s.runtime.stateCache?.enabled) return null
+  return s.runtime.stateCache.folder || path.join(path.dirname(s.modelsDir ?? defaultModelsDir()), 'LLMManagerStates')
+}
+
 export class LlamaRuntime extends EventEmitter {
   private child: ChildProcess | null = null
   private current: LoadedModel | null = null
   private starting: Promise<LoadedModel> | null = null
   private lastTimings: Timings | null = null
+  /** What the last request sent, which is what the server's cache now holds. */
+  private lastShape: SentShape | null = null
+  /** Whether that request only read a conversation ahead of its next message. */
+  private lastWasReadAhead = false
+  /** The folder the running server was started able to save states into, if it was. */
+  private stateDir: string | null = null
+  /** What a saved state must match to be loaded: this model, loaded this way, by this server build. */
+  private stateFingerprint = ''
+  /** Work running while nobody waits, and how to stop it. */
+  private idleJob: { abort: AbortController; done: Promise<void> } | null = null
   /** Cleared whenever the loaded model changes; see modalities(). */
   private modalityCache: { vision: boolean; audio: boolean; video: boolean } | null = null
 
@@ -255,6 +303,74 @@ export class LlamaRuntime extends EventEmitter {
 
   get timings(): Timings | null {
     return this.lastTimings
+  }
+
+  /**
+   * Whether sending this would only add to what the server already holds.
+   *
+   * After a conversation has been read ahead, what the server holds ends in a stand-in for the
+   * next message. That stand-in is not part of the conversation, so it is left out of the
+   * comparison: a conversation already read ahead is not read ahead a second time.
+   */
+  holds(next: Parameters<typeof shapeOf>[0]): boolean {
+    const held = this.lastShape
+    if (!held) return false
+    const base = this.lastWasReadAhead ? { ...held, messages: held.messages.slice(0, -1) } : held
+    return extendsPrevious(base, shapeOf(next))
+  }
+
+  /**
+   * Record that the server now holds exactly this conversation.
+   *
+   * After a state is saved or loaded nothing was sent through `streamEvents`, so nothing else
+   * would know, and the conversation would be read ahead again the moment it was opened.
+   */
+  assumeHeld(req: Parameters<typeof shapeOf>[0]): void {
+    this.lastShape = shapeOf(req)
+    this.lastWasReadAhead = false
+  }
+
+  /** Where and under what identity states are saved, when the running server can save them. */
+  get stateStore(): { base: string; dir: string; fingerprint: string } | null {
+    const loaded = this.current
+    if (!loaded || !this.stateDir) return null
+    return { base: `http://127.0.0.1:${loaded.port}`, dir: this.stateDir, fingerprint: this.stateFingerprint }
+  }
+
+  /** The conversation the server's cache belongs to, when the last request named one. */
+  get heldKey(): string | undefined {
+    return this.lastShape?.key
+  }
+
+  /**
+   * Run something while nobody is waiting on the model.
+   *
+   * One at a time, and never in the way: the next ordinary request stops it and waits for it to
+   * unwind before starting, so warming a conversation can never delay the message it was for.
+   */
+  async runIdle(job: (signal: AbortSignal) => Promise<void>): Promise<void> {
+    await this.preemptIdle()
+    const abort = new AbortController()
+    const done = job(abort.signal).catch((err) => {
+      if (!abort.signal.aborted) logger.warn('prompt', 'background work failed', err)
+    })
+    const entry = { abort, done }
+    this.idleJob = entry
+    await done
+    if (this.idleJob === entry) this.idleJob = null
+  }
+
+  /** Stop background work, if any, and wait until it has let go of the server. */
+  async preemptIdle(): Promise<void> {
+    const job = this.idleJob
+    if (!job) return
+    this.idleJob = null
+    job.abort.abort()
+    await job.done
+  }
+
+  get idleBusy(): boolean {
+    return this.idleJob !== null
   }
 
   /**
@@ -552,6 +668,47 @@ export class LlamaRuntime extends EventEmitter {
     const port = await freePort()
     const args = this.buildArgs(model, plan, port)
 
+    /*
+     * Saved states, when they are switched on.
+     *
+     * The server writes and reads them itself, into a folder it is given at start, so the
+     * setting takes effect with the next load. The fingerprint is what a state has to match to
+     * be loaded back: the same file, the same context and cache types, the same server build.
+     */
+    this.stateDir = null
+    const stateDir = stateCacheFolder()
+    if (stateDir) {
+      try {
+        fs.mkdirSync(stateDir, { recursive: true })
+        args.push('--slot-save-path', stateDir)
+        const stamp = (file: string): string => {
+          try {
+            const st = fs.statSync(file)
+            return `${st.size}:${Math.round(st.mtimeMs)}`
+          } catch {
+            return 'missing'
+          }
+        }
+        this.stateFingerprint = crypto
+          .createHash('sha256')
+          .update(
+            JSON.stringify([
+              model.path,
+              stamp(model.path),
+              plan.contextLength,
+              plan.kvType,
+              plan.kvTypeV ?? plan.kvType,
+              model.caps.mmprojPath ?? null,
+              stamp(llamaServerPath(backend))
+            ])
+          )
+          .digest('hex')
+        this.stateDir = stateDir
+      } catch (err) {
+        logger.warn('model', `conversation states cannot be kept in ${stateDir}`, err)
+      }
+    }
+
     this.emit('status', { phase: 'starting', model: model.filename, args })
 
     // Test mode: swap in a stand-in server that speaks the same HTTP surface. Everything
@@ -597,6 +754,7 @@ export class LlamaRuntime extends EventEmitter {
       const wasLoaded = this.current?.port === port
       if (wasLoaded) this.current = null
       this.modalityCache = null
+      this.lastShape = null
       this.child = null
 
       /*
@@ -651,6 +809,7 @@ export class LlamaRuntime extends EventEmitter {
     const loaded: LoadedModel = { model, plan, port, startedAt: Date.now(), visionUnavailable }
     this.current = loaded
     this.modalityCache = null
+    this.lastShape = null
     this.emit('status', { phase: 'ready', model: model.filename, port })
     return loaded
   }
@@ -685,12 +844,14 @@ export class LlamaRuntime extends EventEmitter {
     const child = this.child
     if (!child) {
       this.current = null
-    this.modalityCache = null
+      this.modalityCache = null
+      this.lastShape = null
       return
     }
     this.child = null
     this.current = null
     this.modalityCache = null
+    this.lastShape = null
     await new Promise<void>((resolve) => {
       // Cleared when the child goes quietly, so a normal unload does not leave a four-second
       // timer holding the event loop open behind it — which on quit is four seconds of the
@@ -761,8 +922,10 @@ export class LlamaRuntime extends EventEmitter {
         type: 'function',
         function: { name: t.name, description: t.description, parameters: t.parameters }
       }))
-      body.tool_choice = 'auto'
+      body.tool_choice = opts.toolChoice ?? 'auto'
     }
+    // Zero is a real limit to the server: it reads the prompt, samples once and stops.
+    if (opts.processOnly) body.max_tokens = 0
     return body
   }
 
@@ -795,6 +958,16 @@ export class LlamaRuntime extends EventEmitter {
     let contextSentAt = 0
     /** At most twice a second: often enough to look live, rarely enough not to flood the bridge. */
     const CONTEXT_INTERVAL_MS = 500
+
+    // Anything a person is waiting for goes ahead of work done to save them waiting later.
+    if (!opts.background) await this.preemptIdle()
+
+    const shape = shapeOf(opts)
+    const previous = this.lastShape
+    this.lastShape = shape
+    this.lastWasReadAhead = !!opts.processOnly
+    /** Prompt tokens the server took from its cache; known from the first progress frame. */
+    let reusedTokens: number | null = null
 
     const res = await fetch(`http://127.0.0.1:${loaded.port}/v1/chat/completions`, {
       method: 'POST',
@@ -898,6 +1071,10 @@ export class LlamaRuntime extends EventEmitter {
               cached: pp.cache ?? 0,
               percent: Math.round((processed / pp.total) * 100)
             }
+            if (reusedTokens === null) {
+              reusedTokens = pp.cache ?? 0
+              this.reportReuse(previous, shape, reusedTokens, pp.total, !!opts.processOnly)
+            }
             /*
              * The prompt total is the context this turn starts from, and it is known here —
              * before a single token has been generated. Reporting it now means the reading is
@@ -1000,6 +1177,29 @@ export class LlamaRuntime extends EventEmitter {
         /* already closed */
       }
     }
+  }
+
+  /**
+   * Say how much of a prompt was read and how much was reused, and why when a lot was read.
+   *
+   * Reported as soon as the server says how much it kept, which is before it has read the rest:
+   * the explanation is most useful during the wait it explains.
+   */
+  private reportReuse(previous: SentShape | null, shape: SentShape, reused: number, total: number, warming: boolean): void {
+    const read = Math.max(0, total - reused)
+    const what = warming ? 'warming' : 'prompt'
+    if (!isLargeReread(read, total)) {
+      logger.info('prompt', `${what}: read ${read} of ${total} tokens, ${reused} reused`, { key: shape.key })
+      return
+    }
+    const why = explainReread(previous, shape)
+    const report: RereadReport = { read, reused, total, reason: why.reason, detail: why.detail, key: shape.key }
+    logger.warn('prompt', `${what}: read ${read} of ${total} tokens again, ${reused} reused: ${why.reason}`, {
+      key: shape.key,
+      detail: why.detail
+    })
+    // Warming is the app reading ahead on purpose; only a wait someone sat through is worth a notice.
+    if (!warming) this.emit('reread', report)
   }
 
   /** Text-only stream, for plain chat where tool calls are not wanted. */

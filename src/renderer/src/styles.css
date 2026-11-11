@@ -2079,6 +2079,12 @@ button.tiny {
   flex-shrink: 0;
 }
 
+/* A conversation's controls go onto a second line in a narrow window rather than off its edge. */
+.row.head.chat-head {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
 .error-card {
   border-color: #5c2626;
 }

@@ -50,6 +50,7 @@ interface MessageRow {
   plan: string | null
   tool_calls: string | null
   tool_result: string | null
+  follow_up: string | null
   created_at: number
 }
 
@@ -150,8 +151,8 @@ export function appendMessage(chatId: string, message: AgentMessage): void {
      * upsert kept them.
      */
     run(
-      `INSERT INTO messages (id, chat_id, parent_id, role, content, reasoning, plan, tool_calls, tool_result, created_at)
-       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO messages (id, chat_id, parent_id, role, content, reasoning, plan, tool_calls, tool_result, follow_up, created_at)
+       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          chat_id = excluded.chat_id,
          role = excluded.role,
@@ -160,6 +161,7 @@ export function appendMessage(chatId: string, message: AgentMessage): void {
          plan = excluded.plan,
          tool_calls = excluded.tool_calls,
          tool_result = excluded.tool_result,
+         follow_up = excluded.follow_up,
          created_at = excluded.created_at`,
       message.id,
       chatId,
@@ -169,6 +171,7 @@ export function appendMessage(chatId: string, message: AgentMessage): void {
       message.plan ?? null,
       message.toolCalls ? JSON.stringify(message.toolCalls) : null,
       message.toolResult ? JSON.stringify(message.toolResult) : null,
+      message.followUp ?? null,
       message.createdAt
     )
     run('UPDATE chats SET updated_at = ? WHERE id = ?', Date.now(), chatId)
@@ -193,6 +196,7 @@ export function loadMessages(chatId: string): AgentMessage[] {
     plan: r.plan ?? undefined,
     toolCalls: r.tool_calls ? JSON.parse(r.tool_calls) : undefined,
     toolResult: r.tool_result ? JSON.parse(r.tool_result) : undefined,
+    followUp: r.follow_up ?? undefined,
     createdAt: r.created_at
   }))
 }
@@ -289,6 +293,19 @@ export function setContextUsed(chatId: string, tokens: number): void {
 export function mostRecentAgentSession(): ChatSummary | null {
   const rows = listChats('agent')
   return rows.length ? rows[0] : null
+}
+
+/**
+ * The system prompt and tools an agent conversation first sent, and what it has told the model
+ * about the session since, as JSON. See agent/prompt-state.
+ */
+export function getPromptState(chatId: string): string | null {
+  return get<{ prompt_state: string | null }>('SELECT prompt_state FROM chats WHERE id = ?', chatId)?.prompt_state ?? null
+}
+
+/** Null forgets it, so the next turn fixes the prompt and tools of the moment instead. */
+export function setPromptState(chatId: string, state: string | null): void {
+  run('UPDATE chats SET prompt_state = ? WHERE id = ?', state, chatId)
 }
 
 export function setChatCwd(chatId: string, cwd: string): void {

@@ -9,6 +9,7 @@
 
 import { app, dialog, shell, BrowserWindow } from 'electron'
 import path from 'node:path'
+import os from 'node:os'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import type {
@@ -25,7 +26,8 @@ import type {
   PermissionDecision,
   PermissionRequest,
   AttachmentInfo,
-  AgentMessage
+  AgentMessage,
+  AgentSessionState
 } from '@shared/types'
 import { defaultModelsDir, exeDir, TOOL_OUTPUT_DIR } from './storage/paths'
 import { loadSettings, patchSettings } from './storage/settings'
@@ -35,6 +37,9 @@ import { isInside, libraryRoots } from './models/roots'
 import { checkRelocation, keepInPlace, performMove } from './models/relocation'
 import { DEFAULT_CONSTRAINTS, gpuKey, learnHeadroom, planFit, usableDevices, verifyPrediction } from './autofit/engine'
 import { llama, estimateTokens, type ChatMessage, type ContentPart, type CompletionOptions } from './runtime/llama'
+import type { RereadReport } from './runtime/reuse-meter'
+import { listStates, prune, readMeta, removeState, restoreState, saveState } from './runtime/state-cache'
+import { stateCacheFolder } from './runtime/llama'
 import { missingBinaries, embeddingModelPath, vendorDiagnostics, llamaServerPath } from './runtime/binaries'
 import { cudaKvPairs, MATCHED_KV_PAIRS } from './runtime/fa-kernels'
 import { deleteLogin, listLogins, saveLogin } from './agent/credentials'
@@ -49,8 +54,9 @@ import { searchModels, listFiles, groupVariants, recommendQuant, findMmprojFor, 
 import { summarizer, type SummarizerHandle } from './runtime/summarizer'
 import { chooseHelperPlacement, helperContext, helperVramNeed, keepRecent, type TranscriptItem } from './agent/compaction'
 import { summariseTranscript, COMPACTION_FAILED } from './agent/summarise'
+import { summariseInPlace } from './agent/summarise-in-place'
 import { samplingOptions } from '../shared/sampling'
-import { persistSent, restoreSent, sentContentFor, sentTextFor } from './chat/media-cache'
+import { persistSent, restoreSent, sentContentFor, sentTextFor, sentWithText } from './chat/media-cache'
 import {
   adoptAttachments,
   deleteConversationFiles,
@@ -204,6 +210,235 @@ let emit: Emitter = () => undefined
 
 export function setEmitter(fn: Emitter): void {
   emit = fn
+}
+
+/*
+ * A long wait before a reply is explained where it happens.
+ *
+ * The log has every request's count; this is for the one the person just sat through. Only the
+ * agent view has somewhere to say it, and a sub-agent's reading is its parent's business.
+ */
+llama.on('reread', (r: RereadReport) => {
+  if (!r.key?.startsWith('agent:') || r.key.startsWith('agent:sub-')) return
+  emit('agent:notice', {
+    sessionId: r.key.slice('agent:'.length),
+    message: `Read ${r.read.toLocaleString()} of ${r.total.toLocaleString()} tokens again before this reply: ${r.reason}.`
+  })
+})
+
+/** Stands in for the next message while a conversation is read ahead of it. */
+const STAND_IN: ChatMessage = { role: 'user', content: '.' }
+
+/** Whether the model is free to read ahead: loaded, allowed to, and nobody waiting on it. */
+function canWarm(): boolean {
+  return (
+    !!llama.loaded &&
+    loadSettings().runtime.warmConversations !== false &&
+    !agentTurnAbort &&
+    inFlightChats.size === 0 &&
+    !llama.idleBusy
+  )
+}
+
+/**
+ * Read a conversation into the model now, so its next message only has to add to it.
+ *
+ * The request is the one the next turn will send, with a stand-in where the new message goes
+ * and no reply asked for. The server checkpoints at the start of the last user message, so the
+ * real message replaces the stand-in and everything before it is already read. Does nothing
+ * when the server already holds the conversation. Returns whether anything was started.
+ */
+function warm(req: CompletionOptions): boolean {
+  if (!req.messages.length || llama.holds(req)) return false
+  void llama.runIdle(async (signal) => {
+    // What the server holds now is about to be replaced; keep it first if states are kept.
+    await parkHeld(req.cacheKey ?? null, signal)
+    if (signal.aborted) return
+    // A kept state is a file read; reading the conversation is the fallback.
+    if (await restoreSaved(req, signal)) return
+    await readAhead(req, signal)
+  })
+  return true
+}
+
+/** The effort each conversation was last sent with; its state is saved and loaded under the same one. */
+const lastEffort = new Map<string, ReasoningChoice | null>()
+
+/** The request a conversation's next turn starts from, for a key such as chat:<id> or agent:<id>. */
+async function conversationRequest(key: string): Promise<CompletionOptions | null> {
+  const effort = effortFields(lastEffort.get(key))
+  if (key.startsWith('chat:')) {
+    const id = key.slice('chat:'.length)
+    const history = chats.loadMessages(id)
+    if (!history.length) return null
+    await restoreConversationMedia(id, history)
+    return { messages: chatMessagesFor(id, history, loadSettings().reasoning.preserve), cacheKey: key, ...effort }
+  }
+  if (key.startsWith('agent:')) {
+    const session = chats.loadSession(key.slice('agent:'.length))
+    if (!session?.messages.length) return null
+    await restoreConversationMedia(session.id, session.messages)
+    const a = getAgent()
+    return { messages: a.buildHistory(session), tools: a.toolsFor(session), cacheKey: key, ...effort }
+  }
+  return null
+}
+
+/** Conversations whose saved state is never removed to make room. */
+function statePins(dir: string): Set<string> {
+  try {
+    const pins = JSON.parse(fs.readFileSync(path.join(dir, 'pins.json'), 'utf8')) as unknown
+    return new Set(Array.isArray(pins) ? pins.filter((p): p is string => typeof p === 'string') : [])
+  } catch {
+    return new Set()
+  }
+}
+
+/**
+ * Save what the server holds before it is lost, when that is a conversation other than `nextKey`.
+ *
+ * Called at the three moments the server stops holding a conversation: another one is about to
+ * be read in, the model is being unloaded, and the app is closing. Never throws; a state that
+ * could not be saved costs a reading later, not the turn that is waiting now.
+ */
+async function parkHeld(nextKey: string | null, signal?: AbortSignal): Promise<void> {
+  const store = llama.stateStore
+  const held = llama.heldKey
+  if (!store || !held || held === nextKey) return
+  // A conversation in the middle of a reply is not parked; its turn leaves the server holding it again.
+  if (held.startsWith('agent:') && agentTurnAbort) return
+  if (held.startsWith('chat:') && inFlightChats.has(held.slice('chat:'.length))) return
+  try {
+    const req = await conversationRequest(held)
+    // Only what the server is still holding: bringing it there first would mean reading it all.
+    if (!req || signal?.aborted || !llama.holds(req)) return
+    const result = await saveState({ ...store, key: held, req, signal })
+    if (!result.ok) {
+      logger.info('prompt', `${held} was not saved to disk: ${result.why}`)
+      return
+    }
+    llama.assumeHeld(req)
+    const budget = Math.max(1, loadSettings().runtime.stateCache.budgetGb) * 1024 ** 3
+    const removed = prune(store.dir, budget, statePins(store.dir))
+    logger.info('prompt', `saved ${held} to disk`, { tokens: result.meta.tokens, bytes: result.meta.bytes, removed })
+  } catch (err) {
+    logger.warn('prompt', `could not save ${held} to disk`, err)
+  }
+}
+
+/** Load a conversation's saved state into the server. False when there is none or it no longer fits. */
+async function restoreSaved(req: CompletionOptions, signal?: AbortSignal): Promise<boolean> {
+  const store = llama.stateStore
+  const key = req.cacheKey
+  if (!store || !key || !readMeta(store.dir, key)) return false
+  try {
+    const result = await restoreState({ ...store, key, req, signal })
+    if (!result.ok) {
+      logger.info('prompt', `${key} was not restored from disk: ${result.why}`)
+      return false
+    }
+    llama.assumeHeld(req)
+    logger.info('prompt', `restored ${key} from disk`, { tokens: result.meta.tokens, bytes: result.meta.bytes })
+    return true
+  } catch (err) {
+    logger.warn('prompt', `could not restore ${key} from disk`, err)
+    return false
+  }
+}
+
+/**
+ * Before a turn: keep what the server holds, then bring this conversation back if it was kept.
+ *
+ * The same thing clicking into the message box does ahead of time, for a message sent without
+ * that head start.
+ */
+async function resumeSaved(req: CompletionOptions): Promise<void> {
+  if (!llama.stateStore || !req.messages.length || llama.holds(req)) return
+  await parkHeld(req.cacheKey ?? null)
+  await restoreSaved(req)
+}
+
+async function readAhead(req: CompletionOptions, signal: AbortSignal): Promise<void> {
+  const events = llama.streamEvents({
+    ...req,
+    messages: [...req.messages, STAND_IN],
+    processOnly: true,
+    background: true,
+    signal
+  })
+  for await (const ev of events) void ev
+}
+
+/** The effort fields a conversation's requests carry, which anything read ahead must carry too. */
+function effortFields(choice: ReasoningChoice | null | undefined): ReturnType<typeof reasoningRequestFields> {
+  const support = llama.loaded?.model.caps.reasoning
+  return reasoningRequestFields(support, sendableChoice(support, choice ?? null))
+}
+
+/**
+ * How full the window has to be for a conversation to be summarised once its turn is over.
+ *
+ * Below the point where a turn has to stop and compact, on purpose: done here, while the reply is
+ * being read, the summary and the reading of the shortened conversation cost nobody any waiting.
+ */
+const TIDY_AT = 0.6
+
+/** After a chat turn: summarise if the window is filling, then read the shorter conversation in. */
+function tidyChat(chatId: string, reasoning: ReasoningChoice | null): void {
+  const loaded = llama.loaded
+  if (!loaded || !canWarm()) return
+  if ((chats.getContextUsed(chatId) ?? 0) < loaded.plan.contextLength * TIDY_AT) return
+  void llama.runIdle(async (signal) => {
+    const history = chats.loadMessages(chatId)
+    await restoreConversationMedia(chatId, history)
+    const preserveReasoning = loadSettings().reasoning.preserve
+    const report = await compactChat(chatId, history, {
+      automatic: true,
+      threshold: TIDY_AT,
+      preserveReasoning,
+      reasoning,
+      signal,
+      background: true
+    })
+    if (!report.ok || signal.aborted) return
+    await readAhead(
+      { messages: chatMessagesFor(chatId, history, preserveReasoning), cacheKey: `chat:${chatId}`, ...effortFields(reasoning) },
+      signal
+    )
+  })
+}
+
+/** The same after an agent turn. */
+function tidyAgent(sessionId: string): void {
+  const loaded = llama.loaded
+  if (!loaded || !canWarm()) return
+  if ((chats.getContextUsed(sessionId) ?? 0) < loaded.plan.contextLength * TIDY_AT) return
+  void llama.runIdle(async (signal) => {
+    const session = chats.loadSession(sessionId)
+    if (!session) return
+    const a = getAgent()
+    await restoreConversationMedia(session.id, session.messages)
+    if (signal.aborted || agentTurnAbort) return
+    activeAgentSessionId = sessionId
+    a.hydrate(session)
+    const report = await a.compactNow(session, { signal, background: true })
+    if (!report.ok || signal.aborted || agentTurnAbort) return
+    if (typeof report.afterTokens === 'number') {
+      emit('agent:context', { sessionId, used: report.afterTokens, max: loaded.plan.contextLength })
+      chats.setContextUsed(sessionId, report.afterTokens)
+    }
+    const shorter = chats.loadSession(sessionId)
+    if (!shorter) return
+    await readAhead(
+      {
+        messages: a.buildHistory(shorter),
+        tools: a.toolsFor(shorter),
+        cacheKey: `agent:${sessionId}`,
+        ...effortFields(a.options.reasoningChoice)
+      },
+      signal
+    )
+  })
 }
 
 export function modelsDir(): string {
@@ -539,6 +774,15 @@ function chatPromptHistory(chatId: string, history: AgentMessage[], preserveReas
   return out
 }
 
+/** A chat's prompt before the new message: the parameters panel's system prompt, then its history. */
+function chatMessagesFor(chatId: string, history: AgentMessage[], preserveReasoning: boolean): ChatMessage[] {
+  const messages = chatPromptHistory(chatId, history, preserveReasoning)
+  // The system prompt leads, ahead of any summary and the history itself.
+  const systemPrompt = String(loadSettings().generation.systemPrompt ?? '')
+  if (systemPrompt.trim()) messages.unshift({ role: 'system', content: systemPrompt })
+  return messages
+}
+
 interface ChatCompactionReport {
   ok: boolean
   message: string
@@ -560,7 +804,18 @@ interface ChatCompactionReport {
 async function compactChat(
   chatId: string,
   history: AgentMessage[],
-  opts: { automatic: boolean; pendingTokens?: number; preserveReasoning: boolean; signal?: AbortSignal }
+  opts: {
+    automatic: boolean
+    pendingTokens?: number
+    preserveReasoning: boolean
+    signal?: AbortSignal
+    /** The effort level the conversation's turns are sent with, so the summary request starts as they do. */
+    reasoning?: ReasoningChoice | null
+    /** Share of the window an automatic run waits for; three quarters unless said otherwise. */
+    threshold?: number
+    /** Run unasked after a turn: silent, the cheap route only, and no trace if stopped. */
+    background?: boolean
+  }
 ): Promise<ChatCompactionReport> {
   const loaded = llama.loaded
   if (!loaded) return { ok: false, message: 'Load a model first — compacting needs one to summarise with.' }
@@ -588,7 +843,7 @@ async function compactChat(
      * that is too low here is a request the server refuses, not a compaction a little early.
      */
     const measured = chats.getContextUsed(chatId) ?? 0
-    if (Math.max(before, measured) + (opts.pendingTokens ?? 0) <= windowTokens * 0.75) {
+    if (Math.max(before, measured) + (opts.pendingTokens ?? 0) <= windowTokens * (opts.threshold ?? 0.75)) {
       return { ok: false, message: 'There is still room in the context window.' }
     }
   }
@@ -606,15 +861,37 @@ async function compactChat(
   ]
 
   let boundary: string | null = null
-  emit('chat:compacting', { chatId, automatic: opts.automatic })
+  if (!opts.background) emit('chat:compacting', { chatId, automatic: opts.automatic })
   try {
-    const helper = await resolveCompactionHelper()
-    const text = await summariseTranscript(items, {
+    /*
+     * Asked of the conversation itself first.
+     *
+     * The server is holding it, so the summary costs no reading; handing the transcript over as
+     * text in a new prompt makes the model read the older half again before it writes anything.
+     */
+    const inPlace = await summariseInPlace({
       kind: 'chat',
-      helper,
+      messages: chatMessagesFor(chatId, history, opts.preserveReasoning),
+      cacheKey: `chat:${chatId}`,
+      effort: effortFields(opts.reasoning),
+      usedTokens: Math.max(before, chats.getContextUsed(chatId) ?? 0),
       signal: opts.signal,
-      onProgress: (p) => emit('chat:compaction-progress', { chatId, ...p })
+      background: opts.background,
+      onProgress: (percent) =>
+        opts.background
+          ? undefined
+          : emit('chat:compaction-progress', { chatId, percent, chunk: 1, chunks: 1, stage: 'merge', helper: null })
     })
+    if (opts.signal?.aborted) return { ok: false, message: 'Compaction was stopped.' }
+    if (!inPlace && opts.background) return { ok: false, message: 'Nothing was summarised.' }
+    const text =
+      inPlace ??
+      (await summariseTranscript(items, {
+        kind: 'chat',
+        helper: await resolveCompactionHelper(),
+        signal: opts.signal,
+        onProgress: (p) => emit('chat:compaction-progress', { chatId, ...p })
+      }))
     if (opts.signal?.aborted) return { ok: false, message: 'Compaction was stopped.' }
     if (text === COMPACTION_FAILED) {
       logger.warn('compaction', 'no pass produced a summary; the chat goes on with its full history', { chatId })
@@ -632,7 +909,8 @@ async function compactChat(
     logger.warn('compaction', 'chat compaction failed; the chat goes on with its full history', { chatId, error: message })
     return { ok: false, message: `Compaction failed: ${message}` }
   } finally {
-    emit('chat:compacted', { chatId, uptoMessageId: boundary })
+    // Work done unasked is only announced once it has changed something.
+    if (!opts.background || boundary) emit('chat:compacted', { chatId, uptoMessageId: boundary })
   }
 }
 
@@ -862,6 +1140,10 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
   const model = library.find((m) => m.id === modelId || m.filename === modelId)
   if (!model) throw new Error(`Model not found: ${modelId}`)
   if (!model.arch) throw new Error(model.error ?? 'Model metadata could not be parsed')
+
+  // Loading replaces whatever is loaded; the conversation it holds is kept first, if states are kept.
+  await llama.preemptIdle()
+  await parkHeld(null)
 
   /*
    * The compaction helper goes before anything is measured.
@@ -1381,6 +1663,9 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   'model:load': (modelId: string, plan?: FitPlan) => loadModelById(modelId, plan),
   'model:sampling-defaults': () => llama.samplingDefaults(),
   'model:unload': async () => {
+    await llama.preemptIdle()
+    // The conversation the model is holding is kept, if states are kept, before it goes.
+    await parkHeld(null)
     await llama.unload()
     // The helper was placed in what this model left free; it is placed again against the next one.
     await summarizer.stop()
@@ -1524,6 +1809,9 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   },
   'chat:delete': async (id: string) => {
     chats.deleteChat(id)
+    // Its saved state is gigabytes nothing will ever load again.
+    const stateDir = llama.stateStore?.dir ?? stateCacheFolder()
+    if (stateDir) for (const key of [`chat:${id}`, `agent:${id}`]) removeState(stateDir, key)
     // Messages, tasks and attachments cascade out of the database; a session's file snapshots
     // live on disk and were left behind, holding a full copy of everything the agent had edited.
     await discardCheckpoints(id)
@@ -1559,6 +1847,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     collectionId?: string,
     reasoning?: ReasoningChoice
   ) => {
+    // Anything being done ahead of this message stops here, before the conversation is read.
+    await llama.preemptIdle()
     const loaded = llama.loaded
     if (!loaded) throw new Error('No model is loaded')
 
@@ -1676,6 +1966,23 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     }
     if (notes.length) emit('chat:notes', notes)
 
+    /*
+     * Retrieved excerpts go in the message they were retrieved for, and stay there.
+     *
+     * They used to be sent as a system message placed just before the question and stored
+     * nowhere, so the next turn's prompt lacked them: the server had to go back to before that
+     * point and read the last turn or two again, every turn. A system message anywhere but the
+     * start is also something several chat templates refuse outright. Recorded with the message,
+     * they are sent again in the same place, at the cost of staying in the window.
+     */
+    if (ragContext) {
+      userContent =
+        typeof userContent === 'string'
+          ? `${ragContext}\n\n[The user's message]\n${userContent}`
+          : [{ type: 'text' as const, text: ragContext }, ...userContent]
+      await persistSent(chatId, userMsg.id, userContent)
+    }
+
     const started = Date.now()
     let answer = ''
     let thinking = ''
@@ -1710,17 +2017,17 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         estimateTokens(String(loadSettings().generation.systemPrompt ?? '')) +
         (attachments?.length ?? 0) * MEDIA_TOKEN_ESTIMATE,
       preserveReasoning,
+      reasoning: effort,
       signal: abort.signal
     })
-    const messages = chatPromptHistory(chatId, history, preserveReasoning)
-    // The parameters panel's system prompt leads, ahead of any summary and the history itself.
+    const messages = chatMessagesFor(chatId, history, preserveReasoning)
     const generation = loadSettings().generation
-    const systemPrompt = String(generation.systemPrompt ?? '')
-    if (systemPrompt.trim()) messages.unshift({ role: 'system', content: systemPrompt })
-    if (ragContext) messages.push({ role: 'system', content: ragContext })
+    lastEffort.set(`chat:${chatId}`, effort)
+    await resumeSaved({ messages, cacheKey: `chat:${chatId}`, ...effortFields(effort) })
 
     const request: CompletionOptions = {
       messages: [...messages, { role: 'user', content: userContent }],
+      cacheKey: `chat:${chatId}`,
       // The parameters panel's settings. Ultra keeps them for every sample, stepping only the temperature.
       ...samplingOptions(generation.sampling),
       signal: abort.signal,
@@ -1822,6 +2129,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       setContextUsed(t.promptTokens + t.completionTokens)
       chats.setContextUsed(chatId, t.promptTokens + t.completionTokens)
     }
+    if (!stopped) tidyChat(chatId, effort)
     return assistantMsg
   },
 
@@ -1832,6 +2140,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     return a.listTools()
   },
   'agent:run': async (sessionId: string, input: string, reasoning?: ReasoningChoice, attachments?: string[]) => {
+    // Anything being done ahead of this message stops here, before the session is read.
+    await llama.preemptIdle()
     const session = chats.loadSession(sessionId)
     if (!session) throw new Error(`No session ${sessionId}`)
 
@@ -1960,6 +2270,13 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     // Every turn rebuilds the history from storage, which keeps only text; the images come from here.
     await restoreConversationMedia(session.id, session.messages)
     a.hydrate(session)
+    lastEffort.set(`agent:${sessionId}`, effort)
+    await resumeSaved({
+      messages: a.buildHistory(session),
+      tools: a.toolsFor(session),
+      cacheKey: `agent:${sessionId}`,
+      ...effortFields(effort)
+    })
     // A prompt left unanswered by an earlier turn (window reloaded, remote tab closed) would
     // otherwise sit in the map forever and never be answerable again.
     drainPendingPermissions()
@@ -2048,6 +2365,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     }
 
     chats.autoTitle(sessionId)
+    if (!turnAbort.signal.aborted) tidyAgent(sessionId)
     return session
   },
   /** Cut a chat turn short. Whatever has been generated so far is kept. */
@@ -2062,6 +2380,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
    * can be made cheaper before the next question rather than while that question waits.
    */
   'chat:compact': async (chatId: string): Promise<ChatCompactionReport> => {
+    await llama.preemptIdle()
     if (inFlightChats.has(chatId)) {
       return { ok: false, message: 'A reply is still being written — stop it or let it finish first.' }
     }
@@ -2088,7 +2407,110 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
    * anything — found an empty history, returned early, and reported success for work it had not
    * done. When it did find a history, it was whichever session last ran, not necessarily this one.
    */
+  /**
+   * Read a conversation into the model ahead of its next message.
+   *
+   * Called when a conversation's message box is clicked. Reading starts then rather than at
+   * Send, so the time spent typing is time the model spends catching up: after a restart, a
+   * model reload, or another conversation having had the model in between.
+   */
+  'chat:warm': async (chatId: string, reasoning?: ReasoningChoice) => {
+    const loaded = llama.loaded
+    if (!loaded || !chatId || !canWarm()) return false
+    const history = chats.loadMessages(chatId)
+    if (!history.length) return false
+    await restoreConversationMedia(chatId, history)
+    if (!canWarm()) return false
+    lastEffort.set(`chat:${chatId}`, reasoning ?? null)
+    return warm({
+      messages: chatMessagesFor(chatId, history, loadSettings().reasoning.preserve),
+      cacheKey: `chat:${chatId}`,
+      ...reasoningRequestFields(loaded.model.caps.reasoning, sendableChoice(loaded.model.caps.reasoning, reasoning ?? null))
+    })
+  },
+  /**
+   * The same for an agent session. With no session yet, what is read is the part every session
+   * starts with, the system prompt and the tools, which is most of a first message's wait.
+   */
+  'agent:warm': async (sessionId?: string, reasoning?: ReasoningChoice) => {
+    const loaded = llama.loaded
+    if (!loaded || !canWarm()) return false
+    const session: AgentSessionState = (sessionId ? chats.loadSession(sessionId) : null) ?? {
+      id: 'draft',
+      title: '',
+      cwd: os.homedir(),
+      planMode: false,
+      messages: [],
+      taskList: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    }
+    const a = getAgent()
+    syncAgentOptions()
+    if (session.messages.length) await restoreConversationMedia(session.id, session.messages)
+    if (!canWarm()) return false
+    lastEffort.set(`agent:${session.id}`, reasoning ?? null)
+    return warm({
+      messages: a.buildHistory(session),
+      tools: a.toolsFor(session),
+      cacheKey: `agent:${session.id}`,
+      ...reasoningRequestFields(loaded.model.caps.reasoning, sendableChoice(loaded.model.caps.reasoning, reasoning ?? null))
+    })
+  },
+  /**
+   * Give a session the current system prompt and tools in place of the ones it started with.
+   *
+   * A session keeps what it first sent so the model never has to read it again; this is how it
+   * picks up a tool added since, and it costs one full reading on the next message.
+   */
+  /** What is kept on disk of conversations the model has read, for the settings page and the pin. */
+  'state:info': () => {
+    const settings = loadSettings().runtime.stateCache
+    const dir = llama.stateStore?.dir ?? stateCacheFolder()
+    const states = dir ? listStates(dir) : []
+    return {
+      enabled: !!settings?.enabled,
+      // Whether the loaded model was started able to save; the setting applies from the next load.
+      active: !!llama.stateStore,
+      modelLoaded: !!llama.loaded,
+      folder: dir ?? '',
+      budgetGb: settings?.budgetGb ?? 20,
+      usedBytes: states.reduce((n, s) => n + s.bytes, 0),
+      count: states.length,
+      saved: states.map((s) => s.key),
+      pinned: dir ? [...statePins(dir)] : []
+    }
+  },
+  /** Keep a conversation's saved state whatever the budget says, or stop keeping it. */
+  'state:pin': (key: string, on: boolean) => {
+    const dir = llama.stateStore?.dir ?? stateCacheFolder()
+    if (!dir || !/^(chat|agent):[\w-]+$/.test(key)) return []
+    const pins = statePins(dir)
+    if (on) pins.add(key)
+    else pins.delete(key)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'pins.json'), JSON.stringify([...pins]))
+    return [...pins]
+  },
+  /** Remove every saved state. Pins are kept: they say what to keep once there is something again. */
+  'state:clear': () => {
+    const dir = llama.stateStore?.dir ?? stateCacheFolder()
+    if (!dir) return 0
+    const states = listStates(dir)
+    for (const s of states) removeState(dir, s.key)
+    return states.length
+  },
+  'agent:refresh-prompt': (sessionId: string) => {
+    if (agentTurnAbort) return { ok: false, message: 'Wait for the reply to finish, then try again.' }
+    if (!sessionId) return { ok: false, message: 'Open a conversation first.' }
+    getAgent().refreshPrompt(sessionId)
+    return {
+      ok: true,
+      message: 'This conversation will use the current tools and instructions from its next message. That message reads the whole conversation again once.'
+    }
+  },
   'agent:compact': async (sessionId?: string) => {
+    await llama.preemptIdle()
     const id = sessionId || activeAgentSessionId
     const session = id ? chats.loadSession(id) : null
     if (!session) {
@@ -2188,6 +2610,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
    */
   'agent:rewind-and-regenerate': async (sessionId: string, messageId: string, content: string, reasoning?: ReasoningChoice) => {
     assertAgentIdle()
+    await llama.preemptIdle()
     /*
      * Checked before anything is touched, not after.
      *
@@ -2204,6 +2627,18 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     if (idx === -1) throw new Error('That message is no longer in this conversation.')
     const target = before0.messages[idx]
     if (target.role !== 'user') throw new Error('Only your own messages can be rewound like this.')
+
+    /*
+     * What the message sent is edited along with what it shows.
+     *
+     * A message can have sent more than its words: the app's note about the session above them,
+     * or files beside them. That record is what a rebuilt history sends, so with only the
+     * transcript changed the model was asked the old question again.
+     */
+    await restoreConversationMedia(sessionId, before0.messages)
+    const typed = (s: string): string => s.replace(/\n\n\[Attached: [^\]]*\]$/, '')
+    const resent = sentWithText(target.id, typed(target.content), typed(content))
+    if (resent !== undefined) await persistSent(sessionId, target.id, resent)
 
     chats.appendMessage(sessionId, { ...target, content })
 
@@ -2275,6 +2710,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
    * it there is nothing to continue, and the ordinary send path is what is wanted.
    */
   'agent:continue': async (sessionId: string, reasoning?: ReasoningChoice) => {
+    await llama.preemptIdle()
     const session = chats.loadSession(sessionId)
     if (!session) throw new Error(`No session ${sessionId}`)
     const last = session.messages.at(-1)
@@ -2319,6 +2755,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   },
 
   'agent:rewind': async (sessionId: string, checkpointId: string, messageId?: string) => {
+    await llama.preemptIdle()
     const result = await rewindTo(sessionId, checkpointId)
     if (messageId) chats.truncateFrom(sessionId, messageId)
     /*
@@ -2642,6 +3079,9 @@ export async function invokeBridge(channel: string, args: unknown[]): Promise<un
 }
 
 export async function shutdown(): Promise<void> {
+  // Bounded: closing the app must not hang on a slow disk, and a state not saved only costs a reading.
+  await llama.preemptIdle().catch(() => undefined)
+  await parkHeld(null, AbortSignal.timeout(20_000))
   persistPermissionRules()
   killAllJobs()
   mcpManager.closeAll()

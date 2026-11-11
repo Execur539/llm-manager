@@ -44,6 +44,16 @@ import { uiTools } from './tools/ui'
 import { resolveLogin } from './credentials'
 import { maskCall, redactSecrets, referencesCredential, substituteCredentials } from './credential-refs'
 import { announcesNextStep, rebuildHistory } from './history'
+import {
+  afterSummary,
+  factsBlock,
+  noteFor,
+  parsePromptState,
+  toldFacts,
+  withNote,
+  type PromptState,
+  type SessionFacts
+} from './prompt-state'
 import { webTools } from './tools/web'
 import { systemTools } from './tools/system'
 import { browserTools } from './tools/browser'
@@ -60,6 +70,7 @@ import * as chats from '../chat/repo'
 import { APPDATA_DIR } from '../storage/paths'
 import { type CompactionHelper, type TranscriptItem } from './compaction'
 import { summariseTranscript } from './summarise'
+import { summariseInPlace } from './summarise-in-place'
 // Relative, not `@shared`: the main-process bundle has no such alias, so only type imports can use it.
 import { continuedMessage } from '../../shared/continuation'
 import { samplingOptions, AGENT_TEMPERATURE, type SamplingSettings } from '../../shared/sampling'
@@ -144,10 +155,9 @@ Rules:
   write {{credential:NAME}} and it is filled in when the call runs; you do not need to see it.
 - When the work is done, reply in prose with what you did. Keep it short.`
 
-const PLAN_MODE_PROMPT = `
-PLAN MODE IS ACTIVE. You may only use read-class tools (reading, listing, searching, fetching).
-Investigate first, then present a concise written plan for the user to approve. Do not attempt
-to write files or run commands until plan mode is turned off.`
+/** Sent right after a reply that announced a step without taking it. */
+const NUDGE =
+  'You said what you would do next but did not call a tool. Call it now. If the work is in fact finished, say so plainly instead.'
 
 /** A history message as plain text, with media named rather than dropped or pasted as base64. */
 function messageText(m: ChatMessage): string {
@@ -178,6 +188,15 @@ export class Agent extends EventEmitter {
   /** Rolling conversation sent to the model, distinct from the persisted session history. */
   private history: ChatMessage[] = []
   private depth: number
+  /**
+   * The system prompt and tools the conversation being run first sent, and what it has been told.
+   *
+   * Held for one conversation at a time and read back from storage when another is run, so a
+   * change made elsewhere, such as the list being refreshed, is picked up on the next turn.
+   */
+  private prompt: { sessionId: string; state: PromptState } | null = null
+  /** The session whose turn is running, for work the loop starts on its own behalf. */
+  private runningSessionId = ''
   /**
    * Set while a planning sample is running.
    *
@@ -267,8 +286,15 @@ export class Agent extends EventEmitter {
     return this.permissions.export()
   }
 
+  /** What can be used right now, for the tool catalog: plan mode narrows this, though not the prompt. */
   listTools(): { name: string; description: string; tier: string }[] {
-    return this.availableTools().map((d) => ({ name: d.name, description: d.description, tier: d.tier }))
+    const all = this.currentTools().filter((t) => !this.opts.remote || !LOCAL_ONLY_TOOLS.has(t.name))
+    const readOnly = this.opts.planMode || (this.opts.remote && !this.opts.remoteToolsEnabled)
+    return (readOnly ? all.filter((t) => t.tier === 'read') : all).map((d) => ({
+      name: d.name,
+      description: d.description,
+      tier: d.tier
+    }))
   }
 
   stop(): void {
@@ -293,17 +319,26 @@ export class Agent extends EventEmitter {
     return this.opts.askUser({ id: crypto.randomBytes(6).toString('hex'), question, options })
   }
 
+  /** Every tool there is at this moment, before anything narrows the list. */
+  private currentTools(): ToolDefinition[] {
+    return [...this.registry.definitions(), ...mcpManager.toolDefinitions()]
+  }
+
   /**
-   * Tools offered this turn.
-   * Plan mode narrows to read-class. A remote session with remote tools disabled gets the
-   * same narrowing, so remote users can still investigate without holding a shell.
+   * Tools the model is offered.
+   *
+   * The conversation's own list, as it first sent it. The tools are written at the very start of
+   * the prompt, so a list that changed made the whole conversation be read again: plan mode
+   * narrowing it, a tool server reconnecting, an update adding one. Plan mode therefore removes
+   * nothing here; a call it forbids is refused when it is made. A remote session is still
+   * narrowed, because what it must not be offered depends on who is asking, not on speed.
    */
   private availableTools(): ToolDefinition[] {
-    const all = [...this.registry.definitions(), ...mcpManager.toolDefinitions()].filter(
+    const all = (this.prompt?.state.tools ?? this.currentTools()).filter(
       // Saved logins belong to whoever is at the machine, not to whoever signed in over the web.
       (t) => !this.opts.remote || !LOCAL_ONLY_TOOLS.has(t.name)
     )
-    const readOnly = this.opts.planMode || (this.opts.remote && !this.opts.remoteToolsEnabled)
+    const readOnly = this.opts.remote && !this.opts.remoteToolsEnabled
     return readOnly ? all.filter((t) => t.tier === 'read') : all
   }
 
@@ -311,18 +346,60 @@ export class Agent extends EventEmitter {
     return this.registry.get(name) ?? mcpManager.asTool(name)
   }
 
-  private buildSystemPrompt(): string {
-    const memories = readMemory()
-    const memoryBlock = memories.length
-      ? `\n\nThings you have remembered from previous sessions:\n${memories.map((m) => `- ${m.text}`).join('\n')}`
-      : ''
-    return `${SYSTEM_PROMPT}${this.opts.planMode ? PLAN_MODE_PROMPT : ''}
+  /** What the model is told about this session; everything in it can change between turns. */
+  private sessionFacts(): SessionFacts {
+    return {
+      cwd: this.opts.cwd,
+      scratch: agentScratchDir(),
+      admin: isElevated(),
+      date: new Date().toLocaleDateString('en-CA'),
+      memories: readMemory().map((m) => m.text),
+      planMode: this.opts.planMode
+    }
+  }
 
-Working directory: ${this.opts.cwd}
-Scratch folder: ${agentScratchDir()}
-Platform: Windows (Windows PowerShell 5.1)
-Administrator rights: ${isElevated() ? 'yes, commands already run elevated' : 'no — use run_elevated for a command that needs them'}
-Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
+  /**
+   * The conversation's fixed start: the system prompt and tools it first sent.
+   *
+   * Read from storage, or fixed now for a conversation that has none. A sub-agent's is never
+   * stored, since it lives for one task.
+   */
+  private promptStateFor(session: AgentSessionState): PromptState {
+    if (this.prompt?.sessionId === session.id) return this.prompt.state
+    const stored = this.depth === 0 ? parsePromptState(chats.getPromptState(session.id)) : null
+    const state: PromptState = stored ?? { system: SYSTEM_PROMPT, tools: this.currentTools(), announced: [] }
+    this.prompt = { sessionId: session.id, state }
+    return state
+  }
+
+  private savePromptState(session: AgentSessionState, state: PromptState): void {
+    this.prompt = { sessionId: session.id, state }
+    // Neither a sub-agent nor a planning draft is a conversation anyone will come back to.
+    if (this.depth === 0 && !this.sampling) chats.setPromptState(session.id, JSON.stringify(state))
+  }
+
+  /**
+   * Forget the fixed start, so the next turn takes the current system prompt and tools.
+   *
+   * Costs one full reading of the conversation, which is why it happens only when asked for.
+   */
+  refreshPrompt(sessionId: string): void {
+    if (this.prompt?.sessionId === sessionId) this.prompt = null
+    chats.setPromptState(sessionId, null)
+    this.history = []
+  }
+
+  /** The messages still in the conversation: everything after what a stored summary covers. */
+  private liveMessages(session: AgentSessionState): AgentMessage[] {
+    const all = session.messages.filter((m) => m.role !== 'system')
+    if (!session.summary || !session.summaryUpto) return all
+    const cut = all.findIndex((m) => m.id === session.summaryUpto)
+    return cut === -1 ? all : all.slice(cut + 1)
+  }
+
+  /** Whether a stored summary stands in for the start of the conversation. */
+  private hasSummary(session: AgentSessionState): boolean {
+    return !!session.summary && !!session.summaryUpto && session.messages.some((m) => m.id === session.summaryUpto)
   }
 
   /** A model that ignores the tools API but emits a JSON object as prose still gets honoured. */
@@ -580,12 +657,14 @@ Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
      */
     this.emit('compacting', { strategy: 'auto-compact', automatic: true })
 
+    // Asked of the conversation itself first, which the server is holding and need not read again.
     // Every pass carries the turn's abort signal, so stop does not have to wait a compaction out.
-    const summary = await this.summariseItems(items)
+    const summary = (await this.summariseHere(this.runningSessionId)) ?? (await this.summariseItems(items))
 
+    // The message that told the model about the session is among those just folded away.
     this.history = [
       system,
-      { role: 'user', content: `[Summary of earlier work in this session]\n${summary}` },
+      { role: 'user', content: `${factsBlock(this.sessionFacts())}\n\n[Summary of earlier work in this session]\n${summary}` },
       ...recent
     ]
     this.emit('compacted', { strategy: 'auto-compact', summary })
@@ -606,7 +685,16 @@ Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
    * compaction was structurally unable to touch. That is exactly the case people hit, because
    * heavy tool use is what fills a window in the first place.
    */
-  async compactNow(session: AgentSessionState): Promise<CompactionReport> {
+  async compactNow(
+    session: AgentSessionState,
+    /**
+     * `background` is a compaction nobody asked for, run after a turn so the next message does
+     * not have to wait for one. It says nothing while it works, takes only the cheap route, and
+     * gives up without a trace when stopped: the ordinary compaction is still there for when the
+     * window really is full.
+     */
+    opts: { signal?: AbortSignal; background?: boolean } = {}
+  ): Promise<CompactionReport> {
     const loaded = llama.loaded
     if (!loaded) {
       return { ok: false, message: 'Load a model first — compacting needs one to summarise with.' }
@@ -644,15 +732,27 @@ Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
       }
     }
 
-    this.emit('compacting', { strategy: 'manual', automatic: false })
+    const background = !!opts.background
+    let stored = false
+    if (!background) this.emit('compacting', { strategy: 'manual', automatic: false })
     try {
-      const summary = await this.summarise(older)
+      const inPlace = await this.summariseHere(session.id, opts)
+      if (opts.signal?.aborted) return { ok: false, message: 'Compaction was stopped.' }
+      if (!inPlace && background) return { ok: false, message: 'Nothing was summarised.' }
+      const summary = inPlace ?? (await this.summarise(older))
       const boundary = older[older.length - 1].id
+      // Read before the summary is stored: what the model had been told is judged against the
+      // messages that told it, and most of those are about to stand behind the summary.
+      const state = this.promptStateFor(session)
+      const told = toldFacts(state, new Set(this.liveMessages(session).map((m) => m.id)), this.hasSummary(session))
       chats.setSummary(session.id, summary, boundary)
+      const kept = new Set(all.slice(cut).map((m) => m.id))
+      this.savePromptState(session, afterSummary(state, told ?? this.sessionFacts(), kept))
 
       // Rebuilt from what is now stored, so the running history matches what a resume would give.
       this.hydrate({ ...session, summary, summaryUpto: boundary })
 
+      stored = true
       const after = estimateTokens(summary) + all.slice(cut).reduce((a, m) => a + cost(m), 0)
       return {
         ok: true,
@@ -661,8 +761,43 @@ Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
         afterTokens: after
       }
     } finally {
-      this.emit('compacted', { strategy: 'manual' })
+      // Work done unasked is only announced once it has changed something.
+      if (!background || stored) this.emit('compacted', { strategy: background ? 'in the background' : 'manual' })
     }
+  }
+
+  /** What the rolling history costs, with media at a flat rate rather than as base64 text. */
+  private historyTokens(): number {
+    return this.history.reduce((total, m) => {
+      const thought = estimateTokens(m.reasoning_content ?? '')
+      if (typeof m.content === 'string') return total + estimateTokens(m.content) + thought
+      return total + m.content.reduce((a, p) => a + (p.type === 'text' ? estimateTokens(p.text ?? '') : 1200), thought)
+    }, 0)
+  }
+
+  /**
+   * Ask for the summary as the conversation's own next message.
+   *
+   * The server is holding the conversation, so this costs no reading, where summarising a
+   * transcript handed over as text reads the older half a second time. Null when there is no
+   * room to ask or the reply cannot be trusted; the caller then summarises in passes.
+   */
+  private summariseHere(
+    sessionId: string,
+    opts: { signal?: AbortSignal; background?: boolean } = {}
+  ): Promise<string | null> {
+    return summariseInPlace({
+      kind: 'agent',
+      messages: this.history,
+      tools: this.availableTools(),
+      cacheKey: `agent:${sessionId}`,
+      effort: reasoningRequestFields(llama.loaded?.model.caps.reasoning, this.opts.reasoningChoice ?? null),
+      usedTokens: this.historyTokens(),
+      signal: opts.signal ?? this.abort?.signal,
+      background: opts.background,
+      onProgress: (percent) =>
+        opts.background ? undefined : this.emit('compactionProgress', { percent, chunk: 1, chunks: 1, stage: 'merge', helper: null })
+    })
   }
 
   /**
@@ -785,19 +920,27 @@ Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
   }
 
   hydrate(session: AgentSessionState): void {
-    const all = session.messages.filter((m) => m.role !== 'system')
-    let rest = all
+    this.history = this.buildHistory(session)
+  }
+
+  /**
+   * The messages a session's next request starts from, without touching the running history.
+   *
+   * Built the same way whether a turn is about to run or the conversation is only being read
+   * ahead of one, so what is read ahead is exactly what the turn then sends.
+   */
+  buildHistory(session: AgentSessionState): ChatMessage[] {
+    const state = this.promptStateFor(session)
+    const rest = this.liveMessages(session)
     const summarised: ChatMessage[] = []
 
-    if (session.summary && session.summaryUpto) {
-      const cut = all.findIndex((m) => m.id === session.summaryUpto)
-      if (cut !== -1) {
-        rest = all.slice(cut + 1)
-        summarised.push({
-          role: 'user',
-          content: `[Summary of earlier work in this session]\n${session.summary}`
-        })
-      }
+    if (this.hasSummary(session)) {
+      // What the model had been told about the session stood in the messages the summary replaced.
+      const facts = state.summaryFacts ? `${factsBlock(state.summaryFacts)}\n\n` : ''
+      summarised.push({
+        role: 'user',
+        content: `${facts}[Summary of earlier work in this session]\n${session.summary}`
+      })
     }
 
     const rebuilt = rebuildHistory(rest, {
@@ -805,7 +948,13 @@ Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
       sentContentFor: this.opts.sentContentFor
     })
 
-    this.history = [{ role: 'system', content: this.buildSystemPrompt() }, ...summarised, ...rebuilt]
+    return [{ role: 'system', content: state.system }, ...summarised, ...rebuilt]
+  }
+
+  /** The tools a session's next request offers, for reading a conversation ahead of its turn. */
+  toolsFor(session: AgentSessionState): ToolDefinition[] {
+    this.promptStateFor(session)
+    return this.availableTools()
   }
 
   /**
@@ -855,17 +1004,38 @@ Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
     // A fresh turn re-opens decisions the user made in the previous one.
     this.permissions.resetTurn()
 
+    this.runningSessionId = session.id
+    // Read back for this session, so the tools offered are its own even when the history is kept.
+    const promptState = this.promptStateFor(session)
     if (!this.history.length) this.hydrate(session)
-    else this.history[0] = { role: 'system', content: this.buildSystemPrompt() }
+    else this.history[0] = { role: 'system', content: promptState.system }
 
     if (!turnMeta.continueTurn) {
+      const userMessageId = turnMeta.userMessageId ?? crypto.randomBytes(6).toString('hex')
+      /*
+       * What changes between turns rides on the user's message, not in the system prompt.
+       *
+       * The date, the folder, the remembered notes and plan mode used to be written into the
+       * start of the prompt, so any of them changing made the server read the whole conversation
+       * again. They are told once, here, and again only when they change.
+       */
+      const told = noteFor(
+        promptState,
+        this.sessionFacts(),
+        new Set(this.liveMessages(session).map((m) => m.id)),
+        this.hasSummary(session),
+        userMessageId
+      )
+      if (told.note) this.savePromptState(session, told.state)
+      const sentText = withNote(told.note, userInput)
+
       const userContent: string | ContentPart[] = media.length
-        ? [...media, { type: 'text', text: userInput }]
-        : userInput
+        ? [...media, { type: 'text', text: sentText }]
+        : sentText
       this.history.push({ role: 'user', content: userContent })
 
       const userMsg: AgentMessage = {
-        id: turnMeta.userMessageId ?? crypto.randomBytes(6).toString('hex'),
+        id: userMessageId,
         role: 'user',
         content: displayText,
         plan: turnMeta.plan,
@@ -878,7 +1048,9 @@ Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
        * prompt — so a rebuilt history sends the same. Not for a planning sample, whose message is a
        * draft that is never stored.
        */
-      if (!this.sampling && (media.length || userInput !== displayText)) this.opts.onSent?.(userMsg.id, userContent)
+      if (!this.sampling && this.depth === 0 && (media.length || sentText !== displayText)) {
+        this.opts.onSent?.(userMsg.id, userContent)
+      }
     }
 
     /*
@@ -967,6 +1139,7 @@ Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
           llama.streamEvents({
             messages: this.history,
             tools: this.availableTools(),
+            cacheKey: `agent:${session.id}`,
             signal,
             continueFinal: resuming,
             ...sampling,
@@ -1179,8 +1352,8 @@ Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
            * "Let me check the event log." followed by the end of the turn leaves the user to type
            * "continue" for work the model had already decided to do. Once per turn, a reply that
            * ends on such an announcement is answered with an instruction to act on it. The
-           * instruction is sent to the model only and never stored: it is the loop's doing, not
-           * something the user said.
+           * instruction is the loop's doing, not something the user said, so it is never shown as
+           * a message of theirs.
            */
           if (
             !nudged &&
@@ -1190,11 +1363,10 @@ Today's date: ${new Date().toLocaleDateString('en-CA')}${memoryBlock}`
             announcesNextStep(assistant.content, assistant.reasoning ?? '')
           ) {
             nudged = true
-            this.history.push({
-              role: 'user',
-              content:
-                'You said what you would do next but did not call a tool. Call it now. If the work is in fact finished, say so plainly instead.'
-            })
+            // Kept with the reply it answered, so a history rebuilt from storage sends it again in
+            // the same place. Left out, the next turn's prompt parted from this one's right here.
+            assistant.followUp = NUDGE
+            this.history.push({ role: 'user', content: NUDGE })
             continue
           }
 

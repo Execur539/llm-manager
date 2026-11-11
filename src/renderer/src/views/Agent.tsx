@@ -35,6 +35,7 @@ import PromptProgress from '../components/PromptProgress'
 import MediaStage from '../components/MediaStage'
 import ContextMeter from '../components/ContextMeter'
 import CompactingNotice from '../components/CompactingNotice'
+import KeepReadyButton from '../components/KeepReadyButton'
 import PendingToolCall from '../components/PendingToolCall'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
@@ -519,6 +520,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
           >
             Compact
           </button>
+          <KeepReadyButton stateKey={activeId ? `agent:${activeId}` : null} />
           {running && (
             <button className="danger" onClick={() => {
                 // The main process settles any outstanding question when the turn is drained;
@@ -549,6 +551,28 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             <div className="faint tiny-note">
               Green runs freely. Amber and red ask for approval before anything happens.
             </div>
+            {/*
+              * A session keeps the tools and instructions it started with, so the model never has
+              * to read them twice. This is how an old session picks up a tool added since.
+              */}
+            {activeId && (
+              <div className="faint tiny-note">
+                A conversation keeps the tools and instructions it started with, so the model never reads them
+                twice.{' '}
+                <button
+                  className="link"
+                  disabled={busy}
+                  onClick={async () => {
+                    const r = await invoke<{ ok: boolean; message: string }>('agent:refresh-prompt', activeId)
+                    toast(r.message, r.ok ? 'success' : 'info')
+                  }}
+                  title="The next message in this conversation reads the whole conversation again once."
+                  data-testid="refresh-prompt"
+                >
+                  Use the current ones here
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -777,6 +801,13 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onPaste={attachments.paste}
+              // Clicking in to type is the earliest sign a message is coming: the model starts
+              // reading the conversation now, if it is not already holding it, rather than at Send.
+              onFocus={() => {
+                if (!loaded || running) return
+                const effort = sendableChoice(loaded?.caps?.reasoning, stream.reasoning[effortId] ?? null)
+                void invoke('agent:warm', activeId ?? undefined, effort).catch(() => undefined)
+              }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()

@@ -512,6 +512,13 @@ export interface AgentMessage {
   plan?: string
   toolCalls?: ToolCall[]
   toolResult?: ToolResult
+  /**
+   * An instruction the agent loop sent the model straight after this reply.
+   *
+   * Not a message of the user's and never shown as one, but part of what the model was sent, so
+   * it is kept here for a history rebuilt from storage to send again in the same place.
+   */
+  followUp?: string
   createdAt: number
 }
 
@@ -589,6 +596,20 @@ export interface AppSettings {
      * faster and costs VRAM in the compute buffers, which the planner accounts for. 0 = automatic.
      */
     ubatchSize: number
+    /**
+     * Read a conversation into the model when its message box is clicked, instead of when the
+     * message is sent. Only does anything when the model is not already holding that conversation.
+     */
+    warmConversations: boolean
+    /**
+     * Keep what the model has read of a conversation on disk, so coming back to it after another
+     * conversation, a model reload or a restart costs a file read instead of reading it all again.
+     *
+     * Off unless asked for: a long conversation is gigabytes. `folder` empty means beside the
+     * models folder. `budgetGb` is the most the folder may hold; the least recently used
+     * conversations go first, and pinned ones never.
+     */
+    stateCache: { enabled: boolean; budgetGb: number; folder: string }
   }
   /**
    * What each request asks of the model: a system prompt for chats, and the sampling parameters.

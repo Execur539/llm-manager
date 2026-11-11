@@ -83,9 +83,9 @@ check('the message insert is an upsert rather than INSERT OR REPLACE', !insert.r
 
 db.prepare("INSERT INTO chats (id, title, kind, created_at, updated_at) VALUES ('c1','t','agent',0,0)").run()
 
-/** Run the app's own statement with the nine parameters it takes. */
+/** Run the app's own statement with the ten parameters it takes. */
 function storeMessage(id, content) {
-  db.prepare(insert.sql).run(id, 'c1', 'user', content, null, null, null, null, 1)
+  db.prepare(insert.sql).run(id, 'c1', 'user', content, null, null, null, null, null, 1)
 }
 
 storeMessage('m1', 'first write')

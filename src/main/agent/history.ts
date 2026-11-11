@@ -88,6 +88,11 @@ export function rebuildHistory(rest: AgentMessage[], opts: RebuildOptions): Chat
     // Tool results directly after an assistant message are the calls that message made.
     caller = m.role === 'assistant' ? entry : null
     callerBatch = undefined
+    // What the loop said straight after this reply goes back where it was said.
+    if (m.role === 'assistant' && m.followUp) {
+      rebuilt.push({ role: 'user', content: m.followUp })
+      caller = null
+    }
   }
   return rebuilt
 }

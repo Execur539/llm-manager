@@ -48,6 +48,41 @@ export const CHAT_MERGE_INSTRUCTION =
 
 export type TranscriptKind = 'agent' | 'chat'
 
+/*
+ * Summarising from inside the conversation: see summarise-in-place. What is here is the part of
+ * it that is plain arithmetic and wording, kept in this module so it can be tested without a model.
+ */
+export const IN_PLACE_WORDS = 900
+/** Room the request needs beyond the conversation: the instruction and the summary itself. */
+export const IN_PLACE_ROOM_TOKENS = 3000
+export const IN_PLACE_MAX_TOKENS = 2400
+/** Shorter than this is a refusal or a stub, not an account of a conversation. */
+const MIN_WORDS = 40
+
+export function inPlaceInstruction(kind: TranscriptKind): string {
+  const keep =
+    kind === 'agent'
+      ? 'the user goal, decisions made, files and paths touched, commands run and their outcomes, facts learned, the state the work is in now, and anything still outstanding'
+      : 'what the user is trying to do, facts and preferences they gave, answers and decisions reached, code or commands that matter, and questions still open'
+  return (
+    '[Instruction from the app, not written by the user]\n' +
+    'This conversation is about to be shortened to free room, and your reply to this message is what will stand in ' +
+    `for everything above it. Write that account now. Preserve: ${keep}. Be dense and factual, in the order things ` +
+    `happened, as one account under ${IN_PLACE_WORDS} words. No preamble, and do not call any tools.`
+  )
+}
+
+/** Whether there is room to ask: the conversation as last measured, plus the instruction and reply. */
+export function hasRoomInPlace(usedTokens: number, contextTokens: number): boolean {
+  return contextTokens > 0 && usedTokens + IN_PLACE_ROOM_TOKENS < contextTokens
+}
+
+/** Whether a reply is usable as a summary. */
+export function usableSummary(text: string): boolean {
+  const trimmed = text.trim()
+  return trimmed.split(/\s+/).filter(Boolean).length >= MIN_WORDS && !looksLikeALoop(trimmed)
+}
+
 export function instructionsFor(kind: TranscriptKind): { chunk: string; merge: string } {
   return kind === 'chat'
     ? { chunk: CHAT_CHUNK_INSTRUCTION, merge: CHAT_MERGE_INSTRUCTION }

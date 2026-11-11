@@ -29,6 +29,8 @@ import {
 /** Actions that require physical access to the desktop app. */
 const DESKTOP_ONLY = new Set([
   'library:delete-model',
+  // Gigabytes of saved conversation states belong to whoever is at the machine.
+  'state:clear',
   'settings:set-password',
   'remote:disable',
   'remote:enable',

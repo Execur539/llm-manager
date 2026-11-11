@@ -112,7 +112,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
     loadMode: 'auto',
     threads: 0,
     batchSize: 0,
-    ubatchSize: 0
+    ubatchSize: 0,
+    warmConversations: true,
+    stateCache: { enabled: false, budgetGb: 20, folder: '' }
   },
   generation: {
     systemPrompt: '',

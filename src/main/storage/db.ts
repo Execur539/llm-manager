@@ -327,6 +327,22 @@ export const MIGRATIONS: { id: number; sql: string }[] = [
       updated_at INTEGER NOT NULL
     );
     `
+  },
+  {
+    id: 11,
+    sql: `
+    -- What a conversation must send unchanged for the server to reuse what it has read.
+    --
+    -- prompt_state holds the system prompt and tool list an agent conversation first sent, and
+    -- which message told the model what about the session. Rebuilding those every turn put the
+    -- date and the tool list of the moment at the start of the prompt, and any change there
+    -- made the whole conversation be read again.
+    --
+    -- follow_up is an instruction the loop sent straight after a reply. It was sent and never
+    -- stored, so the next turn's prompt differed from this one's from that point on.
+    ALTER TABLE chats ADD COLUMN prompt_state TEXT;
+    ALTER TABLE messages ADD COLUMN follow_up TEXT;
+    `
   }
 ]
 

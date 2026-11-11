@@ -30,6 +30,20 @@ export default function Settings({
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [missing, setMissing] = useState<string[]>([])
   const [paths, setPaths] = useState<{ exeDir: string; modelsDir: string } | null>(null)
+  /** What is kept on disk of conversations the model has read. */
+  const [stateInfo, setStateInfo] = useState<{
+    active: boolean
+    modelLoaded: boolean
+    folder: string
+    usedBytes: number
+    count: number
+  } | null>(null)
+  const stateCacheOn = !!settings?.runtime.stateCache?.enabled
+  useEffect(() => {
+    void invoke<typeof stateInfo>('state:info')
+      .then(setStateInfo)
+      .catch(() => undefined)
+  }, [stateCacheOn])
   const [mcp, setMcp] = useState<McpStatus[]>([])
   const [memory, setMemory] = useState<MemoryEntry[]>([])
   /** Saved logins, without their passwords. Null where they cannot be managed (a remote session). */
@@ -317,6 +331,85 @@ export default function Settings({
               onCommit={(n) => void patch({ runtime: { ...settings.runtime, ubatchSize: n } })}
             />
           </dd>
+          {/*
+            * Both of these are about the wait before a reply starts, which is the model reading
+            * the conversation rather than writing anything.
+            */}
+          <dt>Read ahead</dt>
+          <dd>
+            <input
+              type="checkbox"
+              checked={settings.runtime.warmConversations !== false}
+              onChange={(e) => void patch({ runtime: { ...settings.runtime, warmConversations: e.target.checked } })}
+              data-testid="warm-conversations"
+            />
+            <span className="faint" style={{ marginLeft: 6 }}>
+              start reading a conversation when its message box is clicked, and summarise a long one after a reply
+              rather than before the next message
+            </span>
+          </dd>
+          <dt>Keep conversations ready on disk</dt>
+          <dd>
+            <input
+              type="checkbox"
+              checked={stateCacheOn}
+              onChange={(e) =>
+                void patch({
+                  runtime: {
+                    ...settings.runtime,
+                    stateCache: { ...settings.runtime.stateCache, enabled: e.target.checked }
+                  }
+                })
+              }
+              data-testid="state-cache-enabled"
+            />
+            <span className="faint" style={{ marginLeft: 6 }}>
+              saves what the model has read of a conversation, so coming back to it after another conversation, a
+              model reload or a restart is a file read · text-only conversations · takes effect from the next model
+              load
+            </span>
+          </dd>
+          {stateCacheOn && (
+            <>
+              <dt>Disk budget</dt>
+              <dd>
+                <NumberField
+                  value={settings.runtime.stateCache.budgetGb}
+                  min={1}
+                  max={4000}
+                  hint="GB · the least recently used conversations are removed first, pinned ones never"
+                  onCommit={(n) =>
+                    void patch({
+                      runtime: { ...settings.runtime, stateCache: { ...settings.runtime.stateCache, budgetGb: n } }
+                    })
+                  }
+                />
+              </dd>
+              <dt>Kept now</dt>
+              <dd>
+                <span className="faint" data-testid="state-cache-usage">
+                  {stateInfo
+                    ? `${stateInfo.count} conversation${stateInfo.count === 1 ? '' : 's'}, ${fmtBytes(stateInfo.usedBytes)}, in ${stateInfo.folder}`
+                    : '…'}
+                  {stateInfo?.modelLoaded && !stateInfo.active ? ' · reload the model to start saving' : ''}
+                </span>
+                {!!stateInfo?.count && (
+                  <button
+                    className="tiny"
+                    style={{ marginLeft: 8 }}
+                    onClick={() => {
+                      void invoke('state:clear')
+                        .then(() => invoke<typeof stateInfo>('state:info'))
+                        .then(setStateInfo)
+                        .catch(() => undefined)
+                    }}
+                  >
+                    Clear
+                  </button>
+                )}
+              </dd>
+            </>
+          )}
         </dl>
       </div>
 
