@@ -201,7 +201,7 @@ export default function Settings({
               data-testid="speculative-enabled"
             />
             <span className="faint" style={{ marginLeft: 6 }}>
-              roughly twice the generation speed on models that carry the head, same answers
+              faster generation on models with an MTP head, built in or in its own file (Flash-Next), same answers
             </span>
           </dd>
           {/*
@@ -227,7 +227,7 @@ export default function Settings({
               value={settings.speculative.nMax}
               min={1}
               max={16}
-              hint="a wrong guess discards everything after it"
+              hint="a wrong guess discards everything after it · a head in its own file drafts at most 2"
               onCommit={(n) => void patch({ speculative: { ...settings.speculative, nMax: n } })}
             />
           </dd>

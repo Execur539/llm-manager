@@ -33,6 +33,8 @@ import { defaultModelsDir, exeDir, TOOL_OUTPUT_DIR } from './storage/paths'
 import { loadSettings, patchSettings } from './storage/settings'
 import { detectHardware, mergeDetection, refreshFreeVram } from './hardware/gpu'
 import { scanLibrary, libraryDiskUsage } from './models/library'
+import { draftReserveBytes } from './models/draft-module'
+import { resolveBatches } from './autofit/engine'
 import { isInside, libraryRoots } from './models/roots'
 import { checkRelocation, keepInPlace, performMove } from './models/relocation'
 import { DEFAULT_CONSTRAINTS, gpuKey, learnHeadroom, planFit, usableDevices, verifyPrediction } from './autofit/engine'
@@ -1107,6 +1109,28 @@ async function restoreConversationMedia(chatId: string, messages: AgentMessage[]
   await restoreSent(chatId, messages, reconstructSent)
 }
 
+/*
+ * A separate MTP head, when the model has one and it can be used.
+ *
+ * Only the CUDA build carries the patch that loads a head from its own file, and a model with a
+ * head inside it needs no other. Charged for the model's full trained context, since the head
+ * keeps a layer of cache for whatever context the plan settles on.
+ */
+function draftReserve(
+  model: ModelRecord,
+  backend: string,
+  batches: { batchSize?: number; ubatchSize?: number } = {}
+): { draftModule?: string; draftBytes: number } {
+  const head = model.caps.mtpModule
+  const arch = model.arch
+  if (!head || !arch || backend !== 'cuda' || (arch.mtpLayers ?? 0) > 0) return { draftBytes: 0 }
+  const spec = loadSettings().speculative
+  if (!spec.enabled || spec.nMax <= 0 || !fs.existsSync(head.path)) return { draftBytes: 0 }
+  // The draft context inherits the model's batch size, and its compute buffer grows with it.
+  const { ubatch } = resolveBatches(batches.batchSize, batches.ubatchSize)
+  return { draftModule: head.path, draftBytes: draftReserveBytes(head, arch, arch.contextLength || 262144, ubatch) }
+}
+
 function companionSize(model: ModelRecord): number {
   if (!model.caps.mmprojPath) return 0
   try {
@@ -1213,9 +1237,10 @@ function moreConservative(
   arch: ModelArchInfo,
   hw: HardwareSnapshot,
   companionBytes: number,
-  kvPairs: string[] | undefined
+  kvPairs: string[] | undefined,
+  draftBytes = 0
 ): FitPlan | null {
-  const base = { ...constraintsFromSettings(loadSettings()), companionBytes, kvPairs }
+  const base = { ...constraintsFromSettings(loadSettings()), companionBytes, kvPairs, draftBytes }
   // The batch sizes too: a retry that fell back to 512 would change the load's speed as well as its placement.
   const keep = {
     contextLength: plan.contextLength,
@@ -1226,7 +1251,7 @@ function moreConservative(
   }
   const take = (result: FitResult): FitPlan | null => {
     const next = result.chosen ?? result.alternatives[0]
-    return next ? { ...next, draftMax: plan.draftMax } : null
+    return next ? { ...next, draftMax: plan.draftMax, draftModule: plan.draftModule } : null
   }
 
   const cpuMoe = plan.cpuMoeLayers ?? 0
@@ -1278,7 +1303,18 @@ async function loadWithBackoff(
       const message = err instanceof Error ? err.message : String(err)
       const outOfVram = /out of memory|failed to allocate|unable to allocate/i.test(message)
       const next =
-        outOfVram && arch && attempt < 3 ? moreConservative(current, arch, hw, companionSize(model), kvPairs) : null
+        outOfVram && arch && attempt < 3
+          ? moreConservative(
+              current,
+              arch,
+              hw,
+              companionSize(model),
+              kvPairs,
+              current.draftModule
+                ? draftReserve(model, hw.backend, { batchSize: current.batchSize, ubatchSize: current.ubatchSize }).draftBytes
+                : 0
+            )
+          : null
       if (!next) throw err
       logger.warn('model', `${model.filename}: load ran out of VRAM, retrying with more of it in system RAM`, {
         attempt: attempt + 1,
@@ -1325,6 +1361,7 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
       expertCacheSlots: s.runtime.expertCache,
       allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
+      draftBytes: draftReserve(model, fresh.backend, batchOverrides(s)).draftBytes,
       learnedHeadroom: learnedHeadroomFor(model.id),
       kvPairs: await kvPairsFor(fresh.backend),
       overrides: batchOverrides(s)
@@ -1341,7 +1378,8 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
    * cannot do.
    */
   const spec = loadSettings().speculative
-  chosen = { ...chosen, draftMax: spec.enabled ? spec.nMax : 0 }
+  const draft = draftReserve(model, fresh.backend, { batchSize: chosen.batchSize, ubatchSize: chosen.ubatchSize })
+  chosen = { ...chosen, draftMax: spec.enabled ? spec.nMax : 0, draftModule: draft.draftModule }
 
   const attempted = await loadWithBackoff(model, chosen, fresh)
   const loaded = attempted.loaded
@@ -1792,6 +1830,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       expertCacheSlots: s.runtime.expertCache,
       allowRopeScaling: s.autoFit.allowRopeScaling,
       companionBytes: companionSize(model),
+      draftBytes: draftReserve(model, fresh.backend, { ...batchOverrides(s), ...sanitizeOverrides(overrides) }).draftBytes,
       learnedHeadroom: learnedHeadroomFor(model.id),
       kvPairs: await kvPairsFor(fresh.backend),
       // The load dialog's own placement choices sit on top of the batch sizes from Settings.

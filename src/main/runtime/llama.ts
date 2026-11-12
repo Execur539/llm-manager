@@ -31,6 +31,7 @@ import { nglFor } from '../autofit/engine'
 import { logger } from '../log'
 // Relative, not `@shared`: the main-process bundle has no such alias for value imports.
 import { DEFAULT_TEMPERATURE, DEFAULT_TOP_P, SAMPLING_FIELDS, type SamplingOptions } from '../../shared/sampling'
+import { draftModuleArgs, SIDECAR_MAX_DRAFT } from '../models/draft-module'
 
 /**
  * Environment for llama-server from the runtime settings.
@@ -665,9 +666,21 @@ export class LlamaRuntime extends EventEmitter {
      * the tensors agree.
      */
     const specTypes: string[] = []
-    if ((model.arch?.mtpLayers ?? 0) > 0 && (plan.draftMax ?? 0) > 0) {
+    /*
+     * Or a head in its own file (Unsloth ships Flash-Next's that way), which the planner found and
+     * charged to the primary device. Placement is the one measured fastest with the expert cache:
+     * the head's experts and embedding table in system RAM, the rest on the GPU.
+     */
+    const sidecar =
+      (model.arch?.mtpLayers ?? 0) === 0 &&
+      typeof plan.draftModule === 'string' &&
+      plan.draftModule !== '' &&
+      fs.existsSync(plan.draftModule)
+    if (((model.arch?.mtpLayers ?? 0) > 0 || sidecar) && (plan.draftMax ?? 0) > 0) {
       specTypes.push('draft-mtp')
-      args.push('--spec-draft-n-max', String(plan.draftMax ?? 3))
+      const draftMax = plan.draftMax ?? 3
+      args.push('--spec-draft-n-max', String(sidecar ? Math.min(draftMax, SIDECAR_MAX_DRAFT) : draftMax))
+      if (sidecar) args.push(...draftModuleArgs(plan.draftModule as string, plan.kvType, plan.kvTypeV ?? plan.kvType))
     }
     /*
      * Self-speculation from n-grams: drafts come from text already in the conversation, so it needs

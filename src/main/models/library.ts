@@ -10,6 +10,7 @@ import crypto from 'node:crypto'
 import type { ModelCapabilities, ModelRecord, ReasoningSupport } from '@shared/types'
 import { extractArchInfo, readGguf, readGgufParts, templateSupportsTools } from './gguf'
 import { detectReasoning, NO_REASONING } from './reasoning'
+import { draftModuleInfo, pickDraftModule, type DraftModuleInfo } from './draft-module'
 import { APPDATA_DIR } from '../storage/paths'
 
 const INDEX_FILE = path.join(APPDATA_DIR, 'model-index.json')
@@ -360,8 +361,51 @@ export async function scanLibrary(roots: string | readonly string[]): Promise<Mo
     nextIndex.push({ path: file, size, mtimeMs, record })
   }
 
+  await pairDraftModules(records, files)
   await saveIndex(nextIndex)
   return records
+}
+
+/** Headers of the MTP heads seen, keyed by path, size and time, so a rescan does not reread them. */
+const draftHeaders = new Map<string, DraftModuleInfo | null>()
+
+/**
+ * Give each model the separate MTP head that belongs to it, if the library holds one.
+ *
+ * Done on every scan rather than cached in the index: a head added, moved or deleted changes what a
+ * model can do without touching the model's own file.
+ */
+async function pairDraftModules(records: ModelRecord[], files: string[]): Promise<void> {
+  const heads: DraftModuleInfo[] = []
+  for (const file of files) {
+    if (!DRAFT_MODULE_RE.test(path.basename(file))) continue
+    try {
+      const st = await fsp.stat(file)
+      const key = `${file}|${st.size}|${st.mtimeMs}`
+      if (!draftHeaders.has(key)) draftHeaders.set(key, draftModuleInfo(file, await readGguf(file)))
+      const info = draftHeaders.get(key)
+      if (info) heads.push(info)
+    } catch {
+      // An unreadable head is one this model cannot use.
+    }
+  }
+  for (const record of records) {
+    const a = record.arch
+    const head = a
+      ? pickDraftModule(
+          {
+            path: record.path,
+            architecture: a.architecture,
+            embeddingLength: a.embeddingLength,
+            vocabSize: a.vocabSize,
+            blockCount: a.blockCount,
+            mtpLayers: a.mtpLayers ?? 0
+          },
+          heads
+        )
+      : null
+    record.caps.mtpModule = head ? { path: head.path, gpuBytes: head.gpuBytes } : null
+  }
 }
 
 function autoTags(quant: string, ctx: number, caps: ModelCapabilities, bytes: number): string[] {

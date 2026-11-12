@@ -873,6 +873,13 @@ function planFitInner(
     )
   }
 
+  // A separate MTP head drafts on the primary device too (llama-server is told so).
+  const draft = constraints.draftBytes ?? 0
+  if (draft > 0 && budgets.length > 0) {
+    budgets[0] = Math.max(0, budgets[0] - draft)
+    notes.push(`Reserving ${fmtBytes(draft)} on ${usableGpus[0].name} for the MTP draft head.`)
+  }
+
   const totalBudget = budgets.reduce((a, b) => a + b, 0)
 
   const anyUnmeasured = usableGpus.some((g) => !g.freeIsMeasured)

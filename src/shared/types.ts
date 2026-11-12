@@ -170,6 +170,12 @@ export interface ModelCapabilities {
   tools: boolean
   mmprojPath: string | null
   reasoning: ReasoningSupport
+  /**
+   * A multi-token-prediction head in its own file that belongs to this model (Unsloth's
+   * `MTP/mtp-*.gguf` for Qwen3.8-Flash-Next), found by the library scan. `gpuBytes` is what it
+   * puts on the GPU with its experts and embedding table in system RAM.
+   */
+  mtpModule?: { path: string; gpuBytes: number } | null
 }
 
 export interface ModelRecord {
@@ -267,6 +273,8 @@ export interface FitConstraints {
    * rather than split. Ignoring it is enough to turn a fitting plan into an OOM.
    */
   companionBytes?: number
+  /** VRAM a separate MTP draft head takes on the primary device: weights, its cache and buffers. */
+  draftBytes?: number
   /**
    * Slots per MoE layer in the GPU expert cache, charged to the card that holds the layer when its
    * experts stay in system RAM: (slots + 1) of that layer's experts. 0 = no cache, -1 = as many as fit.
@@ -349,6 +357,8 @@ export interface FitPlan {
    * Carried on the plan rather than read at spawn time so a plan is loaded the way it was costed.
    */
   draftMax?: number
+  /** A separate MTP head file to draft with, charged to the primary device when planned. */
+  draftModule?: string
   /**
    * How many of the model's blocks are offloaded to GPU.
    *

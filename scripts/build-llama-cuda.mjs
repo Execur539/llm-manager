@@ -1,6 +1,8 @@
 /**
  * Rebuild the CUDA llama.cpp that LLM Manager ships, with Qwen3.8-Flash-Next's QSA work applied and the
- * GPU expert cache and fused gate+up of scripts/llama-patches/moe-expert-cache.patch.
+ * GPU expert cache and fused gate+up of scripts/llama-patches/moe-expert-cache.patch, and Flash-Next's
+ * MTP draft head (scripts/llama-patches/qwen4exp-mtp.patch: ggml-org/llama.cpp#27836's src changes,
+ * ported, plus loading the head from a separate file as Unsloth ships it).
  *
  * fetch-vendor installs the official b10900 release. Two upstream pull requests make QSA cheaper at
  * long context and are not merged yet, so this builds that same release with them applied and swaps
@@ -36,7 +38,7 @@ const PULLS = [
   { number: 28699, commit: '141f3f564', title: 'qwen4exp: incremental pooled-key cache for the QSA indexer' },
   { number: 28770, commit: '41a4ad00d', title: 'CUDA: enable sparse fa for qwen4' }
 ]
-const LOCAL_PATCHES = ['qsa-pooled-reserve.patch', 'moe-expert-cache.patch']
+const LOCAL_PATCHES = ['qsa-pooled-reserve.patch', 'moe-expert-cache.patch', 'qwen4exp-mtp.patch']
 // The matched pairs every CUDA build compiles, plus the mixed pairs the planner can choose.
 const FA_QUANTS = ['q4_0-q4_0', 'q8_0-q8_0', 'f16-f16', 'bf16-bf16', 'q8_0-q4_0', 'f16-q8_0', 'f16-q4_0']
 const OUTPUTS = ['llama.dll', 'ggml-cuda.dll']
@@ -100,7 +102,14 @@ for (const pr of PULLS) {
   }
   git('cherry-pick', '-n', `pr-${pr.number}`)
 }
-for (const patch of LOCAL_PATCHES) git('apply', path.join(ROOT, 'scripts', 'llama-patches', patch))
+for (const patch of LOCAL_PATCHES) {
+  const file = path.join(ROOT, 'scripts', 'llama-patches', patch)
+  // Files a patch creates are untracked, so the forced checkout above leaves a previous build's
+  // copies behind and git apply then refuses them as already existing.
+  const created = [...fs.readFileSync(file, 'utf8').matchAll(/^--- \/dev\/null\r?\n\+\+\+ b\/(.+?)\r?$/gm)].map((m) => m[1])
+  for (const rel of created) fs.rmSync(path.join(SRC, rel), { force: true })
+  git('apply', file)
+}
 
 // 3. Configure and build like the official windows-cuda job: MSVC host compiler, backend DLLs.
 const cuda = cudaToolkit()

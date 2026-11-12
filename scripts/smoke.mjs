@@ -57,6 +57,7 @@ const { toStored, fromStored, forCaps, textOf } = await import('./built/sentCont
 const { exportFilename, uniquePath } = await import('./built/filenames.js')
 const { detectReasoning, reasoningRequestFields } = await import('./built/reasoning.js')
 const { cleanTitle, TITLE_MAX } = await import('./built/title.js')
+const { draftModuleInfo, pickDraftModule, draftReserveBytes, draftModuleArgs, draftComputeBytes } = await import('./built/draftModule.js')
 const { findFaQuants, parseFaQuants, readFaQuants } = await import('./built/faKernels.js')
 const { hostCacheBudgetMb } = await import('./built/hostBudget.js')
 
@@ -125,6 +126,64 @@ const segmentsAddUp = (plan) =>
   !!plan?.vramSegments &&
   plan.vramSegments.length === plan.predictedVramPerGpu.length &&
   plan.vramSegments.every((s, d) => Math.abs(s.weights + s.kv + s.compute - plan.predictedVramPerGpu[d]) < 1)
+
+// ---------------------------------------------------------------- MTP heads in their own file
+
+section('A separate MTP head is paired with the model it belongs to')
+{
+  // Shaped like Unsloth's mtp-Qwen3.8-Flash-Next-Q8_0.gguf: one trailing block (48) of a 49-block file.
+  const MiB = 1024 * 1024
+  const header = {
+    kv: {
+      'general.architecture': 'qwen4exp',
+      'qwen4exp.block_count': 49,
+      'qwen4exp.nextn_predict_layers': 1,
+      'qwen4exp.embedding_length': 2560
+    },
+    tensors: [
+      { name: 'token_embd.weight', dims: [2560, 248320], bytes: 675 * MiB },
+      { name: 'output.weight', dims: [2560, 248320], bytes: 675 * MiB },
+      { name: 'blk.48.ffn_gate_exps.weight', dims: [2560, 640, 512], bytes: 850 * MiB },
+      { name: 'blk.48.ffn_up_exps.weight', dims: [2560, 640, 512], bytes: 850 * MiB },
+      { name: 'blk.48.ffn_down_exps.weight', dims: [640, 2560, 512], bytes: 850 * MiB },
+      { name: 'blk.48.attn_q.weight', dims: [2560, 12288], bytes: 32 * MiB },
+      { name: 'blk.48.nextn.eh_proj.weight', dims: [5120, 2560], bytes: 13 * MiB }
+    ]
+  }
+  const head = draftModuleInfo('D:/M/unsloth/MTP/mtp-Flash-Q8_0.gguf', header)
+  check('a head file is recognised', !!head)
+  check('its trunk is the file less its MTP blocks', head?.trunkBlocks === 48, String(head?.trunkBlocks))
+  check('the vocabulary comes from the embedding table', head?.vocabSize === 248320)
+  check('experts and the embedding table are not counted on the GPU', head?.gpuBytes === (675 + 32 + 13) * MiB, String(head?.gpuBytes))
+  check('a file without MTP blocks is not a head', draftModuleInfo('x.gguf', { kv: { 'general.architecture': 'qwen4exp', 'qwen4exp.block_count': 48 }, tensors: [] }) === null)
+
+  const model = { path: 'D:/M/unsloth/Flash-Q4.gguf', architecture: 'qwen4exp', embeddingLength: 2560, vocabSize: 248320, blockCount: 48, mtpLayers: 0 }
+  check('a model takes the head from the MTP folder beside it', pickDraftModule(model, [head])?.path === head.path)
+  const elsewhere = { ...model, path: 'S:/LLM/heretic/Flash-abliterated.gguf' }
+  check('an edited copy elsewhere uses the head of the same trunk', pickDraftModule(elsewhere, [head])?.path === head.path)
+  const near = { ...head, path: 'S:/LLM/heretic/MTP/mtp-other.gguf' }
+  check('the nearest head wins', pickDraftModule(elsewhere, [head, near])?.path === near.path)
+  check('a model with its own head takes none', pickDraftModule({ ...model, mtpLayers: 1 }, [head]) === null)
+  check('another architecture is not paired', pickDraftModule({ ...model, architecture: 'qwen35moe' }, [head]) === null)
+  check('another depth is not paired', pickDraftModule({ ...model, blockCount: 40 }, [head]) === null)
+
+  const reserve = draftReserveBytes(head, { headCountKv: 2, headDim: 256 }, 262144, 2048)
+  const kv = 2 * 2 * 256 * 262144 * (34 / 32)
+  // The DLL caps the draft context at ubatch 512, so a 2048 batch is charged as 512.
+  check('the reserve is weights, one layer of cache and buffers', Math.abs(reserve - (head.gpuBytes + kv + draftComputeBytes(512))) < 2, String(reserve))
+  // Measured on the real head: 742 / 1,064 / 1,709 MiB at ubatch 512 / 1024 / 2048.
+  for (const [ub, mib] of [[512, 742], [1024, 1064], [2048, 1709]]) {
+    const got = draftComputeBytes(ub) / MiB
+    check(`the compute charge at ubatch ${ub} covers the measured ${mib} MiB with little to spare`, got >= mib && got <= mib * 1.08, got.toFixed(0))
+  }
+
+  const args = draftModuleArgs('D:/M/mtp.gguf', 'q8_0', 'q8_0')
+  const after = (flag) => args[args.indexOf(flag) + 1]
+  check('the head is the draft model', after('--spec-draft-model') === 'D:/M/mtp.gguf')
+  check('its experts stay in system RAM', args.includes('--spec-draft-cpu-moe'))
+  check('its embedding table stays in system RAM', after('--spec-draft-override-tensor') === 'token_embd\\.weight=CPU')
+  check('it drafts on the primary device', after('--spec-draft-device') === 'CUDA0')
+}
 
 // ---------------------------------------------------------------- chat titles
 

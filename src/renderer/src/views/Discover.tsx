@@ -467,7 +467,7 @@ export default function Discover({ onDownloaded }: { onDownloaded: () => Promise
                       {fmtBytes(v.bytes)} ·{' '}
                       {v.kind === 'mmproj'
                         ? 'vision projector — fetched automatically with a model'
-                        : 'separate MTP module — not a standalone model, and the bundled llama.cpp cannot attach one'}
+                        : 'separate MTP module — not a standalone model; used automatically with the model it belongs to (CUDA)'}
                     </div>
                   </div>
                   {v.kind === 'mmproj' && <button onClick={() => void download(v.id)}>Download</button>}

@@ -25,10 +25,16 @@ function CapBadges({ model }: { model: ModelRecord }): JSX.Element {
         model.caps.videoPossible && <span className="badge">video via frames</span>
       )}
       {model.caps.tools && <span className="badge">tools</span>}
-      {(model.arch?.mtpLayers ?? 0) > 0 && (
+      {(model.arch?.mtpLayers ?? 0) > 0 ? (
         <span className="badge good" title="Built-in multi-token prediction: drafts ahead of itself for faster generation">
           MTP
         </span>
+      ) : (
+        model.caps.mtpModule && (
+          <span className="badge good" title={`Multi-token prediction from ${model.caps.mtpModule.path}: drafts ahead of itself for faster generation`}>
+            MTP
+          </span>
+        )
       )}
       {(model.parts?.length ?? 0) > 1 && <span className="badge">{model.parts?.length} parts</span>}
     </>
