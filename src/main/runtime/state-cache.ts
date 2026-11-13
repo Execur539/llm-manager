@@ -45,8 +45,59 @@ export interface StateMeta {
   prefixHash: string
   tokens: number
   bytes: number
+  /**
+   * The state file's size on disk when it was saved. A file of any other size is not the one this
+   * record describes (a save cut off part way, say) and is never loaded. Absent in older records.
+   */
+  fileBytes?: number
   savedAt: number
   usedAt: number
+}
+
+/**
+ * When a conversation is worth saving again at a quiet moment: what checkpointDue weighs.
+ *
+ * Saving rewrites the whole state, which for a long conversation is gigabytes, so it is not done
+ * after every reply. A short conversation is never saved this way (reading it again takes about
+ * as long as loading it would). A longer one is saved once enough is new to be worth a file, in
+ * proportion to its length, so a 500,000-token conversation is not rewritten for every line; and
+ * whatever has changed is saved at least every ten minutes. Switching away, unloading, quitting
+ * and the machine going to sleep save it regardless.
+ */
+export const CHECKPOINT = {
+  /** Below this many tokens a conversation is not worth a file. */
+  minTokens: 1024,
+  /** Less new than this is never worth rewriting the file for. */
+  minNew: 256,
+  /** Enough new to save straight away: this share of the conversation, but at least `floor`. */
+  share: 0.03,
+  floor: 1024,
+  /** Anything new at all is saved once the file is this old. */
+  maxAgeMs: 10 * 60_000
+}
+
+/**
+ * Whether to save a conversation now, given how long it is (tokens, as the server last counted
+ * them, or null when it never said) and what is already saved of it.
+ */
+export function checkpointDue(total: number | null, saved: { tokens: number; savedAt: number } | null, now: number): boolean {
+  if (total === null) return !saved || now - saved.savedAt >= CHECKPOINT.maxAgeMs
+  if (total < CHECKPOINT.minTokens) return false
+  if (!saved) return true
+  const fresh = total - saved.tokens
+  if (fresh < CHECKPOINT.minNew) return false
+  if (fresh >= Math.max(CHECKPOINT.floor, total * CHECKPOINT.share)) return true
+  return now - saved.savedAt >= CHECKPOINT.maxAgeMs
+}
+
+/** Whether a state file on disk is the whole of what its record describes. */
+function fileMatches(dir: string, meta: StateMeta): boolean {
+  try {
+    const size = fs.statSync(path.join(dir, `${fileStem(meta.key)}.bin`)).size
+    return meta.fileBytes === undefined || size === meta.fileBytes
+  } catch {
+    return false
+  }
 }
 
 export type StateResult = { ok: true; meta: StateMeta } | { ok: false; why: string }
@@ -116,14 +167,14 @@ function metaPath(dir: string, key: string): string {
 export function readMeta(dir: string, key: string): StateMeta | null {
   try {
     const meta = JSON.parse(fs.readFileSync(metaPath(dir, key), 'utf8')) as StateMeta
-    return meta.key === key && fs.existsSync(path.join(dir, `${fileStem(key)}.bin`)) ? meta : null
+    return meta.key === key && fileMatches(dir, meta) ? meta : null
   } catch {
     return null
   }
 }
 
 export function removeState(dir: string, key: string): void {
-  for (const ext of ['.bin', '.json']) fs.rmSync(path.join(dir, fileStem(key) + ext), { force: true })
+  for (const ext of ['.bin', '.json', '.next.bin']) fs.rmSync(path.join(dir, fileStem(key) + ext), { force: true })
 }
 
 export function listStates(dir: string): StateMeta[] {
@@ -138,7 +189,7 @@ export function listStates(dir: string): StateMeta[] {
     if (!/^state-[0-9a-f]{20}\.json$/.test(name)) continue
     try {
       const meta = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')) as StateMeta
-      if (fs.existsSync(path.join(dir, `${fileStem(meta.key)}.bin`))) out.push(meta)
+      if (fileMatches(dir, meta)) out.push(meta)
     } catch {
       /* a half-written record is no record */
     }
@@ -187,7 +238,18 @@ export async function saveState(o: {
     // Leaves the slot holding exactly this text: nothing after it for a later prompt to undo.
     await post(o.base, '/completion', { prompt: prefix, n_predict: 0, cache_prompt: true, stream: false }, o.signal)
     const stem = fileStem(o.key)
-    const saved = await post(o.base, '/slots/0?action=save', { filename: `${stem}.bin` }, o.signal)
+    /*
+     * Written beside the last good state, and only put in its place once it is whole.
+     *
+     * The server writes the file itself, as it goes. Saving straight over the old one meant a crash
+     * or a power cut part way through left neither: the old state half overwritten, under a record
+     * that still vouched for it. Now an interrupted save leaves the previous state as it was.
+     */
+    const next = path.join(o.dir, `${stem}.next.bin`)
+    fs.rmSync(next, { force: true })
+    const saved = await post(o.base, '/slots/0?action=save', { filename: `${stem}.next.bin` }, o.signal)
+    const fileBytes = fs.statSync(next).size
+    fs.renameSync(next, path.join(o.dir, `${stem}.bin`))
     const meta: StateMeta = {
       key: o.key,
       fingerprint: o.fingerprint,
@@ -195,6 +257,7 @@ export async function saveState(o: {
       prefixHash: sha(prefix),
       tokens: Number(saved.n_saved ?? 0),
       bytes: Number(saved.n_written ?? 0),
+      fileBytes,
       savedAt: Date.now(),
       usedAt: Date.now()
     }
@@ -204,6 +267,7 @@ export async function saveState(o: {
     fs.renameSync(tmp, metaPath(o.dir, o.key))
     return { ok: true, meta }
   } catch (err) {
+    fs.rmSync(path.join(o.dir, `${fileStem(o.key)}.next.bin`), { force: true })
     return { ok: false, why: err instanceof Error ? err.message : String(err) }
   }
 }
@@ -238,6 +302,8 @@ export async function restoreState(o: {
     }
     const loaded = await post(o.base, '/slots/0?action=restore', { filename: `${fileStem(o.key)}.bin` }, o.signal)
     if (Number(loaded.n_restored ?? -1) !== meta.tokens) {
+      // The file and its record disagree, so neither can be trusted again.
+      removeState(o.dir, o.key)
       return { ok: false, why: `the server restored ${String(loaded.n_restored)} tokens where ${meta.tokens} were saved` }
     }
     const used: StateMeta = { ...meta, usedAt: Date.now() }

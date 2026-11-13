@@ -121,6 +121,15 @@ export interface StreamState {
    * raw, usually incomplete JSON accumulated so far — for showing, not for parsing.
    */
   pendingCalls: Record<string, { index: number; name: string; args: string }[]>
+  /** A chat's tool call while it runs, keyed by chat id; gone once its result arrives. */
+  chatToolRunning: Record<string, ToolCall | null>
+  /**
+   * The frames a chat's look at a video returned, keyed by the tool message they belong to.
+   *
+   * In memory only, like the scratchpad they came from, so a conversation reopened after a restart
+   * shows the call without its pictures.
+   */
+  toolFrames: Record<string, string[]>
   /**
    * Ultra's independent attempts for the turn in flight, keyed by conversation.
    *
@@ -219,6 +228,8 @@ const state: StreamState = {
   questionQueue: [],
   toolCalls: {},
   pendingCalls: {},
+  chatToolRunning: {},
+  toolFrames: {},
   ultra: {},
   ultraSynthesising: {},
   ultraPlan: {},
@@ -254,6 +265,8 @@ function emitChange(): void {
     questionQueue: [...state.questionQueue],
     toolCalls: { ...state.toolCalls },
     pendingCalls: { ...state.pendingCalls },
+    chatToolRunning: { ...state.chatToolRunning },
+    toolFrames: { ...state.toolFrames },
     ultra: { ...state.ultra },
     ultraSynthesising: { ...state.ultraSynthesising },
     ultraPlan: { ...state.ultraPlan },
@@ -549,8 +562,20 @@ function wire(): void {
     emitChange()
   })
 
+  on<{ chatId: string; call: ToolCall }>('chat:tool-call', (d) => {
+    state.chatToolRunning[d.chatId || activeId] = d.call
+    emitChange()
+  })
+
+  on<{ chatId: string; messageId: string; frames: string[] }>('chat:tool-frames', (d) => {
+    state.toolFrames[d.messageId] = d.frames
+    emitChange()
+  })
+
   on<{ chatId: string; message: AgentMessage }>('chat:message', (d) => {
     const id = d.chatId || activeId
+    // A tool's result, or the answer, means no call is running any more.
+    state.chatToolRunning[id] = null
     state.partial[id] = ''
     delete state.promptProgress[id]
     // The finished message carries its own reasoning; the streamed copy has served its purpose.

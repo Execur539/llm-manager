@@ -46,6 +46,9 @@ const PRODUCT = pkg.build?.productName ?? 'LLM Manager'
  */
 const OUTFILE = path.join(RELEASE, `${PRODUCT.replace(/\s+/g, '-')}-portable.exe`)
 const ICON = path.join(ROOT, 'build', 'icon.ico')
+/** The stub every shortcut points at (build/stub.nsi), built first and carried inside the launcher. */
+const STUB = path.join(RELEASE, 'llmm-entry-stub.exe')
+const LAUNCHER_SOURCES = [path.join(ROOT, 'build', 'portable.nsi'), path.join(ROOT, 'build', 'stub.nsi')]
 /*
  * NSIS's VIProductVersion demands exactly four numeric parts.
  *
@@ -253,7 +256,11 @@ async function main() {
    */
   const stamp = `${OUTFILE}.buildid`
   const previous = await fsp.readFile(stamp, 'utf8').catch(() => '')
-  if (previous.trim() === `${buildId} ${APP_LEVEL.label}` && fs.existsSync(OUTFILE)) {
+  // The launcher's own scripts are part of what it is: a change to either rebuilds it.
+  const launcherHash = crypto.createHash('sha256')
+  for (const file of LAUNCHER_SOURCES) launcherHash.update(await fsp.readFile(file))
+  const stampValue = `${buildId} ${APP_LEVEL.label} ${launcherHash.digest('hex').slice(0, 12)}`
+  if (previous.trim() === stampValue && fs.existsSync(OUTFILE)) {
     const existing = (await fsp.stat(OUTFILE)).size
     console.log(`\nPayload unchanged (${buildId}) — keeping the existing exe.`)
     console.log(`  ${OUTFILE}`)
@@ -320,7 +327,18 @@ async function main() {
     ((await fsp.stat(APP_ARCHIVE)).size + (await fsp.stat(VENDOR_ARCHIVE)).size + (await treeBytes(UNPACKED))) / 1024 ** 2 + 200
   )
 
-  // ---- 3. the launcher, which only has to carry them
+  // ---- 3. the stub shortcuts point at, then the launcher, which only has to carry them
+  await stage('entry stub', () =>
+    run(makensis, [
+      '/V2',
+      `/DVERSION=${VERSION}`,
+      `/DVERSION4=${VERSION4}`,
+      `/DCOPYRIGHT=${COPYRIGHT}`,
+      `/DOUTFILE=${STUB}`,
+      ...(fs.existsSync(ICON) ? [`/DICON=${ICON}`] : []),
+      path.join(ROOT, 'build', 'stub.nsi')
+    ])
+  )
   await stage('launcher', () =>
     run(makensis, [
       '/V2',
@@ -334,6 +352,7 @@ async function main() {
       `/DAPPEXE=${PRODUCT}.exe`,
       `/DBUILDID=${buildId}`,
       `/DOUTFILE=${OUTFILE}`,
+      `/DSTUB=${STUB}`,
       // Optional: the launcher falls back to the NSIS default if the icon has not been generated.
       ...(fs.existsSync(ICON) ? [`/DICON=${ICON}`] : []),
       path.join(ROOT, 'build', 'portable.nsi')
@@ -345,7 +364,7 @@ async function main() {
   console.log(`  ${'total'.padEnd(30)} ${`${((Date.now() - total) / 1000).toFixed(1)}s`.padStart(7)}`)
 
   // Recorded only after a successful build, so an interrupted one is never mistaken for done.
-  await fsp.writeFile(stamp, `${buildId} ${APP_LEVEL.label}`)
+  await fsp.writeFile(stamp, stampValue)
   const size = (await fsp.stat(OUTFILE)).size
   console.log(`\nDone: ${OUTFILE}`)
   console.log(`  ${(size / 1024 ** 3).toFixed(2)} GB  (${((size / payloadBytes) * 100).toFixed(0)}% of payload)`)

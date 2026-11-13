@@ -11,6 +11,7 @@
 
 import path from 'node:path'
 import fsp from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import { buildGguf, createEnv, addModel, addDocument, addEmbeddingModel, startMockHf, cleanupEnv, ROOT } from './fixtures.mjs'
 import { Report, launchApp, closeApp, goTo, shot, auditLayout, auditResponsive, stubDialogs, toastTexts, VIEWS, SHOTS_DIR, scenarioContext } from './harness.mjs'
 import fs from 'node:fs'
@@ -141,12 +142,12 @@ const scenarios = {
        */
       await goTo(page, 'Settings')
       await page.evaluate(() => {
-        const m = document.querySelector('.main')
+        const m = document.querySelector('.main-scroll')
         if (m) m.scrollTop = m.scrollHeight
       })
       await page.waitForTimeout(400)
       const gap = await page.evaluate(() => {
-        const main = document.querySelector('.main')
+        const main = document.querySelector('.main-scroll')
         const cards = [...document.querySelectorAll('.main .card')]
         const last = cards[cards.length - 1]
         if (!main || !last) return -1
@@ -307,15 +308,15 @@ const scenarios = {
       // The fit badge is computed asynchronously; assert on the settled value, not the spinner.
       await page
         .waitForFunction(
-          () => !document.querySelector('.model-card')?.textContent?.includes('checking'),
+          () => !/checking/i.test(document.querySelector('.model-card')?.textContent ?? 'checking'),
           undefined,
           { timeout: 20000 }
         )
         .catch(() => undefined)
 
       const badges = await page.locator('.model-card .badge').allTextContents()
-      report.check('model-lifecycle', 'model card shows a fit badge', badges.some((b) => /fits|offload|tradeoff|too large/.test(b)), badges.join(','))
-      report.check('model-lifecycle', 'capabilities detected', badges.some((b) => /vision|tools/.test(b)), badges.join(','))
+      report.check('model-lifecycle', 'model card shows a fit badge', badges.some((b) => /fits|offload|tradeoff|too large/i.test(b)), badges.join(','))
+      report.check('model-lifecycle', 'capabilities detected', badges.some((b) => /vision|tools/i.test(b)), badges.join(','))
 
       await page.locator('.model-card').first().click()
       await page.waitForSelector('button:has-text("Load with this plan")', { timeout: 15000 })
@@ -2184,7 +2185,8 @@ const scenarios = {
 
         const m = await page.evaluate(() => {
           const rect = (sel) => {
-            const el = document.querySelector(sel)
+            // A list inside the sidebar is already counted in the sidebar's width.
+            const el = [...document.querySelectorAll(sel)].find((x) => sel === '.sidebar' || !x.closest('.sidebar'))
             if (!el) return null
             const r = el.getBoundingClientRect()
             // A closed drawer still has a width; what matters is whether it occupies the viewport.
@@ -2630,6 +2632,81 @@ const scenarios = {
   },
 
   /** Attaching files: the picker, drag-and-drop, and what each type turns into. */
+  /**
+   * A video attached in Chat goes into the scratchpad, and the model watches it itself.
+   *
+   * Chat cannot reach the machine the way the agent can, so a video is copied into the
+   * conversation's scratchpad (memory, by default) and the model looks at it with watch_video. The
+   * call shows in the transcript with the frames it returned, the scratchpad reports what it holds,
+   * and deleting the conversation empties it.
+   */
+  async chatScratchpad() {
+    await withApp('chat-scratchpad', async ({ app, page, env }) => {
+      const ffmpeg = path.join(ROOT, 'vendor', 'ffmpeg', 'ffmpeg.exe')
+      if (!fs.existsSync(ffmpeg)) {
+        report.ok('chat-scratchpad', 'skipped: vendor/ffmpeg is not present')
+        return
+      }
+      const dir = path.join(env.base, 'files')
+      await fsp.mkdir(dir, { recursive: true })
+      const video = path.join(dir, 'clip.mp4')
+      await new Promise((resolve, reject) =>
+        execFile(
+          ffmpeg,
+          ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=6:size=320x240:rate=10', '-pix_fmt', 'yuv420p', '-y', video],
+          { windowsHide: true },
+          (err) => (err ? reject(err) : resolve())
+        )
+      )
+
+      await loadModel(page)
+      await goTo(page, 'Chat')
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+
+      await stubDialogs(app, { open: [video] })
+      await page.getByTestId('attach-button').click()
+      await page.waitForSelector('[data-testid="attachment"]', { timeout: 10000 })
+
+      await page.getByTestId('chat-input').fill(
+        '[[mock:calltool:watch_video]] [[mock:toolonce]] [[mock:toolargs:{"name":"clip.mp4"}]] what happens in this video?'
+      )
+      await page.getByTestId('chat-send').click()
+      await page.waitForFunction(
+        () => {
+          const el = document.querySelector('[data-testid="chat-input"]')
+          return el instanceof HTMLTextAreaElement && !el.disabled
+        },
+        undefined,
+        { timeout: 60000 }
+      )
+      await page.waitForTimeout(500)
+
+      const card = (await page.locator('[data-testid="tool-card"]').first().textContent().catch(() => '')) ?? ''
+      report.check('chat-scratchpad', 'the model watching the video shows as a tool call', /watch_video/.test(card) && /clip\.mp4/.test(card), card.slice(0, 80))
+      const frames = await page.locator('[data-testid="tool-frames"] img').count()
+      report.check('chat-scratchpad', 'with the frames it looked at', frames === 8, `${frames} frames`)
+      const after = await page.locator('.messages .msg.from-assistant').count()
+      report.check('chat-scratchpad', 'and then an answer', after > 0, `${after} replies`)
+      const status = await page.evaluate(() => window.api.invoke('scratchpad:status'))
+      report.check('chat-scratchpad', 'the scratchpad holds the video, in memory', status.files === 1 && status.inMemory > 0, JSON.stringify(status))
+      await auditLayout(page, 'Chat (watched a video)', report)
+      await shot(page, 'chat-scratchpad')
+
+      await goTo(page, 'Settings')
+      await page.locator('#settings-scratchpad').scrollIntoViewIfNeeded()
+      const usage = (await page.getByTestId('scratchpad-usage').textContent()) ?? ''
+      report.check('chat-scratchpad', 'Settings says what it holds', /1 file/.test(usage), usage)
+      await shot(page, 'settings-scratchpad')
+
+      const chats = await page.evaluate(() => window.api.invoke('chat:list', 'chat'))
+      for (const c of chats) await page.evaluate((id) => window.api.invoke('chat:delete', id), c.id)
+      await page.waitForTimeout(400)
+      const cleared = await page.evaluate(() => window.api.invoke('scratchpad:status'))
+      report.check('chat-scratchpad', 'deleting the conversation empties its scratchpad', cleared.files === 0, JSON.stringify(cleared))
+    })
+  },
+
   async attachments() {
     await withApp('attachments', async ({ app, page, env }) => {
       const dir = path.join(env.base, 'files')

@@ -27,7 +27,9 @@ import type {
   PermissionRequest,
   AttachmentInfo,
   AgentMessage,
-  AgentSessionState
+  AgentSessionState,
+  ToolCall,
+  ToolDefinition
 } from '@shared/types'
 import { defaultModelsDir, exeDir, TOOL_OUTPUT_DIR } from './storage/paths'
 import { loadSettings, patchSettings } from './storage/settings'
@@ -37,17 +39,22 @@ import { draftReserveBytes } from './models/draft-module'
 import { resolveBatches } from './autofit/engine'
 import { isInside, libraryRoots } from './models/roots'
 import { checkRelocation, keepInPlace, performMove } from './models/relocation'
-import { DEFAULT_CONSTRAINTS, gpuKey, learnHeadroom, planFit, usableDevices, verifyPrediction } from './autofit/engine'
+import { DEFAULT_CONSTRAINTS, gpuKey, usableDevices } from './autofit/engine'
+import { describeLoad, extrasFromLoad, learnedExtras, planModel, recordSpeed, type ExtrasFeatures } from './autofit/planner'
 import { llama, estimateTokens, type ChatMessage, type ContentPart, type CompletionOptions } from './runtime/llama'
 import type { RereadReport } from './runtime/reuse-meter'
-import { listStates, prune, readMeta, removeState, restoreState, saveState } from './runtime/state-cache'
+import { checkpointDue, listStates, prune, readMeta, removeState, restoreState, saveState } from './runtime/state-cache'
 import { stateCacheFolder } from './runtime/llama'
 import crypto from 'node:crypto'
 import { missingBinaries, embeddingModelPath, vendorDiagnostics, llamaServerPath } from './runtime/binaries'
 import { cudaKvPairs, MATCHED_KV_PAIRS } from './runtime/fa-kernels'
 import { deleteLogin, listLogins, saveLogin } from './agent/credentials'
 import { Agent } from './agent/loop'
-import { describeVideo, videoFacts } from './agent/tools/video'
+import { describeVideo, lookAtVideo, videoFacts } from './agent/tools/video'
+import { makeResult, splitOutput, type ToolOutput } from './agent/tools/base'
+import { rebuildHistory } from './agent/history'
+import { scratchpad, scratchServer, idleMinutes, scratchpadChanged, onScratchpadChange, stopScratchpad } from './scratchpad'
+import { CHAT_TOOLS, runChatTool } from './scratchpad/tools'
 import { killAllJobs } from './agent/tools/exec'
 import { closeBrowser } from './agent/tools/browser'
 import { listCheckpoints, rewindTo, discardCheckpoints } from './agent/checkpoints'
@@ -92,7 +99,6 @@ import {
 import * as rag from './rag'
 import * as chats from './chat/repo'
 import { buildContent, type VideoContext, type PreparedMedia } from './chat/multimodal'
-import { planVideo } from './chat/video-plan'
 import { classifyAttachment, recordAttachment, toDataUrl, IMAGE_EXT, AUDIO_EXT, VIDEO_EXT, TEXT_EXT } from './chat/repo'
 import { historicalStats, liveStats, requestLog, recordGeneration, clearStats, setContextUsed } from './stats'
 import { buildDiagnostics, logger } from './log'
@@ -215,6 +221,9 @@ export function setEmitter(fn: Emitter): void {
   emit = fn
 }
 
+// What the scratchpad holds, for the window: every add, delete and sweep.
+onScratchpadChange(() => emit('scratchpad:changed', scratchpad.totals()))
+
 /*
  * A long wait before a reply is explained where it happens.
  *
@@ -228,6 +237,43 @@ llama.on('reread', (r: RereadReport) => {
     message: `Read ${r.read.toLocaleString()} of ${r.total.toLocaleString()} tokens before this reply: ${r.reason}.`
   })
 })
+
+/** Each reply's real decode speed, kept against the plan that produced it. */
+llama.on('decodeSpeed', (d: { tokensPerSecond: number; tokens: number }) => {
+  const loaded = llama.loaded
+  if (!loaded) return
+  try {
+    recordSpeed(loaded.model.id, loaded.plan, d.tokensPerSecond, d.tokens)
+  } catch (err) {
+    logger.warn('autofit', 'could not keep a speed measurement', err)
+  }
+})
+
+/**
+ * The cards as they will be once the loaded model makes way.
+ *
+ * Planning another model, or the same one again, happens while the current one still holds its
+ * VRAM. What its load cost was measured when it loaded, so that is given back to the free figure
+ * rather than planning the next model into whatever happens to be left.
+ */
+function withLoadedReleased(hw: HardwareSnapshot): HardwareSnapshot {
+  const loaded = llama.loaded
+  if (!loaded) return hw
+  const row = get<{ actual_vram: string | null }>('SELECT actual_vram FROM model_configs WHERE model_id = ?', loaded.model.id)
+  try {
+    const held = row?.actual_vram ? (JSON.parse(row.actual_vram) as { keys?: string[]; bytes?: number[] }) : null
+    if (!held?.keys || !held.bytes) return hw
+    return {
+      ...hw,
+      gpus: hw.gpus.map((g) => {
+        const i = held.keys!.indexOf(gpuKey(g))
+        return i >= 0 && g.freeIsMeasured ? { ...g, freeVram: Math.min(g.totalVram, g.freeVram + (held.bytes![i] ?? 0)) } : g
+      })
+    }
+  } catch {
+    return hw
+  }
+}
 
 /** Stands in for the next message while a conversation is read ahead of it. */
 const STAND_IN: ChatMessage = { role: 'user', content: '.' }
@@ -277,7 +323,8 @@ async function conversationRequest(key: string): Promise<CompletionOptions | nul
     const history = chats.loadMessages(id)
     if (!history.length) return null
     await restoreConversationMedia(id, history)
-    return { messages: chatMessagesFor(id, history, loadSettings().reasoning.preserve), cacheKey: key, ...effort }
+    const tools = chatToolsFor(id, history)
+    return { messages: chatMessagesFor(id, history, loadSettings().reasoning.preserve), cacheKey: key, ...(tools ? { tools } : {}), ...effort }
   }
   if (key.startsWith('agent:')) {
     const session = chats.loadSession(key.slice('agent:'.length))
@@ -317,11 +364,15 @@ async function parkHeld(nextKey: string | null, signal?: AbortSignal): Promise<v
     const req = await conversationRequest(held)
     // Only what the server is still holding: bringing it there first would mean reading it all.
     if (!req || signal?.aborted || !llama.holds(req)) return
+    // Already on disk exactly as it is: a quiet moment's save made it, and rewriting it would change nothing.
+    const shape = stateShape(req)
+    if (savedShapes.get(held) === shape && readMeta(store.dir, held)) return
     const result = await saveState({ ...store, key: held, req, signal })
     if (!result.ok) {
       logger.info('prompt', `${held} was not saved to disk: ${result.why}`)
       return
     }
+    savedShapes.set(held, shape)
     llama.assumeHeld(req)
     const budget = Math.max(1, loadSettings().runtime.stateCache.budgetGb) * 1024 ** 3
     const pins = statePins(store.dir)
@@ -331,6 +382,61 @@ async function parkHeld(nextKey: string | null, signal?: AbortSignal): Promise<v
   } catch (err) {
     logger.warn('prompt', `could not save ${held} to disk`, err)
   }
+}
+
+/** What a conversation's saved state was made from, by key: nothing is saved twice over. */
+const savedShapes = new Map<string, string>()
+
+function stateShape(req: CompletionOptions): string {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify([req.messages, req.tools?.map((t) => t.name) ?? [], req.reasoningEffort ?? null, req.chatTemplateKwargs ?? null]))
+    .digest('hex')
+}
+
+/** How long a conversation is left alone after a reply before it is saved. */
+const CHECKPOINT_DELAY_MS = 4000
+const checkpointTimers = new Map<string, NodeJS.Timeout>()
+
+/**
+ * Save a conversation at a quiet moment, so that a crash, a power cut or Windows restarting costs
+ * at most its last few turns, not a reading of the whole thing.
+ *
+ * Saving used to happen only when the server was about to let go of a conversation: another one
+ * read in, the model unloaded, the app closed. Anything that ended the app without warning lost
+ * everything since. Now each reply is followed, once the conversation has been quiet for a few
+ * seconds, by a save of exactly what the next message will reuse (see checkpointDue for when
+ * that is worth the disk). It runs as background work, so a message sent meanwhile stops it.
+ */
+async function checkpoint(key: string, signal: AbortSignal): Promise<void> {
+  const store = llama.stateStore
+  if (!store || !conversationStates() || llama.heldKey !== key || signal.aborted) return
+  const id = key.slice(key.indexOf(':') + 1)
+  if (!checkpointDue(chats.getContextUsed(id) ?? null, readMeta(store.dir, key), Date.now())) return
+  await parkHeld(null, signal)
+}
+
+/** The same, a few seconds from now, unless the conversation is busy again by then. */
+function checkpointLater(key: string): void {
+  if (!conversationStates()) return
+  clearTimeout(checkpointTimers.get(key))
+  const timer = setTimeout(() => {
+    checkpointTimers.delete(key)
+    // Anyone using the model goes first; that turn's own end schedules the next try.
+    if (!llama.loaded || agentTurnAbort || inFlightChats.size > 0 || llama.idleBusy) return
+    void llama.runIdle((signal) => checkpoint(key, signal))
+  }, CHECKPOINT_DELAY_MS)
+  timer.unref()
+  checkpointTimers.set(key, timer)
+}
+
+/**
+ * Before the machine sleeps or Windows ends the session: save what the server holds, if it is not
+ * on disk already. Bounded, since the system only waits so long.
+ */
+export async function parkBeforeSleep(ms: number): Promise<void> {
+  await llama.preemptIdle().catch(() => undefined)
+  await parkHeld(null, AbortSignal.timeout(ms))
 }
 
 /** Load a conversation's saved state into the server. False when there is none or it no longer fits. */
@@ -532,13 +638,22 @@ async function retitleChat(chatId: string, reasoning: ReasoningChoice | null, si
 /** After a chat turn: name it if due, and summarise if the window is filling. One background job. */
 function afterChatTurn(chatId: string, reasoning: ReasoningChoice | null): void {
   const loaded = llama.loaded
-  if (!loaded || agentTurnAbort || inFlightChats.size > 0 || llama.idleBusy) return
+  const key = `chat:${chatId}`
+  if (!loaded || agentTurnAbort || inFlightChats.size > 0 || llama.idleBusy) {
+    checkpointLater(key)
+    return
+  }
   const retitle = titleDue(chatId)
   const tidy = canWarm() && (chats.getContextUsed(chatId) ?? 0) >= loaded.plan.contextLength * TIDY_AT
-  if (!retitle && !tidy) return
+  if (!retitle && !tidy) {
+    checkpointLater(key)
+    return
+  }
   void llama.runIdle(async (signal) => {
     if (retitle) await retitleChat(chatId, reasoning, signal)
     if (tidy && !signal.aborted) await tidyChatNow(chatId, reasoning, signal)
+    // Saved after the rest, so what is kept is the conversation as tidied.
+    if (!signal.aborted) await checkpoint(key, signal)
   })
 }
 
@@ -556,8 +671,14 @@ async function tidyChatNow(chatId: string, reasoning: ReasoningChoice | null, si
     background: true
   })
   if (!report.ok || signal.aborted) return
+  const tools = chatToolsFor(chatId, history)
   await readAhead(
-    { messages: chatMessagesFor(chatId, history, preserveReasoning), cacheKey: `chat:${chatId}`, ...effortFields(reasoning) },
+    {
+      messages: chatMessagesFor(chatId, history, preserveReasoning),
+      cacheKey: `chat:${chatId}`,
+      ...(tools ? { tools } : {}),
+      ...effortFields(reasoning)
+    },
     signal
   )
 }
@@ -565,8 +686,11 @@ async function tidyChatNow(chatId: string, reasoning: ReasoningChoice | null, si
 /** The same after an agent turn. */
 function tidyAgent(sessionId: string): void {
   const loaded = llama.loaded
-  if (!loaded || !canWarm()) return
-  if ((chats.getContextUsed(sessionId) ?? 0) < loaded.plan.contextLength * TIDY_AT) return
+  const key = `agent:${sessionId}`
+  if (!loaded || !canWarm() || (chats.getContextUsed(sessionId) ?? 0) < loaded.plan.contextLength * TIDY_AT) {
+    checkpointLater(key)
+    return
+  }
   void llama.runIdle(async (signal) => {
     const session = chats.loadSession(sessionId)
     if (!session) return
@@ -592,6 +716,7 @@ function tidyAgent(sessionId: string): void {
       },
       signal
     )
+    if (!signal.aborted) await checkpoint(key, signal)
   })
 }
 
@@ -903,17 +1028,75 @@ const MEDIA_TOKEN_ESTIMATE = 1200
  * left out. It rides on the first kept message when that one is the user's, so the roles still
  * alternate — some chat templates refuse two user turns in a row.
  */
+/**
+ * Frames chat's watch_video returned, by conversation and by the message they belong to.
+ *
+ * In memory only, like the scratchpad they came out of: a rebuilt prompt sends them again for as
+ * long as the app stays open, and after a restart says they are gone, rather than pictures of
+ * someone's video being written to disk to survive it.
+ */
+const chatHeldMedia = new Map<string, Map<string, ContentPart[]>>()
+
+function holdChatMedia(chatId: string, messageId: string, parts: ContentPart[]): void {
+  let held = chatHeldMedia.get(chatId)
+  if (!held) {
+    held = new Map()
+    chatHeldMedia.set(chatId, held)
+  }
+  held.set(messageId, parts)
+  // A long session of looking at videos should not hold every frame it ever saw.
+  if (held.size > 64) held.delete(held.keys().next().value as string)
+}
+
+const FRAMES_NOT_KEPT: ContentPart[] = [
+  {
+    type: 'text',
+    text: '[The frames this look returned are not kept once the app closes. If you need them and the video is still in your scratchpad, look again.]'
+  }
+]
+
+/** What each stored message of a chat sent beyond its text, for rebuilding its prompt. */
+function chatSentContent(chatId: string, history: AgentMessage[]): (id: string) => string | ContentPart[] | undefined {
+  const caps = llama.loaded?.model.caps
+  const looks = new Set(
+    history
+      .filter((m) => m.role === 'tool' && m.toolCalls?.[0]?.name === 'watch_video' && /Showing \d+ frame/.test(m.content))
+      .map((m) => m.id)
+  )
+  return (id) => chatHeldMedia.get(chatId)?.get(id) ?? (looks.has(id) ? FRAMES_NOT_KEPT : sentContentFor(id, caps))
+}
+
+/**
+ * The tools a chat's next request offers: its scratchpad's, once the conversation has used it.
+ *
+ * Only from the first time they are needed, so an ordinary conversation's prompt is exactly what it
+ * always was; and from then on every time, scratchpad empty or not, because tool definitions open
+ * the prompt and changing them makes the server read the whole conversation again. Never for a
+ * model that cannot call tools; those are shown an overview of a video instead.
+ */
+function chatToolsFor(chatId: string, history: AgentMessage[], adding = false): ToolDefinition[] | undefined {
+  if (!llama.loaded?.model.caps.tools) return undefined
+  const used =
+    adding ||
+    scratchpad.list(chatId).length > 0 ||
+    history.some((m) => m.role === 'tool' || m.attachments?.some((a) => a.kind === 'video'))
+  return used ? CHAT_TOOLS : undefined
+}
+
+/** How many rounds of tool calls one chat turn may make before it is made to answer. */
+const CHAT_TOOL_ROUNDS = 24
+
 function chatPromptHistory(chatId: string, history: AgentMessage[], preserveReasoning: boolean): ChatMessage[] {
   const stored = chats.getSummary(chatId)
   const upto = stored ? history.findIndex((m) => m.id === stored.uptoMessageId) : -1
-  const out = (upto === -1 ? history : history.slice(upto + 1)).map((m): ChatMessage => {
-    // An earlier message goes back exactly as it was sent, attachments included; the transcript has only its text.
-    const sent = m.role === 'user' ? sentContentFor(m.id, llama.loaded?.model.caps) : undefined
-    return {
-      role: m.role === 'tool' ? 'user' : (m.role as 'user' | 'assistant' | 'system'),
-      content: sent ?? m.content,
-      ...(preserveReasoning && m.role === 'assistant' && m.reasoning ? { reasoning_content: m.reasoning } : {})
-    }
+  /*
+   * An earlier message goes back exactly as it was sent, attachments included, and tool use goes
+   * back as tool use: the calls on the reply that made them, each result after, and any frames it
+   * returned after that, the shape the turn first had. The transcript has only the text.
+   */
+  const out = rebuildHistory(upto === -1 ? history : history.slice(upto + 1), {
+    preserveReasoning,
+    sentContentFor: chatSentContent(chatId, history)
   })
   if (stored && upto !== -1) {
     const note = `[Summary of the earlier conversation]\n${stored.summary}`
@@ -1175,29 +1358,6 @@ function batchOverrides(s: AppSettings): FitConstraints['overrides'] {
   return out
 }
 
-/**
- * Extra headroom per card for a model, from how far its last load overshot its prediction.
- *
- * "Widening the safety margin for next time" used to be a promise nothing kept: the measured
- * figures were stored and never read, so five retries of one model made byte-identical plans
- * and crashed the same way. Rows from before the figures carried their card keys are ignored.
- */
-function learnedHeadroomFor(modelId: string): Record<string, number> {
-  const row = all<{ predicted_vram: string | null; actual_vram: string | null }>(
-    'SELECT predicted_vram, actual_vram FROM model_configs WHERE model_id = ?',
-    modelId
-  )[0]
-  if (!row?.predicted_vram || !row.actual_vram) return {}
-  try {
-    const measured = JSON.parse(row.actual_vram) as { keys?: unknown; bytes?: unknown }
-    const predicted = JSON.parse(row.predicted_vram) as unknown
-    if (!Array.isArray(measured?.keys) || !Array.isArray(measured.bytes) || !Array.isArray(predicted)) return {}
-    return learnHeadroom({ keys: measured.keys as string[], predicted: predicted as number[], actual: measured.bytes as number[] })
-  } catch {
-    return {}
-  }
-}
-
 /** The auto-fit constraints as the user's settings define them. */
 function constraintsFromSettings(s: AppSettings): FitConstraints {
   return {
@@ -1210,6 +1370,48 @@ function constraintsFromSettings(s: AppSettings): FitConstraints {
     expertCacheSlots: s.runtime.expertCache,
     allowRopeScaling: s.autoFit.allowRopeScaling,
     overrides: batchOverrides(s)
+  }
+}
+
+/** What a load's extras depend on, for matching them to the last load's measurement. */
+function extrasFeatures(model: ModelRecord, backend: Backend, overrides: FitConstraints['overrides']): ExtrasFeatures {
+  return {
+    mmproj: model.caps.mmprojPath ?? null,
+    draft: draftReserve(model, backend, overrides).draftModule ?? null,
+    ubatch: resolveBatches(overrides.batchSize, overrides.ubatchSize).ubatch
+  }
+}
+
+/**
+ * Everything the planner needs to plan this model on this machine now.
+ *
+ * Settings, the load dialog's own choices on top, the cache pairings the build is fast at, and what
+ * the model's last load measured outside llama.cpp's buffers (falling back to an estimate from the
+ * projector and head sizes when there is no such load yet).
+ */
+async function planConstraints(
+  model: ModelRecord,
+  hw: HardwareSnapshot,
+  extra: FitConstraints['overrides'] = {}
+): Promise<FitConstraints> {
+  const s = loadSettings()
+  const overrides = { ...batchOverrides(s), ...extra }
+  const base = constraintsFromSettings(s)
+  const arch = model.arch
+  const head = model.caps.mtpModule
+  const { ubatch } = resolveBatches(overrides.batchSize, overrides.ubatchSize)
+  // The head's own cache follows the plan's context; what it costs at a given context, for moving a measurement.
+  const draftKvAt = (ctx: number): number =>
+    head && arch ? draftReserveBytes(head, arch, ctx, ubatch) - draftReserveBytes(head, arch, 0, ubatch) : 0
+  const ceiling = arch?.contextLength && !s.autoFit.allowRopeScaling ? arch.contextLength : Infinity
+  const expectedCtx = Math.min(overrides.contextLength ?? Math.max(s.autoFit.targetContext, s.autoFit.idealContext), ceiling)
+  return {
+    ...base,
+    companionBytes: companionSize(model),
+    draftBytes: draftReserve(model, hw.backend, overrides).draftBytes,
+    extrasPerGpu: learnedExtras(model.id, usableDevices(hw), extrasFeatures(model, hw.backend, overrides), expectedCtx, draftKvAt),
+    kvPairs: await kvPairsFor(hw.backend),
+    overrides
   }
 }
 
@@ -1227,20 +1429,15 @@ async function kvPairsFor(backend: Backend): Promise<string[] | undefined> {
 }
 
 /**
- * The next plan to try when one did not fit: routed experts to the host first, whole layers after.
+ * The next plan to try when one did not fit.
  *
- * Experts are the cheap thing to give up — a token reads ten of five hundred — so they move
- * before anything that is read on every token. Returns null when there is nothing left to move.
+ * Cheapest first: GPU expert-cache slots (each one is a little speed), then routed experts to the
+ * host (a token reads ten of five hundred), and whole layers last. Returns null when there is
+ * nothing left to give up.
  */
-function moreConservative(
-  plan: FitPlan,
-  arch: ModelArchInfo,
-  hw: HardwareSnapshot,
-  companionBytes: number,
-  kvPairs: string[] | undefined,
-  draftBytes = 0
-): FitPlan | null {
-  const base = { ...constraintsFromSettings(loadSettings()), companionBytes, kvPairs, draftBytes }
+async function moreConservative(plan: FitPlan, model: ModelRecord, hw: HardwareSnapshot): Promise<FitPlan | null> {
+  const arch = model.arch
+  if (!arch) return null
   // The batch sizes too: a retry that fell back to 512 would change the load's speed as well as its placement.
   const keep = {
     contextLength: plan.contextLength,
@@ -1253,29 +1450,29 @@ function moreConservative(
     const next = result.chosen ?? result.alternatives[0]
     return next ? { ...next, draftMax: plan.draftMax, draftModule: plan.draftModule } : null
   }
+  const replan = async (overrides: FitConstraints['overrides'], slots?: number): Promise<FitPlan | null> => {
+    const constraints = await planConstraints(model, hw, overrides)
+    return take(await planModel({ model, hw, constraints: slots === undefined ? constraints : { ...constraints, expertCacheSlots: slots }, measure: false }))
+  }
+
+  const slots = plan.expertCacheSlots ?? 0
+  if (slots > 16) {
+    const next = await replan({ ...keep, cpuMoeLayers: plan.cpuMoeLayers ?? arch.blockCount }, Math.floor(slots * 0.7))
+    if (next) return next
+  }
 
   const cpuMoe = plan.cpuMoeLayers ?? 0
   if (arch.expertCount > 0 && cpuMoe < arch.blockCount) {
     // A tenth of the stack at a time: small enough not to give away speed needlessly, large
     // enough that three retries cover a badly wrong estimate rather than inching towards it.
     const step = Math.max(2, Math.round(arch.blockCount / 10))
-    const next = Math.min(arch.blockCount, cpuMoe + step)
-    const replanned = take(planFit(arch, hw, { ...base, overrides: { ...keep, cpuMoeLayers: next } }))
-    if (replanned) return replanned
+    const next = await replan({ ...keep, cpuMoeLayers: Math.min(arch.blockCount, cpuMoe + step) })
+    if (next) return next
   }
 
   const layers = Math.floor(plan.gpuLayers * 0.9)
   if (layers > 0 && layers < plan.gpuLayers) {
-    return take(
-      planFit(arch, hw, {
-        ...base,
-        overrides: {
-          ...keep,
-          gpuLayers: layers,
-          ...(arch.expertCount > 0 ? { cpuMoeLayers: arch.blockCount } : {})
-        }
-      })
-    )
+    return replan({ ...keep, gpuLayers: layers, ...(arch.expertCount > 0 ? { cpuMoeLayers: arch.blockCount } : {}) }, 0)
   }
   return null
 }
@@ -1294,7 +1491,6 @@ async function loadWithBackoff(
   hw: HardwareSnapshot
 ): Promise<{ loaded: Awaited<ReturnType<typeof llama.load>>; plan: FitPlan }> {
   const arch = model.arch
-  const kvPairs = await kvPairsFor(hw.backend)
   let current = plan
   for (let attempt = 0; ; attempt++) {
     try {
@@ -1302,24 +1498,12 @@ async function loadWithBackoff(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const outOfVram = /out of memory|failed to allocate|unable to allocate/i.test(message)
-      const next =
-        outOfVram && arch && attempt < 3
-          ? moreConservative(
-              current,
-              arch,
-              hw,
-              companionSize(model),
-              kvPairs,
-              current.draftModule
-                ? draftReserve(model, hw.backend, { batchSize: current.batchSize, ubatchSize: current.ubatchSize }).draftBytes
-                : 0
-            )
-          : null
+      const next = outOfVram && arch && attempt < 3 ? await moreConservative(current, model, hw) : null
       if (!next) throw err
-      logger.warn('model', `${model.filename}: load ran out of VRAM, retrying with more of it in system RAM`, {
+      logger.warn('model', `${model.filename}: load ran out of VRAM, retrying with less on the GPUs`, {
         attempt: attempt + 1,
-        from: { cpuMoeLayers: current.cpuMoeLayers ?? 0, gpuLayers: current.gpuLayers, context: current.contextLength },
-        to: { cpuMoeLayers: next.cpuMoeLayers ?? 0, gpuLayers: next.gpuLayers, context: next.contextLength }
+        from: { slots: current.expertCacheSlots ?? 0, cpuMoeLayers: current.cpuMoeLayers ?? 0, gpuLayers: current.gpuLayers, context: current.contextLength },
+        to: { slots: next.expertCacheSlots ?? 0, cpuMoeLayers: next.cpuMoeLayers ?? 0, gpuLayers: next.gpuLayers, context: next.contextLength }
       })
       current = next
     }
@@ -1344,28 +1528,21 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
    */
   await summarizer.stop()
 
+  /*
+   * The loaded model goes before anything is measured, when a new plan is to be made.
+   *
+   * Its VRAM was counted as taken: loading a second model planned it into what the first one left,
+   * then unloaded the first and loaded the second into a plan sized for a fraction of the cards.
+   */
+  if (!plan && llama.loaded) await llama.unload()
+
   const hw = await settledHardware()
   const fresh = await refreshFreeVram(hw)
   hardware = fresh
 
   let chosen = plan
   if (!chosen) {
-    const s = loadSettings()
-    const result = planFit(model.arch, fresh, {
-      ...DEFAULT_CONSTRAINTS,
-      minKvType: s.autoFit.minKvType,
-      preferredKvType: s.autoFit.preferredKvType,
-      targetContext: s.autoFit.targetContext,
-      idealContext: s.autoFit.idealContext,
-      headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
-      expertCacheSlots: s.runtime.expertCache,
-      allowRopeScaling: s.autoFit.allowRopeScaling,
-      companionBytes: companionSize(model),
-      draftBytes: draftReserve(model, fresh.backend, batchOverrides(s)).draftBytes,
-      learnedHeadroom: learnedHeadroomFor(model.id),
-      kvPairs: await kvPairsFor(fresh.backend),
-      overrides: batchOverrides(s)
-    })
+    const result = await planModel({ model, hw: fresh, constraints: await planConstraints(model, fresh), measure: true })
     chosen = result.chosen ?? result.alternatives[0]
     if (!chosen) throw new Error('No workable configuration was found for this model on this hardware.')
   }
@@ -1406,18 +1583,36 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
     const now = after.gpus.find((x) => x.index === g.index)
     return now ? Math.max(0, g.freeVram - now.freeVram) : 0
   })
-  const verdict = verifyPrediction(chosen, actual)
-  if (verdict.suggestion) {
-    logger.info('autofit', verdict.suggestion, { predicted: chosen.predictedVramPerGpu, actual })
-    emit('autofit:verified', { ...verdict, predicted: chosen.predictedVramPerGpu, actual })
-  }
+  /*
+   * What the load cost outside llama.cpp's buffers is learned from this, exactly, rather than
+   * widening a margin: the cards' loss, less the dry-run figure and the cache. A plan that was not
+   * measured keeps the previous measurement, since its extras would absorb the estimate's error.
+   */
+  const s = loadSettings()
+  const learned = extrasFromLoad(
+    chosen,
+    planned,
+    actual,
+    extrasFeatures(model, fresh.backend, { ...batchOverrides(s), batchSize: chosen.batchSize, ubatchSize: chosen.ubatchSize })
+  )
+  const previous = get<{ extras: string | null }>('SELECT extras FROM model_configs WHERE model_id = ?', model.id)?.extras ?? null
+  const keptExtras = learned && (learned.exact || !previous) ? JSON.stringify(learned) : previous
+  const comparison = describeLoad(chosen, planned, actual)
+  logger.info('autofit', comparison ?? 'load matched its plan', {
+    predicted: chosen.predictedVramPerGpu,
+    actual,
+    measured: !!chosen.measured,
+    extras: learned?.bytes
+  })
+  if (comparison) emit('autofit:verified', { suggestion: comparison, predicted: chosen.predictedVramPerGpu, actual })
 
   run(
-    'INSERT OR REPLACE INTO model_configs (model_id, plan, predicted_vram, actual_vram, updated_at) VALUES (?, ?, ?, ?, ?)',
+    'INSERT OR REPLACE INTO model_configs (model_id, plan, predicted_vram, actual_vram, extras, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
     model.id,
     JSON.stringify(chosen),
     JSON.stringify(chosen.predictedVramPerGpu),
     JSON.stringify({ keys: planned.map(gpuKey), bytes: actual }),
+    keptExtras,
     Date.now()
   )
   run(
@@ -1611,27 +1806,20 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
    * all, and the measured per-frame cost. A settings panel full of sliders whose effect you
    * cannot see until you upload something is a panel of guesses.
    */
-  'video:estimate': async (durationSeconds = 120) => {
-    const v = await videoContext()
-    const plan = planVideo({
-      contextLength: v.contextLength,
-      share: v.share,
-      detail: v.detail,
-      durationSeconds: Math.max(1, durationSeconds),
-      // A hypothetical clip has no shape of its own, and 16:9 is what most footage is.
-      aspect: 16 / 9,
-      temporalPairing: v.serverTakesVideo,
-      trackScale: v.trackScale,
-      stillShare: v.stillShare,
-      maxFps: v.maxFps
-    })
-    return {
-      ...plan,
-      contextLength: v.contextLength,
-      /** False when nothing is loaded, so the panel can say the figures are provisional. */
-      modelLoaded: !!llama.loaded,
-      serverTakesVideo: v.serverTakesVideo
-    }
+  // ---- chat's scratchpad
+  'scratchpad:list': (chatId: string) => scratchpad.list(chatId),
+  'scratchpad:status': () => {
+    const s = loadSettings().scratchpad
+    return { ...scratchpad.totals(), location: s.location, folder: s.folder, idleMinutes: idleMinutes() }
+  },
+  'scratchpad:remove': async (chatId: string, name: string) => {
+    const removed = await scratchpad.remove(chatId, name, 'the user deleted it')
+    scratchpadChanged()
+    return removed
+  },
+  'scratchpad:choose-folder': async () => {
+    const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
+    return result.canceled ? null : (result.filePaths[0] ?? null)
   },
 
   'settings:patch': (patch: Partial<AppSettings>) => {
@@ -1807,34 +1995,34 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   },
 
   // ---- auto-fit
+  /**
+   * A plan for a model on this machine as it is now.
+   *
+   * `measure` confirms it with llama.cpp's own dry run: a few seconds the first time a configuration
+   * is seen, nothing after. The library's badges leave it off and get the estimate, corrected by
+   * whatever has been measured for that model before; the load dialog asks for it.
+   */
   'autofit:plan': async (
     modelId: string,
-    overrides?: Record<string, unknown>
+    overrides?: Record<string, unknown>,
+    measure?: boolean
   ): Promise<FitResult | { error: string }> => {
     const model = library.find((m) => m.id === modelId)
     if (!model) return { error: 'Model not found' }
     if (!model.arch) return { error: model.error ?? 'Model metadata could not be parsed' }
 
     const hw = await getHardware()
-    const fresh = await refreshFreeVram(hw)
-    hardware = fresh
+    const measuredNow = await refreshFreeVram(hw)
+    hardware = measuredNow
+    // Whatever is loaded gives its VRAM back before this plan would load.
+    const fresh = withLoadedReleased(measuredNow)
 
-    const s = loadSettings()
-    const result = planFit(model.arch, fresh, {
-      ...DEFAULT_CONSTRAINTS,
-      minKvType: s.autoFit.minKvType,
-      preferredKvType: s.autoFit.preferredKvType,
-      targetContext: s.autoFit.targetContext,
-      idealContext: s.autoFit.idealContext,
-      headroomBytes: s.autoFit.headroomMb * 1024 * 1024,
-      expertCacheSlots: s.runtime.expertCache,
-      allowRopeScaling: s.autoFit.allowRopeScaling,
-      companionBytes: companionSize(model),
-      draftBytes: draftReserve(model, fresh.backend, { ...batchOverrides(s), ...sanitizeOverrides(overrides) }).draftBytes,
-      learnedHeadroom: learnedHeadroomFor(model.id),
-      kvPairs: await kvPairsFor(fresh.backend),
-      // The load dialog's own placement choices sit on top of the batch sizes from Settings.
-      overrides: { ...batchOverrides(s), ...sanitizeOverrides(overrides) }
+    // The load dialog's own placement choices sit on top of the batch sizes from Settings.
+    const result = await planModel({
+      model,
+      hw: fresh,
+      constraints: await planConstraints(model, fresh, sanitizeOverrides(overrides)),
+      measure: !!measure
     })
     /*
      * A plan made while detection is still a guess says so.
@@ -2012,6 +2200,10 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     await discardCheckpoints(id)
     // Its kept attachment copies go with it; nothing else refers to them.
     await deleteConversationFiles(id)
+    // And whatever its scratchpad still held, with the frames its model was shown.
+    await scratchpad.clearChat(id)
+    chatHeldMedia.delete(id)
+    scratchpadChanged()
     return true
   },
   'chat:search': (query: string) => chats.searchChats(query),
@@ -2138,24 +2330,104 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     }
     announce()
 
-    if (attachments?.length) {
-      const built = await buildContent(text, sendFiles, loaded.model.caps, await videoContext(), (p) =>
+    /*
+     * A video goes into the conversation's scratchpad, and the model looks at it itself.
+     *
+     * It used to be cut down to a clip and a few stills before the model ever saw the question, by
+     * settings that guessed in advance what would matter. Now it is copied into the scratchpad
+     * (memory unless Settings say otherwise) and the model is told it is there: it takes an
+     * overview with watch_video, looks closer at the moments the question is about, and deletes
+     * the copy when it is done. Nothing outside the scratchpad is reachable from chat. A model that
+     * cannot call tools is shown one overview instead, and the copy goes at once.
+     */
+    const videoFiles = sendFiles.filter((f) => classifyAttachment(f) === 'video')
+    const otherFiles = sendFiles.filter((f) => classifyAttachment(f) !== 'video')
+    const tools = chatToolsFor(chatId, history, videoFiles.length > 0)
+    const scratchNotes: string[] = []
+    const overview: ContentPart[] = []
+    for (const file of videoFiles) {
+      const label = path.basename(file)
+      if (!loaded.model.caps.videoPossible) {
+        notes.push(`${label} skipped: the loaded model has no vision projector, so video cannot be read.`)
+        continue
+      }
+      emit('chat:media-progress', { chatId, file: label, stage: 'putting it in the scratchpad' })
+      let item
+      try {
+        item = await scratchpad.addFile(chatId, file, 'video')
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err)
+        notes.push(`${label} could not be put in the scratchpad: ${why}`)
+        scratchNotes.push(`[${label} was attached, but it could not be given to you: ${why}]`)
+        continue
+      }
+      scratchpadChanged()
+      const source = scratchpad.pathOf(item.id) ?? (await scratchServer.urlFor(item.id))
+      if (tools) {
+        const facts = await videoFacts(source).catch(() => null)
+        scratchNotes.push(
+          facts
+            ? `Attached video: ${item.name}, now in your scratchpad. ${describeVideo(item.name, facts)}. It has not been shown ` +
+                'to you. Look at it with watch_video: with no times first for an overview, then with start and end around ' +
+                'the moments that matter. Delete it with scratchpad_delete when you have finished with it.'
+            : `Attached video: ${item.name}, now in your scratchpad, but it could not be read as a video.`
+        )
+      } else {
+        emit('chat:media-progress', { chatId, file: label, stage: 'picking frames' })
+        const look = await lookAtVideo(
+          source,
+          item.name,
+          { frames: 12 },
+          {
+            vision: !loaded.visionUnavailable,
+            signal: AbortSignal.timeout(180_000),
+            again: 'These frames are all of the video you can see: this model cannot call tools to look again.'
+          }
+        )
+        const { text: about, media } = splitOutput(look)
+        overview.push(...media)
+        scratchNotes.push(`Attached video: ${about}`)
+        await scratchpad.remove(chatId, item.name, 'it was shown to you once, as an overview')
+        scratchpadChanged()
+      }
+    }
+
+    if (otherFiles.length) {
+      const built = await buildContent(text, otherFiles, loaded.model.caps, await videoContext(), (p) =>
         emit('chat:media-progress', { chatId, ...p })
       )
       userContent = built.parts
       notes.push(...built.notes)
       prepared = new Map(built.media.map((m) => [m.source, m]))
-
-      // Now that the clip exists, the row can point at it and the player gains its toggle. The clip and
-      // stills move out of the weekly-swept scratch folder first, so the player keeps working after it.
       for (const media of prepared.values()) {
         const id = attachmentIds.get(media.source)
         if (!id) continue
         const kept = await keepPrepared(chatId, media)
         chats.setAttachmentMeta(id, { optimised: kept.optimised, stills: kept.stills, note: media.note })
       }
-      // Recorded exactly as sent, after the clip has moved, so a rebuilt history sends the same and points at kept files.
-      await persistSent(chatId, userMsg.id, built.parts)
+    }
+    if (scratchNotes.length || overview.length) {
+      const extra: ContentPart[] = [...overview, { type: 'text', text: scratchNotes.join('\n\n') }]
+      userContent = typeof userContent === 'string' ? [{ type: 'text', text: userContent }, ...extra] : [...userContent, ...extra]
+    }
+    /*
+     * Recorded exactly as sent, so a rebuilt history sends the same. An overview's frames are the
+     * exception: they stay in memory with the scratchpad they came from, and what is written down
+     * in their place says they were there.
+     */
+    const recordSent = async (content: typeof userContent): Promise<void> => {
+      if (!overview.length || typeof content === 'string') {
+        await persistSent(chatId, userMsg.id, content)
+        return
+      }
+      holdChatMedia(chatId, userMsg.id, content)
+      await persistSent(chatId, userMsg.id, [
+        ...content.filter((part) => part.type !== 'image_url'),
+        { type: 'text', text: '[Frames of the attached video were shown here. They are not kept once the app closes.]' }
+      ])
+    }
+    if (attachments?.length) {
+      await recordSent(userContent)
       if (prepared.size) announce()
       emit('chat:media-progress', { chatId, file: '', stage: '' })
     }
@@ -2175,7 +2447,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         typeof userContent === 'string'
           ? `${ragContext}\n\n[The user's message]\n${userContent}`
           : [{ type: 'text' as const, text: ragContext }, ...userContent]
-      await persistSent(chatId, userMsg.id, userContent)
+      await recordSent(userContent)
     }
 
     const started = Date.now()
@@ -2218,11 +2490,12 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const messages = chatMessagesFor(chatId, history, preserveReasoning)
     const generation = loadSettings().generation
     lastEffort.set(`chat:${chatId}`, effort)
-    await resumeSaved({ messages, cacheKey: `chat:${chatId}`, ...effortFields(effort) })
+    await resumeSaved({ messages, cacheKey: `chat:${chatId}`, ...(tools ? { tools } : {}), ...effortFields(effort) })
 
     const request: CompletionOptions = {
       messages: [...messages, { role: 'user', content: userContent }],
       cacheKey: `chat:${chatId}`,
+      ...(tools ? { tools } : {}),
       // The parameters panel's settings. Ultra keeps them for every sample, stepping only the temperature.
       ...samplingOptions(generation.sampling),
       signal: abort.signal,
@@ -2239,8 +2512,10 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
      * renderer — sees exactly what it sees for an ordinary turn.
      */
     let stopped = false
+    let toolRounds = 0
     try {
-      if (isUltra(effort)) {
+      // Ultra's drafts cannot call tools, so a turn with the scratchpad's tools is one model working.
+      if (isUltra(effort) && !tools) {
         const cfg = loadSettings().ultra
         const { synthesis } = await ultraSamples(request, cfg, {
           onSampleStart: (index, total) => emit('chat:ultra-sample-start', { chatId, index, total }),
@@ -2252,29 +2527,146 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         request.messages = synthesis
       }
 
-      for await (const ev of llama.streamEvents(request)) {
-        if (ev.type === 'text') {
-          answer += ev.text
-          emit('chat:delta', { chatId, text: ev.text })
+      /*
+       * One request, or a few when the model uses its scratchpad.
+       *
+       * A round that ends in tool calls has its words and thinking kept as a message of their own,
+       * then each call is run against this conversation's scratchpad and its result recorded, and
+       * the model is asked again with them, until it answers in words. Stored the way the agent
+       * stores its steps, so a rebuilt prompt is the one this turn sent.
+       */
+      for (;;) {
+        answer = ''
+        thinking = ''
+        const calls: ToolCall[] = []
+        const batch = crypto.randomBytes(4).toString('hex')
+        for await (const ev of llama.streamEvents(request)) {
+          if (ev.type === 'text') {
+            answer += ev.text
+            emit('chat:delta', { chatId, text: ev.text })
+          }
+          if (ev.type === 'reasoning') {
+            thinking += ev.text
+            emit('chat:reasoning', { chatId, text: ev.text })
+          }
+          if (ev.type === 'tool_call') {
+            calls.push({
+              id: ev.call.id,
+              name: ev.call.name,
+              args: ev.call.args,
+              batch,
+              ...(ev.call.invalid ? { invalid: ev.call.invalid } : {})
+            })
+          }
+          if (ev.type === 'prompt_progress') {
+            emit('chat:prompt-progress', {
+              chatId,
+              percent: ev.percent,
+              processed: ev.processed,
+              total: ev.total,
+              cached: ev.cached
+            })
+          }
+          if (ev.type === 'context') {
+            emit('chat:context', { chatId, used: ev.used, max: ev.max })
+            // The dashboard's meter reads the same number, so it is no longer a separate estimate
+            // that can disagree with what the conversation is showing.
+            setContextUsed(ev.used)
+          }
         }
-        if (ev.type === 'reasoning') {
-          thinking += ev.text
-          emit('chat:reasoning', { chatId, text: ev.text })
+        if (!calls.length || !tools) break
+        toolRounds++
+
+        if (answer.trim() || thinking.trim()) {
+          const said: AgentMessage = {
+            id: `${Date.now().toString(36)}-a${toolRounds}`,
+            role: 'assistant',
+            content: answer.trim(),
+            reasoning: thinking || undefined,
+            createdAt: Date.now()
+          }
+          chats.appendMessage(chatId, said)
+          emit('chat:message', { chatId, message: said })
         }
-        if (ev.type === 'prompt_progress') {
-          emit('chat:prompt-progress', {
-            chatId,
-            percent: ev.percent,
-            processed: ev.processed,
-            total: ev.total,
-            cached: ev.cached
-          })
+        request.messages.push({
+          role: 'assistant',
+          content: answer.trim(),
+          ...(preserveReasoning && thinking ? { reasoning_content: thinking } : {}),
+          tool_calls: calls.map((c) => ({
+            id: c.id,
+            type: 'function' as const,
+            function: { name: c.name, arguments: JSON.stringify(c.args) }
+          }))
+        })
+        // Said and kept above; what follows the calls is a new answer.
+        answer = ''
+        thinking = ''
+
+        const vision = !!loaded.model.caps.vision && !loaded.visionUnavailable
+        for (const call of calls) {
+          // Every announced call gets an answer, even one the user stopped before it ran.
+          if (abort.signal.aborted) {
+            request.messages.push({
+              role: 'tool',
+              content: 'Not run: the user stopped the turn before this call was reached.',
+              tool_call_id: call.id,
+              name: call.name
+            })
+            continue
+          }
+          emit('chat:tool-call', { chatId, call })
+          const startedAt = Date.now()
+          let out: ToolOutput
+          let ok = !call.invalid
+          try {
+            out = call.invalid
+              ? `The arguments for ${call.name} were not valid JSON, so it was not run: ${call.invalid}. Call it again with well-formed arguments.`
+              : await runChatTool(call.name, call.args, {
+                  chatId,
+                  pad: scratchpad,
+                  urlFor: (id) => scratchServer.urlFor(id),
+                  vision,
+                  signal: abort.signal,
+                  idleMinutes: idleMinutes()
+                })
+          } catch (err) {
+            ok = false
+            out = `${call.name} failed: ${err instanceof Error ? err.message : String(err)}`
+          }
+          const { text: resultText, media } = splitOutput(out)
+          const result = makeResult(call.id, resultText, call.name, startedAt, ok)
+          const toolMsg: AgentMessage = {
+            id: crypto.randomBytes(6).toString('hex'),
+            role: 'tool',
+            content: result.content,
+            toolCalls: [call],
+            toolResult: result,
+            createdAt: Date.now()
+          }
+          chats.appendMessage(chatId, toolMsg)
+          request.messages.push({ role: 'tool', content: result.content, tool_call_id: call.id, name: call.name })
+          if (media.length) {
+            // Pictures arrive as a turn of their own after the result, as the agent sends them.
+            const returned: ContentPart[] = [...media, { type: 'text', text: `[images returned by ${call.name}]` }]
+            holdChatMedia(chatId, toolMsg.id, returned)
+            request.messages.push({ role: 'user', content: returned })
+            emit('chat:tool-frames', {
+              chatId,
+              messageId: toolMsg.id,
+              frames: media.flatMap((part) => (part.type === 'image_url' && part.image_url ? [part.image_url.url] : []))
+            })
+          }
+          emit('chat:message', { chatId, message: toolMsg })
+          scratchpadChanged()
         }
-        if (ev.type === 'context') {
-          emit('chat:context', { chatId, used: ev.used, max: ev.max })
-          // The dashboard's meter reads the same number, so it is no longer a separate estimate
-          // that can disagree with what the conversation is showing.
-          setContextUsed(ev.used)
+
+        if (abort.signal.aborted) {
+          stopped = true
+          break
+        }
+        if (toolRounds >= CHAT_TOOL_ROUNDS) {
+          answer = `_[stopped after ${CHAT_TOOL_ROUNDS} rounds of tool calls]_`
+          break
         }
       }
     } catch (err) {
@@ -2617,9 +3009,11 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     await restoreConversationMedia(chatId, history)
     if (!canWarm()) return false
     lastEffort.set(`chat:${chatId}`, reasoning ?? null)
+    const tools = chatToolsFor(chatId, history)
     return warm({
       messages: chatMessagesFor(chatId, history, loadSettings().reasoning.preserve),
       cacheKey: `chat:${chatId}`,
+      ...(tools ? { tools } : {}),
       ...reasoningRequestFields(loaded.model.caps.reasoning, sendableChoice(loaded.model.caps.reasoning, reasoning ?? null))
     })
   },
@@ -3287,7 +3681,8 @@ export async function shutdown(): Promise<void> {
     tunnel.stop(),
     closeBrowser(),
     rag.embeddings.stop(),
-    summarizer.stop()
+    summarizer.stop(),
+    stopScratchpad()
   ])
   certificates.clearRenewal()
   stopDdnsUpdates()

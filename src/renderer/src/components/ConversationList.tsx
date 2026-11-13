@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { useShell } from '../lib/shell'
 import { closeRail, useStream } from '../lib/store'
 import { DRAWER_QUERY, useMediaQuery } from '../lib/media'
 import { fmtRelative } from '../lib/api'
@@ -61,6 +63,15 @@ export default function ConversationList({
   // reachable: an off-screen drawer whose buttons still take focus is a keyboard trap.
   const isDrawer = useMediaQuery(DRAWER_QUERY)
   const hidden = isDrawer && !railOpen
+  /*
+   * Where the list lives.
+   *
+   * In the sidebar, under the navigation, whenever the sidebar is showing its labels: the
+   * conversations are where you move between things, like everything else there. With the sidebar
+   * down to icons it is a column beside the transcript, and on a narrow window a drawer.
+   */
+  const shell = useShell()
+  const inSidebar = !!shell.sidebar && !shell.collapsed && !isDrawer
 
   const commitRename = (id: string): void => {
     const title = draft.trim()
@@ -68,14 +79,7 @@ export default function ConversationList({
     setEditingId(null)
   }
 
-  return (
-    <>
-      {/* Only rendered as a real backdrop on narrow viewports; CSS hides it otherwise. */}
-      <div
-        className={`rail-backdrop${railOpen ? ' open' : ''}`}
-        onClick={closeRail}
-        aria-hidden="true"
-      />
+  const list = (
       <aside
         className={`side-list${railOpen ? ' open' : ''}`}
         data-testid="conversation-list"
@@ -89,6 +93,7 @@ export default function ConversationList({
         data-testid="new-conversation">
         {newLabel}
       </button>
+      {items.length > 0 && <div className="side-list-label">Recent</div>}
 
       {items.map((item) => {
         const isEditing = editingId === item.id
@@ -212,6 +217,18 @@ export default function ConversationList({
 
       {!items.length && <div className="empty small">{emptyLabel}</div>}
       </aside>
+  )
+
+  if (inSidebar && shell.sidebar) return createPortal(list, shell.sidebar)
+  return (
+    <>
+      {/* Only rendered as a real backdrop on narrow viewports; CSS hides it otherwise. */}
+      <div
+        className={`rail-backdrop${railOpen ? ' open' : ''}`}
+        onClick={closeRail}
+        aria-hidden="true"
+      />
+      {list}
     </>
   )
 }

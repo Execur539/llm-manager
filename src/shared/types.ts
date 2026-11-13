@@ -276,6 +276,16 @@ export interface FitConstraints {
   /** VRAM a separate MTP draft head takes on the primary device: weights, its cache and buffers. */
   draftBytes?: number
   /**
+   * VRAM each usable card loses to things outside llama.cpp's own buffers: the CUDA runtime, the
+   * vision projector, a separate MTP head. Measured from this model's previous load where there is
+   * one; a prior from file sizes otherwise. Supersedes companionBytes and draftBytes when given.
+   */
+  extrasPerGpu?: number[]
+  /** Kept free on every card beyond the user's reserve, against allocator slack. */
+  safetyBytes?: number
+  /** Exact figures llama.cpp reported for configurations already measured, to correct the estimate by. */
+  corrections?: PlanCorrection[]
+  /**
    * Slots per MoE layer in the GPU expert cache, charged to the card that holds the layer when its
    * experts stay in system RAM: (slots + 1) of that layer's experts. 0 = no cache, -1 = as many as fit.
    */
@@ -326,6 +336,28 @@ export interface VramSegments {
   kv: number
   /** Compute buffers, staging for experts in system RAM, and the logits row. */
   compute: number
+  /** GPU expert-cache slots for experts kept in system RAM. */
+  cache?: number
+  /** The CUDA runtime, the vision projector and a separate MTP head. */
+  extras?: number
+}
+
+/**
+ * What llama.cpp itself reported for one configuration, against what the estimate said.
+ *
+ * `offset` is per usable card: measured minus estimated, for llama.cpp's own buffers only (the
+ * expert cache and the extras are counted separately and exactly).
+ */
+export interface PlanCorrection {
+  contextLength: number
+  kvType: KvType
+  kvTypeV: KvType
+  ubatch: number
+  flashAttention: boolean
+  gpuLayers: number
+  cpuMoeLayers: number
+  layerSplit: number[]
+  offset: number[]
 }
 
 /** A card a plan places work on, as it was measured when the plan was made. */
@@ -396,7 +428,21 @@ export interface FitPlan {
   ubatchSize?: number
   flashAttention: boolean
   /** predicted bytes per GPU */
+  /** Everything the card loses when this plan loads: llama.cpp's buffers, the expert cache and the extras. */
   predictedVramPerGpu: number[]
+  /** llama.cpp's own buffers per card, as predicted (exact when `measured`). */
+  llamaVramPerGpu?: number[]
+  /** GPU expert cache per card. */
+  cacheVramPerGpu?: number[]
+  /** Runtime, vision projector and MTP head per card. */
+  extrasPerGpu?: number[]
+  /** Left free on each card: the user's reserve plus a small allowance for allocator slack. */
+  reservePerGpu?: number[]
+  /** True when llama.cpp's own dry run confirmed this exact configuration. */
+  measured?: boolean
+  /** Expected generation speed, and whether it comes from this machine's past runs or an estimate. */
+  tokensPerSecond?: number
+  speedSource?: 'measured' | 'calibrated' | 'estimate'
   predictedHostBytes: number
   kvBytes: number
   weightsOnGpuBytes: number
@@ -652,7 +698,8 @@ export interface AppSettings {
      * models folder. `budgetGb` is the most the folder may hold; the least recently used
      * conversations go first, and pinned ones never.
      */
-    stateCache: { enabled: boolean; budgetGb: number; folder: string }
+    /** `version` marks the one-time switch to on by default; see migrateStateCache. */
+    stateCache: { enabled: boolean; budgetGb: number; folder: string; version?: number }
   }
   /**
    * What each request asks of the model: a system prompt for chats, and the sampling parameters.
@@ -762,6 +809,15 @@ export interface AppSettings {
   }
   ui: {
     closeAction: 'ask' | 'tray' | 'quit'
+  }
+  /** Chat's scratchpad: the temporary space a chat's model works in. See main/scratchpad. */
+  scratchpad: {
+    /** 'memory' keeps everything in RAM and never on disk; 'folder' keeps files in `folder`. */
+    location: 'memory' | 'folder'
+    /** Used when location is 'folder'. The app keeps its files in a subfolder of its own there. */
+    folder: string
+    /** A file the model has not read or written for this many minutes is deleted. */
+    idleMinutes: number
   }
 }
 

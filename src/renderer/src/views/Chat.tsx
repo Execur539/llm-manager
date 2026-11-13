@@ -24,6 +24,7 @@ import MessageMedia, { stripAttachmentLine } from '../components/MessageMedia'
 import ThinkingBlock from '../components/ThinkingBlock'
 import UltraSamples from '../components/UltraSamples'
 import RailToggle from '../components/RailToggle'
+import { Toolbar } from '../lib/shell'
 import ReasoningControl, { sendableChoice } from '../components/ReasoningControl'
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
 import { Spinner } from '../components/Spinner'
@@ -35,6 +36,7 @@ import KeepReadyButton from '../components/KeepReadyButton'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
+import ToolCard from '../components/ToolCard'
 import ParametersPanel, { ParamsToggle, useParamsPanel } from '../components/ParametersPanel'
 
 interface Collection {
@@ -62,6 +64,8 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   const busy = activeId ? !!stream.running[activeId] : false
   const progress = activeId ? (stream.promptProgress[activeId] ?? null) : null
   const media = activeId ? (stream.mediaStage[activeId] ?? null) : null
+  // The scratchpad tool the model is running right now, if any.
+  const toolRunning = activeId ? (stream.chatToolRunning[activeId] ?? null) : null
   const ctx = activeId ? (stream.context[activeId] ?? null) : null
   const compacting = activeId ? (stream.compacting[activeId] ?? null) : null
   const summaryUpto = activeId ? (stream.summaryUpto[activeId] ?? null) : null
@@ -225,9 +229,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
 
       <DropZone onFiles={(f) => void attachments.addFiles(f)} disabled={locked}>
       <div className="chat">
-        <div className="row head chat-head">
-          <RailToggle />
-          <h1 style={{ marginRight: 'auto' }}>Chat</h1>
+        <Toolbar title={chats.find((c) => c.id === activeId)?.title ?? 'Chat'} leading={<RailToggle />}>
           {collections.length > 0 && (
             <select
               value={collectionId}
@@ -286,7 +288,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
             </button>
           )}
           <ParamsToggle open={paramsOpen} onToggle={() => setParamsOpen(!paramsOpen)} />
-        </div>
+        </Toolbar>
 
         {!loaded && (
           <div className="card note">
@@ -315,6 +317,10 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
 
           {messages.map((m) => (
             <Fragment key={m.id}>
+              {/* The model using its scratchpad: a line per call, with the frames it looked at. */}
+              {m.role === 'tool' && m.toolCalls?.[0] ? (
+                <ToolCard call={m.toolCalls[0]} result={m.toolResult} frames={stream.toolFrames[m.id]} />
+              ) : (
               <MessageRow role={m.role}>
                 {m.role === 'assistant' ? (
                   <>
@@ -330,6 +336,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
                   </>
                 )}
               </MessageRow>
+              )}
               {/*
                 * Where the model's word-for-word view begins.
                 *
@@ -344,6 +351,8 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               )}
             </Fragment>
           ))}
+
+          {toolRunning && <ToolCard call={toolRunning} />}
 
           {(partial || reasoning || ultra.length > 0) && (
             <MessageRow role="assistant" testId="streaming-message">
@@ -405,16 +414,6 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
           )}
           <AttachmentBar items={attachments.items} onRemove={attachments.remove} disabled={locked} />
           <div className="composer-shell">
-            <button
-              className="attach-button"
-              onClick={() => void attachments.pick()}
-              disabled={locked || attachments.busy}
-              title="Attach images, video, audio, or text files — or paste them into the message box"
-              aria-label="Attach files"
-              data-testid="attach-button"
-            >
-              {attachments.busy ? <Spinner size={14} /> : <Icon name="plus" size={15} />}
-            </button>
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -442,29 +441,41 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               * is stopping it — a disabled send button says "wait", which is exactly the thing
               * the user is trying not to do.
               */}
-            <button
-              className={`send-button${busy ? ' stopping' : ''}`}
-              onClick={() => (busy ? void invoke('chat:stop', activeId) : void send())}
-              disabled={!loaded || (!busy && (!!compacting || (!input.trim() && !attachments.items.length)))}
-              title={busy ? 'Stop generating' : 'Send  (Enter)'}
-              aria-label={busy ? 'Stop' : 'Send'}
-              data-testid="chat-send"
-            >
-              <Icon name={busy ? 'stop' : 'send'} size={15} />
-            </button>
+            {/* Everything about how the message goes, on one line under what it says. */}
+            <div className="composer-bar">
+              <button
+                className="attach-button"
+                onClick={() => void attachments.pick()}
+                disabled={locked || attachments.busy}
+                title="Attach images, video, audio, or text files — or paste them into the message box"
+                aria-label="Attach files"
+                data-testid="attach-button"
+              >
+                {attachments.busy ? <Spinner size={14} /> : <Icon name="plus" size={15} />}
+              </button>
+              <ReasoningControl
+                support={loaded?.caps?.reasoning}
+                value={stream.reasoning[effortId] ?? null}
+                onChange={(next) => setReasoning(effortId, next)}
+                disabled={locked}
+                samples={ultraSamples}
+                onSamplesChange={setUltraSamples}
+              />
+              <span className="composer-spacer" />
+              {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
+              <button
+                className={`send-button${busy ? ' stopping' : ''}`}
+                onClick={() => (busy ? void invoke('chat:stop', activeId) : void send())}
+                disabled={!loaded || (!busy && (!!compacting || (!input.trim() && !attachments.items.length)))}
+                title={busy ? 'Stop generating' : 'Send  (Enter)'}
+                aria-label={busy ? 'Stop' : 'Send'}
+                data-testid="chat-send"
+              >
+                <Icon name={busy ? 'stop' : 'send'} size={15} />
+              </button>
+            </div>
           </div>
-          <div className="composer-meta">
-            {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
-            <div className="composer-hint">Enter to send · Shift+Enter for a newline</div>
-            <ReasoningControl
-              support={loaded?.caps?.reasoning}
-              value={stream.reasoning[effortId] ?? null}
-              onChange={(next) => setReasoning(effortId, next)}
-              disabled={locked}
-              samples={ultraSamples}
-              onSamplesChange={setUltraSamples}
-            />
-          </div>
+          <div className="composer-hint">Enter to send · Shift+Enter for a newline</div>
         </div>
       </div>
       </DropZone>

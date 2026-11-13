@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import type { AgentMessage, ToolCall, ToolResult } from '@shared/types'
+import type { AgentMessage, ToolCall } from '@shared/types'
 import { continuedMessage } from '@shared/continuation'
-import { invoke, on, fmtDuration } from '../lib/api'
+import { invoke, on } from '../lib/api'
 import {
   select,
   setRunning,
@@ -28,6 +28,7 @@ import MessageMedia, { stripAttachmentLine } from '../components/MessageMedia'
 import ThinkingBlock from '../components/ThinkingBlock'
 import UltraSamples from '../components/UltraSamples'
 import RailToggle from '../components/RailToggle'
+import { Toolbar } from '../lib/shell'
 import ReasoningControl, { sendableChoice } from '../components/ReasoningControl'
 import { AttachmentBar, DropZone, useAttachments } from '../components/Attachments'
 import { Spinner } from '../components/Spinner'
@@ -37,6 +38,7 @@ import ContextMeter from '../components/ContextMeter'
 import CompactingNotice from '../components/CompactingNotice'
 import KeepReadyButton from '../components/KeepReadyButton'
 import PendingToolCall from '../components/PendingToolCall'
+import ToolCard from '../components/ToolCard'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
@@ -80,42 +82,6 @@ function ContinuingMessage({
 }
 
 /** Collapsed by default; one line of summary, expanding to arguments and full output. */
-function ToolCard({ call, result }: { call: ToolCall; result?: ToolResult }): JSX.Element {
-  const a = call.args as Record<string, unknown>
-  const detail = ['path', 'command', 'query', 'url', 'task', 'job_id', 'pattern']
-    .map((key) => (typeof a[key] === 'string' ? (a[key] as string) : null))
-    .find((v): v is string => !!v)
-
-  return (
-    <div className="msg-aside">
-      <details className="tool-card" data-testid="tool-card">
-        <summary>
-          <span className={`badge ${result ? (result.ok ? 'good' : 'bad') : 'warn'}`}>
-            {result ? (result.ok ? 'ok' : 'failed') : 'running'}
-          </span>
-          <span className="tool-name">{call.name}</span>
-          {detail && <span className="truncate tool-detail">{detail}</span>}
-          <span className="tool-meta">
-            {result && <span className="faint">{fmtDuration(result.durationMs)}</span>}
-            {result?.truncated && <span className="badge warn">truncated</span>}
-          </span>
-        </summary>
-        <div className="detail">
-          <div className="detail-label">Arguments</div>
-          <pre className="detail-pre">{JSON.stringify(call.args, null, 2)}</pre>
-          {result && (
-            <>
-              <div className="detail-label">Result</div>
-              <pre className="detail-pre">{result.content}</pre>
-              {result.fullOutputPath && <div className="faint tiny-note">Full output: {result.fullOutputPath}</div>}
-            </>
-          )}
-        </div>
-      </details>
-    </div>
-  )
-}
-
 export default function AgentView({ loaded }: { loaded: LoadedModel | null }): JSX.Element {
   const [sessions, setSessions] = useState<ChatSummary[]>([])
   const [messages, setMessages] = useState<AgentMessage[]>([])
@@ -496,9 +462,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
 
       <DropZone onFiles={(f) => void attachments.addFiles(f)} disabled={busy}>
       <div className="chat">
-        <div className="row head chat-head">
-          <RailToggle />
-          <h1 style={{ marginRight: 'auto' }}>Agent</h1>
+        <Toolbar title={sessions.find((c) => c.id === activeId)?.title ?? 'Agent'} leading={<RailToggle />}>
           <button className="link" onClick={() => setShowTools((v) => !v)} data-testid="toggle-tools">
             {tools.length} tools
           </button>
@@ -511,7 +475,8 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             Plan mode {planMode ? 'on' : 'off'}
           </button>
           <button onClick={() => void pickCwd()} title={cwd || 'Choose the folder the agent works in'}>
-            {cwd ? `📁 ${cwd.split(/[\\/]/).filter(Boolean).pop()}` : 'Set folder'}
+            <Icon name="folder" size={15} />
+            {cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : 'Set folder'}
           </button>
           {/*
             * Names the session, and says what happened.
@@ -552,7 +517,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             </button>
           )}
           <ParamsToggle open={paramsOpen} onToggle={() => setParamsOpen(!paramsOpen)} />
-        </div>
+        </Toolbar>
 
         {showTools && (
           <div className="card">
@@ -807,16 +772,6 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
           )}
           <AttachmentBar items={attachments.items} onRemove={attachments.remove} disabled={busy} />
           <div className="composer-shell">
-            <button
-              className="attach-button"
-              onClick={() => void attachments.pick()}
-              disabled={busy || attachments.busy}
-              title="Attach images, video, audio, or text files — or paste them into the message box"
-              aria-label="Attach files"
-              data-testid="attach-button"
-            >
-              {attachments.busy ? <Spinner size={14} /> : <Icon name="plus" size={15} />}
-            </button>
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -848,33 +803,45 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
               data-testid="agent-input"
             />
             {/* Same treatment as chat: the button stops the turn it started. */}
-            <button
-              className={`send-button${running ? ' stopping' : ''}`}
-              onClick={() => {
-                if (!running) return void send()
-                clearQuestions()
-                void invoke('agent:stop')
-              }}
-              disabled={!loaded || (!running && (!!compacting || (!input.trim() && !attachments.items.length)))}
-              title={running ? 'Stop the agent' : 'Send  (Enter)'}
-              aria-label={running ? 'Stop' : 'Send'}
-              data-testid="agent-send"
-            >
-              <Icon name={running ? 'stop' : 'send'} size={15} />
-            </button>
+            {/* Everything about how the message goes, on one line under what it says. */}
+            <div className="composer-bar">
+              <button
+                className="attach-button"
+                onClick={() => void attachments.pick()}
+                disabled={busy || attachments.busy}
+                title="Attach images, video, audio, or text files — or paste them into the message box"
+                aria-label="Attach files"
+                data-testid="attach-button"
+              >
+                {attachments.busy ? <Spinner size={14} /> : <Icon name="plus" size={15} />}
+              </button>
+              <ReasoningControl
+                support={loaded?.caps?.reasoning}
+                value={stream.reasoning[effortId] ?? null}
+                onChange={(next) => setReasoning(effortId, next)}
+                disabled={running}
+                samples={ultraSamples}
+                onSamplesChange={setUltraSamples}
+              />
+              <span className="composer-spacer" />
+              {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
+              <button
+                className={`send-button${running ? ' stopping' : ''}`}
+                onClick={() => {
+                  if (!running) return void send()
+                  clearQuestions()
+                  void invoke('agent:stop')
+                }}
+                disabled={!loaded || (!running && (!!compacting || (!input.trim() && !attachments.items.length)))}
+                title={running ? 'Stop the agent' : 'Send  (Enter)'}
+                aria-label={running ? 'Stop' : 'Send'}
+                data-testid="agent-send"
+              >
+                <Icon name={running ? 'stop' : 'send'} size={15} />
+              </button>
+            </div>
           </div>
-          <div className="composer-meta">
-            {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
-            <div className="composer-hint">Enter to send · Shift+Enter for a newline</div>
-            <ReasoningControl
-              support={loaded?.caps?.reasoning}
-              value={stream.reasoning[effortId] ?? null}
-              onChange={(next) => setReasoning(effortId, next)}
-              disabled={running}
-              samples={ultraSamples}
-              onSamplesChange={setUltraSamples}
-            />
-          </div>
+          <div className="composer-hint">Enter to send · Shift+Enter for a newline</div>
         </div>
       </div>
       </DropZone>

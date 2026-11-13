@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { invoke, on, fmtDuration } from '../lib/api'
 import NumberField from '../components/NumberField'
+import { Toolbar } from '../lib/shell'
 
 interface ServerStatus {
   running: boolean
@@ -23,6 +24,15 @@ interface RequestEntry {
   client: string
   status: number
 }
+
+/** What the server answers, in the order a client usually meets them. */
+const ENDPOINTS: { method: 'GET' | 'POST'; path: string; note?: string }[] = [
+  { method: 'GET', path: '/v1/models' },
+  { method: 'POST', path: '/v1/chat/completions', note: 'OpenAI, streaming and tools' },
+  { method: 'POST', path: '/v1/embeddings' },
+  { method: 'POST', path: '/v1/messages', note: 'Anthropic Messages, streaming' },
+  { method: 'GET', path: '/health' }
+]
 
 export default function ServerView(): JSX.Element {
   const [status, setStatus] = useState<ServerStatus>({ running: false, port: null })
@@ -75,131 +85,153 @@ export default function ServerView(): JSX.Element {
 
   return (
     <>
-      <h1>API server</h1>
+      <Toolbar title="API server" />
       <p className="subtitle">
         Serves an OpenAI-compatible API, plus an Anthropic Messages endpoint — so Claude-compatible clients can
         use a local model too.
       </p>
 
       {error && (
-        <div className="card" style={{ borderColor: '#5c2626' }}>
+        <div className="card error-card">
           <span className="badge bad">error</span> {error}
         </div>
       )}
 
-      <div className="card">
-        <div className="card-title">
-          Status
-          <span className={`badge ${status.running ? 'good' : ''}`}>{status.running ? 'running' : 'stopped'}</span>
+      {/* Whether it is serving, and where, first; then the few things that shape it. */}
+      <div className="card server-card">
+        <div className="server-head">
+          <div className="server-state">
+            <span className="sr-only">Status</span>
+            <span className={`server-dot${status.running ? ' on' : ''}`} aria-hidden="true" />
+            <span className="server-state-text">{status.running ? 'Running' : 'Stopped'}</span>
+          </div>
+          <button className={status.running ? 'danger' : 'primary'} onClick={() => void toggle()}>
+            {status.running ? 'Stop server' : 'Start server'}
+          </button>
+        </div>
+        <div className="server-url">
+          <code>{baseUrl}</code>
+          <button
+            className="ghost tiny"
+            onClick={() => {
+              void navigator.clipboard.writeText(baseUrl)
+              setCopied(true)
+              setTimeout(() => setCopied(false), 1500)
+            }}
+          >
+            {copied ? 'Copied' : 'Copy'}
+          </button>
         </div>
 
-        <dl className="kv">
-          <dt>Port</dt>
-          <dd>
-            <NumberField
-              value={port}
-              min={1}
-              max={65535}
-              disabled={status.running}
-              onCommit={async (n) => {
-                setPort(n)
-                const s = await invoke<{ server: Record<string, unknown> }>('settings:get')
-                await invoke('settings:patch', { server: { ...s.server, port: n } })
-              }}
-            />
-          </dd>
-          <dt>Base URL</dt>
-          <dd>
-            <span className="mono">{baseUrl}</span>
-            <button
-              style={{ marginLeft: 8 }}
-              onClick={() => {
-                void navigator.clipboard.writeText(baseUrl)
-                setCopied(true)
-                setTimeout(() => setCopied(false), 1500)
-              }}
-            >
-              {copied ? 'Copied' : 'Copy'}
-            </button>
-          </dd>
-          <dt>Auto-load models</dt>
-          <dd>
-            <input
-              type="checkbox"
-              checked={jitLoad}
-              onChange={async (e) => {
-                setJitLoad(e.target.checked)
-                const s = await invoke<{ server: Record<string, unknown> }>('settings:get')
-                await invoke('settings:patch', { server: { ...s.server, jitLoad: e.target.checked } })
-              }}
-            />{' '}
-            <span className="faint">load whichever model a request names</span>
-          </dd>
-          <dt>API key</dt>
-          <dd>
-            {apiKey ? (
-              <span className="mono">{apiKey}</span>
-            ) : status.hasApiKey ? (
-              <span className="faint">set — generating a new one replaces it</span>
-            ) : (
-              <span className="faint">none set</span>
-            )}
-            <button
-              style={{ marginLeft: 8 }}
-              onClick={async () => {
-                setApiKey(await invoke<string>('server:generate-key'))
-                setStatus(await invoke<ServerStatus>('server:status'))
-              }}
-            >
-              {status.hasApiKey ? 'Replace' : 'Generate'}
-            </button>
-            {(apiKey || status.hasApiKey) && (
+        <div className="settings-rows">
+          <div className="setting-row">
+            <div className="setting-text">
+              <div className="setting-label">Port</div>
+              <div className="setting-hint">Changed while the server is stopped</div>
+            </div>
+            <div className="setting-control">
+              <NumberField
+                value={port}
+                min={1}
+                max={65535}
+                disabled={status.running}
+                onCommit={async (n) => {
+                  setPort(n)
+                  const s = await invoke<{ server: Record<string, unknown> }>('settings:get')
+                  await invoke('settings:patch', { server: { ...s.server, port: n } })
+                }}
+              />
+            </div>
+          </div>
+          <div className="setting-row">
+            <div className="setting-text">
+              <div className="setting-label">Auto-load models</div>
+              <div className="setting-hint">Load whichever model a request names</div>
+            </div>
+            <div className="setting-control">
+              <input
+                type="checkbox"
+                checked={jitLoad}
+                aria-label="Auto-load models"
+                onChange={async (e) => {
+                  setJitLoad(e.target.checked)
+                  const s = await invoke<{ server: Record<string, unknown> }>('settings:get')
+                  await invoke('settings:patch', { server: { ...s.server, jitLoad: e.target.checked } })
+                }}
+              />
+            </div>
+          </div>
+          <div className="setting-row">
+            <div className="setting-text">
+              <div className="setting-label">API key</div>
+              <div className="setting-hint">
+                {apiKey
+                  ? 'Copy it now: it is shown once'
+                  : status.hasApiKey
+                    ? 'Set. Generating a new one replaces it'
+                    : 'None set'}
+              </div>
+            </div>
+            <div className="setting-control">
+              {apiKey && <code className="server-key">{apiKey}</code>}
               <button
-                style={{ marginLeft: 6 }}
                 onClick={async () => {
-                  await invoke('server:clear-key')
-                  setApiKey(null)
+                  setApiKey(await invoke<string>('server:generate-key'))
                   setStatus(await invoke<ServerStatus>('server:status'))
                 }}
               >
-                Clear
+                {status.hasApiKey ? 'Replace' : 'Generate'}
               </button>
-            )}
-          </dd>
-          <dt>Queue</dt>
-          <dd>
-            {status.queue ? `${status.queue} waiting` : <span className="faint">idle</span>}
-          </dd>
-        </dl>
+              {(apiKey || status.hasApiKey) && (
+                <button
+                  className="ghost"
+                  onClick={async () => {
+                    await invoke('server:clear-key')
+                    setApiKey(null)
+                    setStatus(await invoke<ServerStatus>('server:status'))
+                  }}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="setting-row">
+            <div className="setting-text">
+              <div className="setting-label">Queue</div>
+            </div>
+            <div className="setting-control">
+              <span className="faint">{status.queue ? `${status.queue} waiting` : 'Idle'}</span>
+            </div>
+          </div>
+        </div>
 
         {status.networkBlocked && (
-          <div className="card note" style={{ marginTop: 12 }}>
-            Remote access is on, but the API has no key — so it is listening on 127.0.0.1 only
-            rather than publishing an unauthenticated endpoint to your network. Generate a key
-            above and restart the server to reach it from another machine.
+          <div className="card note server-note">
+            Remote access is on, but the API has no key, so it is listening on 127.0.0.1 only rather than publishing an
+            unauthenticated endpoint to your network. Generate a key above and restart the server to reach it from
+            another machine.
           </div>
         )}
-
-        <button className={status.running ? 'danger' : 'primary'} style={{ marginTop: 12 }} onClick={() => void toggle()}>
-          {status.running ? 'Stop server' : 'Start server'}
-        </button>
       </div>
 
       <div className="card">
         <div className="card-title">Endpoints</div>
-        <div className="mono" style={{ fontSize: 11, lineHeight: 1.9 }}>
-          GET&nbsp;&nbsp;/v1/models<br />
-          POST /v1/chat/completions&nbsp;&nbsp;<span className="faint">— OpenAI, streaming and tools</span><br />
-          POST /v1/embeddings<br />
-          POST /v1/messages&nbsp;&nbsp;<span className="faint">— Anthropic Messages, streaming</span><br />
-          GET&nbsp;&nbsp;/health
+        <div className="endpoint-list">
+          {ENDPOINTS.map((e) => (
+            <div className="endpoint" key={e.path}>
+              <span className="endpoint-method">{e.method}</span>
+              <code className="endpoint-path">{e.path}</code>
+              {e.note && <span className="endpoint-note">{e.note}</span>}
+            </div>
+          ))}
         </div>
       </div>
 
       <div className="card">
         <div className="card-title">
           Request log
-          <span className="faint" style={{ fontSize: 11 }}>local requests take priority over remote</span>
+          <span className="card-title-note">Local requests take priority over remote ones</span>
         </div>
         {requests.length === 0 && <div className="empty">No requests yet.</div>}
         {requests.length > 0 && (

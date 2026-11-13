@@ -1,9 +1,10 @@
 /**
  * The pin for a conversation's saved state.
  *
- * When conversations are kept ready on disk, the folder has a budget and the least recently used
- * ones go first. A pinned conversation is never removed to make room, so the one you always come
- * back to is always a file read away. Shown only while the feature is switched on.
+ * Every conversation is saved to disk as it goes (a few seconds after each reply), and the folder
+ * has a budget: the least recently used go first. A pinned conversation is never removed to make
+ * room, so the one you always come back to is always a file read away. Shown only while keeping
+ * conversations ready is switched on, which it is by default.
  */
 
 import { useEffect, useState } from 'react'
@@ -42,8 +43,8 @@ export default function KeepReadyButton({ stateKey }: { stateKey: string | null 
       }}
       title={
         pinned
-          ? 'This conversation is kept ready on disk whatever the disk budget says. Click to let it be removed like the others.'
-          : 'Never remove what the model has read of this conversation from disk to make room for others.'
+          ? 'Kept ready on disk whatever the disk budget says. Click to let it be removed to make room, like the others.'
+          : 'Every conversation is saved to disk as you go, and the least recently used are removed when the disk budget fills. Click to never remove this one.'
       }
       aria-pressed={pinned}
       data-testid="keep-ready"

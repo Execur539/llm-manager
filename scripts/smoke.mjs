@@ -25,9 +25,10 @@ const {
   proportionalSplit,
   DEFAULT_CONSTRAINTS,
   fmtBytes,
-  verifyPrediction,
-  learnHeadroom,
   gpuKey,
+  correctionFor,
+  priorExtras,
+  DEFAULT_SAFETY,
   nglFor,
   resolveBatches
 } = await import('./built/engine.js')
@@ -62,6 +63,7 @@ const { findFaQuants, parseFaQuants, readFaQuants } = await import('./built/faKe
 const { hostCacheBudgetMb } = await import('./built/hostBudget.js')
 
 const GB = 1024 ** 3
+const MB = 1024 ** 2
 let pass = 0
 let fail = 0
 const failures = []
@@ -125,7 +127,9 @@ const gpu = (name, totalGb, freeGb, measured = true, index = 0) => ({
 const segmentsAddUp = (plan) =>
   !!plan?.vramSegments &&
   plan.vramSegments.length === plan.predictedVramPerGpu.length &&
-  plan.vramSegments.every((s, d) => Math.abs(s.weights + s.kv + s.compute - plan.predictedVramPerGpu[d]) < 1)
+  plan.vramSegments.every(
+    (s, d) => Math.abs(s.weights + s.kv + s.compute + (s.cache ?? 0) + (s.extras ?? 0) - plan.predictedVramPerGpu[d]) < 1
+  )
 
 // ---------------------------------------------------------------- MTP heads in their own file
 
@@ -672,9 +676,6 @@ section('Trained-context ceiling')
 section('Prediction verification feeds back')
 {
   const plan = { predictedVramPerGpu: [10 * GB] }
-  check('flags a large under-prediction', !!verifyPrediction(plan, [13 * GB]).suggestion)
-  check('flags a large over-prediction', !!verifyPrediction(plan, [7 * GB]).suggestion)
-  check('stays quiet when close', verifyPrediction(plan, [10.2 * GB]).suggestion === null)
 }
 
 // ---------------------------------------------------------------- GBNF
@@ -1296,27 +1297,76 @@ section('GGUF types the planner must size exactly')
 }
 
 /*
- * "Used 1.59 GB more VRAM than predicted. Widening the safety margin for next time." was logged
- * five times for one model while nothing read the measurement back, so every retry made the same
- * plan and crashed the same way.
+ * The 1.7.x planner left gigabytes unused on cards set to keep 512 MB free: a fixed runtime charge,
+ * 8% of every card on a routed model, and a "learned" margin that counted the vision projector and
+ * MTP head a second time, because they were reserved but left out of the prediction a load was
+ * compared with. What a card keeps free is now the reserve plus a stated allowance, and nothing else.
  */
-section('The planner learns from a load that overshot')
+section('Planner: what a card keeps free, and what it carries')
 {
   const g0 = gpu('RTX 5080', 16, 14), g1 = gpu('RTX 4070 Ti', 12, 11, true, 1)
-  const learned = learnHeadroom({ keys: [gpuKey(g0), gpuKey(g1)], predicted: [9e9, 10e9], actual: [8.9e9, 11.6e9] })
-  check('an overshoot becomes headroom on that card, with a quarter to spare',
-    learned[gpuKey(g1)] === Math.round(1.6e9 * 1.25), JSON.stringify(learned))
-  check('a card that came in under gets nothing', !(gpuKey(g0) in learned))
-  check('a failed reading teaches nothing', Object.keys(learnHeadroom({ keys: ['x'], predicted: [5e9], actual: [0] })).length === 0)
-  check('two identical cards are told apart', gpuKey(g0) !== gpuKey({ ...g0, index: 1 }))
+  const reserve = 512 * MB
+  const c = { ...DEFAULT_CONSTRAINTS, headroomBytes: reserve, idealContext: 1_000_000, targetContext: 16384 }
+  const plan = planFit(arch, hw([g0, g1]), c).chosen
+  const free = (p, d, g) => g.freeVram - p.predictedVramPerGpu[d]
+  check('a plan fills the cards up to the reserve and the allowance, and no further',
+    !!plan && [g0, g1].every((g, d) => free(plan, d, g) >= reserve + DEFAULT_SAFETY - 1) &&
+      Math.min(free(plan, 0, g0), free(plan, 1, g1)) < reserve + DEFAULT_SAFETY + 1.5 * GB,
+    plan && [g0, g1].map((g, d) => (free(plan, d, g) / GB).toFixed(2)).join(' / '))
+  check('the parts of each card add up to what it is predicted to lose', segmentsAddUp(plan), JSON.stringify(plan?.vramSegments))
+  check('the reserve is reported per card', plan?.reservePerGpu?.every((r) => r === reserve + DEFAULT_SAFETY))
 
-  const base = planFit(arch, hw([g0, g1]), DEFAULT_CONSTRAINTS).chosen
-  // Tighter budgets can leave no default, in which case the planner offers the tradeoffs instead.
-  const r = planFit(arch, hw([g0, g1]), { ...DEFAULT_CONSTRAINTS, learnedHeadroom: { [gpuKey(g1)]: 2 * GB } })
-  const wiser = r.chosen ?? r.alternatives[0]
-  check('the next plan leaves the learned room free on that card',
-    !!base && !!wiser && wiser.predictedVramPerGpu[1] <= base.predictedVramPerGpu[1] - 1.5 * GB,
-    `${(base?.predictedVramPerGpu[1] / GB).toFixed(2)} -> ${(wiser?.predictedVramPerGpu[1] / GB).toFixed(2)} GB`)
+  // Extras are counted on the card that holds them, inside its prediction.
+  const extras = [3 * GB, 0.4 * GB]
+  const withExtras = planFit(arch, hw([g0, g1]), { ...c, extrasPerGpu: extras }).chosen
+  check('measured extras are inside each card\'s prediction',
+    !!withExtras && withExtras.extrasPerGpu?.[0] === extras[0] &&
+      Math.abs(withExtras.predictedVramPerGpu[0] - withExtras.llamaVramPerGpu[0] - withExtras.cacheVramPerGpu[0] - extras[0]) < 1)
+  check('and the card still keeps its reserve', !!withExtras && free(withExtras, 0, g0) >= reserve + DEFAULT_SAFETY - 1,
+    withExtras && (free(withExtras, 0, g0) / GB).toFixed(2))
+  const prior = priorExtras(2, 'cuda', 900 * MB, 2 * GB)
+  check('before any load, the projector and the head are put on the first card only',
+    prior[0] > prior[1] + 2.9 * GB && prior[1] > 0, prior.map((b) => (b / GB).toFixed(2)).join(' / '))
+}
+
+section('Planner: corrections from llama.cpp\'s own figures')
+{
+  const g0 = gpu('RTX 5080', 16, 14), g1 = gpu('RTX 4070 Ti', 12, 11, true, 1)
+  const c = { ...DEFAULT_CONSTRAINTS, headroomBytes: 512 * MB, targetContext: 16384, idealContext: 32768 }
+  const plan = planFit(arch, hw([g0, g1]), c).chosen
+  const q = { contextLength: plan.contextLength, kvType: { k: plan.kvType, v: plan.kvTypeV }, ubatch: plan.batchSize,
+    flashAttention: plan.flashAttention, gpuLayers: plan.gpuLayers, cpuMoeLayers: plan.cpuMoeLayers ?? 0 }
+  const entry = (ctx, offset) => ({ contextLength: ctx, kvType: plan.kvType, kvTypeV: plan.kvTypeV, ubatch: plan.batchSize,
+    flashAttention: plan.flashAttention, gpuLayers: plan.gpuLayers, cpuMoeLayers: plan.cpuMoeLayers ?? 0, layerSplit: plan.layerSplit, offset })
+  check('nothing measured corrects nothing', correctionFor([], q, 2).every((o) => o === 0))
+  const between = correctionFor([entry(q.contextLength - 4096, [0, 1 * GB]), entry(q.contextLength + 4096, [0, 3 * GB])], q, 2)
+  check('a correction is interpolated across context', Math.abs(between[1] - 2 * GB) < 1, String(between[1] / GB))
+  const corrected = planFit(arch, hw([g0, g1]), { ...c, corrections: [entry(plan.contextLength, [0, 1 * GB])] }).chosen
+  check('a measured gigabyte more on a card is a gigabyte more in its prediction, or a smaller plan',
+    !!corrected && (corrected.contextLength < plan.contextLength ||
+      Math.abs(corrected.llamaVramPerGpu.reduce((a, b) => a + b, 0) - plan.llamaVramPerGpu.reduce((a, b) => a + b, 0) - 1 * GB) < 0.05 * GB),
+    corrected && `${plan.contextLength} -> ${corrected.contextLength}`)
+}
+
+section('Planner: tokens per second')
+{
+  const { estimateSpeed, predictSpeed, cacheHitRate } = await import('./built/speed.js')
+  // Shaped like Qwen3.8-Flash-Next: 48 blocks, 512 experts with 10 used, every expert in system RAM.
+  const moe = { blockCount: 48, expertCount: 512, expertUsedCount: 10, perLayerBytes: 0, outputBytes: 444e6,
+    layerDenseBytes: new Array(48).fill(63.75e6), layerExpertBytes: new Array(48).fill(948e6) }
+  const at = (slots) => estimateSpeed(moe, { gpuLayers: 48, cpuMoeLayers: 48, expertCacheSlots: slots })
+  check('no cache, every expert in RAM: about the 18 tok/s measured', Math.abs(at(0) - 18.1) < 1.5, at(0).toFixed(1))
+  check('128 slots: near the 37 tok/s measured', Math.abs(at(128) - 37.4) < 4, at(128).toFixed(1))
+  check('more cache is never slower', at(16) < at(64) && at(64) < at(192))
+  check('the hit rate runs from none to all', cacheHitRate(0, 512) === 0 && cacheHitRate(511, 512) === 1)
+  const plan = { gpuLayers: 48, cpuMoeLayers: 48, expertCacheSlots: 40, draftMax: 1 }
+  check('with no runs it is an estimate', predictSpeed(moe, plan, []).source === 'estimate')
+  const sample = (slots, tps) => ({ gpuLayers: 48, cpuMoeLayers: 48, expertCacheSlots: slots, draft: true, contextLength: 1, tokensPerSecond: tps })
+  const measured = predictSpeed(moe, plan, [sample(40, 30), sample(41, 32), sample(40, 31)])
+  check('runs of the same plan are quoted as measured', measured.source === 'measured' && measured.tokensPerSecond === 31, JSON.stringify(measured))
+  const other = predictSpeed(moe, plan, [sample(100, at(100) * 1.2)])
+  check('runs of another plan scale the estimate', other.source === 'calibrated' && Math.abs(other.tokensPerSecond - at(40) * 1.2) < 0.01,
+    JSON.stringify(other))
 }
 
 section('Compaction helper: chunks, progress, loops and placement')
@@ -1814,6 +1864,29 @@ section('Saved conversation states: what is kept, and what goes first')
     check('a pinned one never goes, whatever the budget', again.join() === 'chat:new' && sc.readMeta(dir, 'chat:pinned') !== null, again.join())
     sc.removeState(dir, 'chat:pinned')
     check('removing takes the state and its record', sc.listStates(dir).length === 0)
+
+    // A save cut off part way: the record names a file of one size, the file on disk is another.
+    fs.writeFileSync(path.join(dir, `${sc.fileStem('chat:cut')}.bin`), 'half')
+    fs.writeFileSync(path.join(dir, `${sc.fileStem('chat:cut')}.json`),
+      JSON.stringify({ key: 'chat:cut', fingerprint: 'f', prefixChars: 1, prefixHash: 'h', tokens: 9, bytes: 9, fileBytes: 9, savedAt: 1, usedAt: 1 }))
+    check('a state file of the wrong size is never taken for the saved one',
+      sc.readMeta(dir, 'chat:cut') === null && !sc.listStates(dir).some((s) => s.key === 'chat:cut'))
+    fs.writeFileSync(path.join(dir, `${sc.fileStem('chat:cut')}.next.bin`), 'partial')
+    sc.removeState(dir, 'chat:cut')
+    check('removing a state also clears a save that never finished',
+      !fs.existsSync(path.join(dir, `${sc.fileStem('chat:cut')}.next.bin`)))
+
+    const min = 60_000
+    check('a short conversation is not worth a file', !sc.checkpointDue(800, null, 0))
+    check('a longer one is saved the first time', sc.checkpointDue(5000, null, 0))
+    check('a few new tokens are not worth rewriting it', !sc.checkpointDue(5100, { tokens: 5000, savedAt: 0 }, 1 * min))
+    check('a turn or two of new text is', sc.checkpointDue(6200, { tokens: 5000, savedAt: 0 }, 1 * min))
+    check('a huge conversation is not rewritten for every line',
+      !sc.checkpointDue(502_000, { tokens: 500_000, savedAt: 0 }, 1 * min))
+    check('but is once enough of it is new', sc.checkpointDue(520_000, { tokens: 500_000, savedAt: 0 }, 1 * min))
+    check('whatever has changed is saved once the file is ten minutes old',
+      sc.checkpointDue(502_000, { tokens: 500_000, savedAt: 0 }, 11 * min))
+    check('without a count from the server it is saved if nothing is', sc.checkpointDue(null, null, 0) && !sc.checkpointDue(null, { tokens: 1, savedAt: 0 }, 1 * min))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

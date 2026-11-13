@@ -27,7 +27,7 @@ import { childEnv, llamaServerPath } from './binaries'
 import { hostCacheBudgetMb } from './host-budget'
 import { TOOL_OUTPUT_DIR, defaultModelsDir } from '../storage/paths'
 import { loadSettings } from '../storage/settings'
-import { nglFor } from '../autofit/engine'
+import { placementArgs, ropeScale } from '../autofit/placement-args'
 import { logger } from '../log'
 // Relative, not `@shared`: the main-process bundle has no such alias for value imports.
 import { DEFAULT_TEMPERATURE, DEFAULT_TOP_P, SAMPLING_FIELDS, type SamplingOptions } from '../../shared/sampling'
@@ -464,48 +464,9 @@ export class LlamaRuntime extends EventEmitter {
 
   private buildArgs(model: ModelRecord, plan: FitPlan, port: number): string[] {
     const fmtGb = (n: number): string => `${(n / 1024 ** 3).toFixed(1)} GB`
-    const args = [
-      '--model', model.path,
-      '--host', '127.0.0.1',
-      '--port', String(port),
-      '--ctx-size', String(plan.contextLength),
-      '--n-gpu-layers', String(nglFor(plan)),
-      '--batch-size', String(plan.batchSize),
-      // llama-server defaults to 4 parallel slots. One is deliberate: slots divide the context
-      // budget between them, and on hybrid models the recurrent-state cache is allocated *per
-      // slot*, which is enough to turn a fitting plan into an OOM. Concurrent callers wait —
-      // API requests in this process's own priority queue, everything else in the server's.
-      '--parallel', '1',
-      // Jinja templates enable llama.cpp's native tool-calling handlers.
-      '--jinja'
-    ]
-    // Plans saved before the micro-batch was settable carry none, and get llama.cpp's default.
-    if (plan.ubatchSize) args.push('--ubatch-size', String(plan.ubatchSize))
+    // What decides llama.cpp's own allocations comes from one place, shared with the memory dry run.
+    const args = [...placementArgs(model.path, model.arch, plan), '--host', '127.0.0.1', '--port', String(port), '--jinja']
 
-    /*
-     * Keys and values are set separately, because they are not equally sensitive.
-     *
-     * Both used to take the same type, so buying context meant pushing the keys down as far as
-     * the values -- and four-bit keys are the one setting measured to break a model rather than
-     * blunt it. The planner now picks them independently and this passes what it picked.
-     */
-    if (plan.kvType !== 'f16') args.push('--cache-type-k', plan.kvType)
-    if ((plan.kvTypeV ?? plan.kvType) !== 'f16') args.push('--cache-type-v', plan.kvTypeV ?? plan.kvType)
-
-    /*
-     * Host memory, put to work.
-     *
-     * This model is hybrid: forty-eight of its sixty-five layers keep a recurrent state rather
-     * than a KV cache, and a recurrent state cannot be rolled back to an earlier token the way a
-     * KV cache can be truncated. llama.cpp therefore cannot resume mid-conversation from the
-     * cache alone -- it resumes from a context checkpoint, and when none covers the resume point
-     * it reprocesses the whole prompt from token zero. That is the long silence before a reply on
-     * a conversation that has been going a while.
-     *
-     * Checkpoints live in system RAM, and the defaults are sized for a machine that does not have
-     * much: 8 GB of prompt cache, 32 checkpoints, and cache-reuse switched off entirely. On a
-     * machine with real headroom those are the wrong numbers, and none of them cost VRAM.
-     */
     const pleBytes = model.arch?.pleBytes ?? 0
     // What this load will keep in system RAM; a per-layer embedding table stays file-backed.
     const residentHost = Math.max(0, plan.predictedHostBytes - pleBytes)
@@ -545,48 +506,13 @@ export class LlamaRuntime extends EventEmitter {
      * long-context benchmarks are unkind here even before extension -- most models fall below
      * their own advertised effective length -- so this stays off unless someone turns it on.
      */
-    const trained = model.arch?.contextLength ?? 0
-    if (trained > 0 && plan.contextLength > trained) {
-      const scale = plan.contextLength / trained
-      args.push(
-        '--rope-scaling', 'yarn',
-        '--rope-scale', scale.toFixed(5),
-        '--yarn-orig-ctx', String(trained)
-      )
+    const scale = ropeScale(model.arch, plan.contextLength)
+    if (scale > 1) {
       logger.warn(
         'model',
-        `context ${plan.contextLength.toLocaleString()} exceeds the trained ${trained.toLocaleString()}; ` +
+        `context ${plan.contextLength.toLocaleString()} exceeds the trained ${(model.arch?.contextLength ?? 0).toLocaleString()}; ` +
           `YaRN scaling by ${scale.toFixed(2)}x. Quality past the trained length is not guaranteed.`
       )
-    }
-    if (plan.flashAttention) args.push('--flash-attn', 'on')
-    /*
-     * Exact block counts, where the plan has them.
-     *
-     * llama.cpp assigns layers by cumulative fraction of the split, so the counts reproduce the
-     * ranges the planner costed, where a fraction rounded to three places can move a boundary
-     * block — and a block's worth of VRAM — onto the other card.
-     */
-    const blocksPerCard = plan.layerSplit ?? []
-    if (blocksPerCard.length > 1) {
-      args.push('--tensor-split', blocksPerCard.join(','))
-    } else if (plan.tensorSplit.length > 1) {
-      args.push('--tensor-split', plan.tensorSplit.map((s) => s.toFixed(3)).join(','))
-    }
-
-    /*
-     * The placement the planner chose, and nothing decided behind its back.
-     *
-     * `--n-cpu-moe` keeps the routed experts of the first N blocks in system RAM, which is how an
-     * MoE model larger than VRAM runs at a usable speed. `--fit` would otherwise adjust whatever
-     * this leaves unset; it already stands down once `-ngl` is given, and turning it off outright
-     * means the plan on screen and the process that runs cannot disagree.
-     */
-    // A plan can come from the renderer, so these are checked for shape rather than trusted.
-    const cpuMoe = Math.max(0, Math.floor(Number(plan.cpuMoeLayers) || 0))
-    if (cpuMoe > 0) args.push('--n-cpu-moe', String(cpuMoe))
-    if (typeof plan.overrideTensors === 'string' && plan.overrideTensors.trim()) {
-      args.push('--override-tensor', plan.overrideTensors.trim())
     }
     args.push('--fit', 'off')
 
@@ -1101,6 +1027,7 @@ export class LlamaRuntime extends EventEmitter {
             usage?: { prompt_tokens?: number; completion_tokens?: number }
             error?: { message?: string } | string
             prompt_progress?: { total?: number; cache?: number; processed?: number; time_ms?: number }
+            timings?: { predicted_n?: number; predicted_per_second?: number; draft_n?: number; draft_n_accepted?: number }
           }
           try {
             json = JSON.parse(payload)
@@ -1111,6 +1038,23 @@ export class LlamaRuntime extends EventEmitter {
           if (json.error) {
             const detail = typeof json.error === 'string' ? json.error : (json.error.message ?? JSON.stringify(json.error))
             throw new ServerStreamError(detail)
+          }
+
+          /*
+           * The server's own decode speed, from the reply's last frame.
+           *
+           * Exact, where the app's figure is characters over four against wall time including
+           * thinking. Kept per plan so the next plan's speed comes from what this machine did.
+           * Not for work done in the background, which is not what anyone waits for.
+           */
+          const t = json.timings
+          if (t && !opts.background && !opts.processOnly && (t.predicted_n ?? 0) >= 32 && (t.predicted_per_second ?? 0) > 0) {
+            this.emit('decodeSpeed', {
+              tokensPerSecond: t.predicted_per_second,
+              tokens: t.predicted_n,
+              draft: t.draft_n ?? 0,
+              accepted: t.draft_n_accepted ?? 0
+            })
           }
 
           /*

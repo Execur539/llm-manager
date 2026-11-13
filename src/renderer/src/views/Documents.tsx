@@ -3,6 +3,7 @@ import { fmtBytes, invoke, on } from '../lib/api'
 import ConfirmDialog from '../components/ConfirmDialog'
 import EmptyState from '../components/EmptyState'
 import Icon from '../components/Icon'
+import { Toolbar } from '../lib/shell'
 
 interface Collection {
   id: string
@@ -87,7 +88,7 @@ export default function Documents(): JSX.Element {
 
   return (
     <>
-      <h1>Documents</h1>
+      <Toolbar title="Documents" />
       <p className="subtitle">
         Build reusable collections and attach them to any chat, or drop files straight into a conversation for
         one-offs. Everything is embedded locally with the bundled model.
@@ -100,7 +101,7 @@ export default function Documents(): JSX.Element {
       )}
       {progress && <div className="card note">{progress}</div>}
 
-      <div className="split">
+      <div className="split documents-split">
         <aside className="side-list">
           <div className="row" style={{ marginBottom: 10 }}>
             <input

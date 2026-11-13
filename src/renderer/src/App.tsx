@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useMemo, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
 import type { HardwareSnapshot, ModelCapabilities, ModelRecord } from '@shared/types'
-import { invoke, on, isDesktop } from './lib/api'
+import { invoke, on, isDesktop, displayModelName } from './lib/api'
 import Dashboard from './views/Dashboard'
 import Library from './views/Library'
 import Discover from './views/Discover'
@@ -15,6 +15,7 @@ import BrandMark from './components/BrandMark'
 import PermissionPrompt from './components/PermissionPrompt'
 import QuestionPrompt from './components/QuestionPrompt'
 import Toasts from './components/Toasts'
+import { ShellContext } from './lib/shell'
 
 export type View =
   | 'dashboard'
@@ -27,6 +28,13 @@ export type View =
   | 'remote'
   | 'settings'
 
+/*
+ * Groups are spacing, not headings.
+ *
+ * "Overview", "Use", "Models" and "Serve" sat above the rows in grey, four labels to read past for
+ * nine destinations that name themselves. The groups still exist, as gaps and as an accessible
+ * name for each set; Settings sits at the foot of the sidebar, apart from the places work happens.
+ */
 const NAV: { id: View; label: string; group: string; icon: IconName }[] = [
   { id: 'dashboard', label: 'Dashboard', group: 'Overview', icon: 'dashboard' },
   { id: 'chat', label: 'Chat', group: 'Use', icon: 'chat' },
@@ -35,9 +43,10 @@ const NAV: { id: View; label: string; group: string; icon: IconName }[] = [
   { id: 'library', label: 'My models', group: 'Models', icon: 'models' },
   { id: 'discover', label: 'Find a model', group: 'Models', icon: 'search' },
   { id: 'server', label: 'API server', group: 'Serve', icon: 'server' },
-  { id: 'remote', label: 'Remote access', group: 'Serve', icon: 'remote' },
-  { id: 'settings', label: 'Settings', group: 'Serve', icon: 'settings' }
+  { id: 'remote', label: 'Remote access', group: 'Serve', icon: 'remote' }
 ]
+
+const SETTINGS_NAV = { id: 'settings' as View, label: 'Settings', icon: 'settings' as IconName }
 
 /** Views whose layout owns the full height and scrolls internally. */
 const FILL_VIEWS = new Set<View>(['chat', 'agent', 'documents'])
@@ -177,7 +186,31 @@ export default function App(): JSX.Element {
 
   const groups = [...new Set(NAV.map((n) => n.group))]
 
+  // Elements the views fill in: the toolbar's title and actions, and the sidebar's list space.
+  const [titleEl, setTitleEl] = useState<HTMLElement | null>(null)
+  const [actionsEl, setActionsEl] = useState<HTMLElement | null>(null)
+  const [sidebarEl, setSidebarEl] = useState<HTMLElement | null>(null)
+  const slots = useMemo(
+    () => ({ title: titleEl, actions: actionsEl, sidebar: sidebarEl, collapsed }),
+    [titleEl, actionsEl, sidebarEl, collapsed]
+  )
+
+  const navButton = (n: { id: View; label: string; icon: IconName }): JSX.Element => (
+    <button
+      key={n.id}
+      type="button"
+      className={`nav-item ${view === n.id ? 'active' : ''}`}
+      onClick={() => setView(n.id)}
+      title={collapsed ? n.label : undefined}
+      aria-current={view === n.id ? 'page' : undefined}
+    >
+      <Icon name={n.icon} />
+      <span>{n.label}</span>
+    </button>
+  )
+
   return (
+    <ShellContext.Provider value={slots}>
     <div
       className={`app${collapsed ? ' sidebar-collapsed' : ''}`}
       // Only while expanded: an inline width would override the collapsed rail's.
@@ -202,44 +235,42 @@ export default function App(): JSX.Element {
         </div>
 
         {groups.map((group) => (
-          <div key={group} className="nav-section">
-            <div className="nav-group">{group}</div>
-            {NAV.filter((n) => n.group === group).map((n) => (
-              <button
-                key={n.id}
-                type="button"
-                className={`nav-item ${view === n.id ? 'active' : ''}`}
-                onClick={() => setView(n.id)}
-                // With the labels hidden, the name has to be reachable some other way.
-                title={collapsed ? n.label : undefined}
-                aria-current={view === n.id ? 'page' : undefined}
-              >
-                <Icon name={n.icon} />
-                <span>{n.label}</span>
-              </button>
-            ))}
+          <div key={group} className="nav-section" role="group" aria-label={group}>
+            {NAV.filter((n) => n.group === group).map(navButton)}
           </div>
         ))}
+
+        {/* A view's own list (conversations, sessions) lands here on a wide window. */}
+        <div className="sidebar-slot" ref={setSidebarEl} />
+
+        <div className="nav-section nav-bottom" role="group" aria-label="App">
+          {navButton(SETTINGS_NAV)}
+        </div>
 
         <div
           className="sidebar-footer"
           title={collapsed ? (loaded ? `Loaded: ${loaded.model}` : 'No model loaded') : undefined}
         >
           {loaded ? (
-            <>
-              <div className="loaded-head" data-testid="model-loaded">
-                <span className="pulse-dot" aria-hidden="true" />
-                <span className="loaded-label">Loaded</span>
-              </div>
-              <div className="loaded-name truncate" title={loaded.model}>
-                {loaded.model}
-              </div>
-              <div className="loaded-meta">
-                {loaded.plan.contextLength.toLocaleString()} ctx · {loaded.plan.gpuLayers}/
-                {loaded.plan.totalLayers} layers on GPU
+            <div className="model-chip" data-testid="model-loaded">
+              <span className="pulse-dot" aria-hidden="true" />
+              <div className="model-chip-text">
+                <div className="loaded-name truncate" title={loaded.model}>
+                  {displayModelName(loaded.model)}
+                </div>
+                <div className="loaded-meta truncate">
+                  {loaded.plan.contextLength >= 1000
+                    ? `${Math.round(loaded.plan.contextLength / 1000)}K context`
+                    : `${loaded.plan.contextLength} context`}
+                  {loaded.plan.gpuLayers < loaded.plan.totalLayers
+                    ? ` · ${loaded.plan.gpuLayers}/${loaded.plan.totalLayers} layers on GPU`
+                    : ''}
+                </div>
               </div>
               <button
-                className="full"
+                type="button"
+                className="model-chip-action"
+                title="Unload the model and free its memory"
                 onClick={async () => {
                   await invoke('model:unload')
                   await refreshLoaded()
@@ -247,12 +278,12 @@ export default function App(): JSX.Element {
               >
                 Unload
               </button>
-            </>
+            </div>
           ) : (
-            <div className="loaded-empty">
+            <button type="button" className="loaded-empty" onClick={() => setView('library')} title="Choose a model to load">
               <Icon name="chip" size={14} />
               <span>No model loaded</span>
-            </div>
+            </button>
           )}
         </div>
       </nav>
@@ -285,9 +316,18 @@ export default function App(): JSX.Element {
 
       {/* Chat-like views fill the pane; the rest scroll normally. */}
       <main className={`main${FILL_VIEWS.has(view) ? ' fill' : ''}`}>
+        {/*
+          * The window's title bar, drawn by the app: the view's title on the left, its actions on
+          * the right, and room at the far right for the window buttons Windows draws over it.
+          */}
+        <header className="titlebar">
+          <div className="titlebar-title" ref={setTitleEl} />
+          <div className="titlebar-actions" ref={setActionsEl} />
+        </header>
+
         {banner && (
           <div className="app-banner" role="status">
-            <span className="badge">note</span>
+            <Icon name="info" size={15} />
             <span className="app-banner-text">{banner}</span>
             <button className="tiny" onClick={() => setBanner(null)} aria-label="Dismiss">
               Dismiss
@@ -295,6 +335,7 @@ export default function App(): JSX.Element {
           </div>
         )}
 
+        <div className="main-scroll">
         <div className="page">
         {view === 'dashboard' && <Dashboard hardware={hardware} models={models} loaded={loaded} onNavigate={setView} />}
         {view === 'library' && (
@@ -313,11 +354,13 @@ export default function App(): JSX.Element {
         {view === 'remote' && <RemoteView />}
         {view === 'settings' && <Settings models={models} onModelsChanged={refreshModels} />}
         </div>
+        </div>
       </main>
 
       <PermissionPrompt />
       <QuestionPrompt />
       <Toasts />
     </div>
+    </ShellContext.Provider>
   )
 }

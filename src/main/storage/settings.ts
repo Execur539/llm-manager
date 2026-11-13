@@ -126,7 +126,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
     batchSize: 0,
     ubatchSize: 0,
     warmConversations: true,
-    stateCache: { enabled: false, budgetGb: 20, folder: '' }
+    // On: coming back to a conversation is a file read rather than reading it all again.
+    stateCache: { enabled: true, budgetGb: 20, folder: '', version: 2 }
   },
   generation: {
     systemPrompt: '',
@@ -181,6 +182,16 @@ export const DEFAULT_SETTINGS: AppSettings = {
   },
   ui: {
     closeAction: 'ask'
+  },
+  /*
+   * In memory by default, so what a chat's model works on never reaches a disk and is gone when the
+   * app closes. Half an hour unused is long enough to come back to a video after a break, and short
+   * enough that a forgotten one does not hold memory all evening.
+   */
+  scratchpad: {
+    location: 'memory',
+    folder: '',
+    idleMinutes: 30
   }
 }
 
@@ -214,6 +225,7 @@ const NUMERIC_BOUNDS: { path: [keyof AppSettings, string]; min: number; max: num
   { path: ['autoFit', 'idealContext'], min: 512, max: 10_000_000 },
   { path: ['autoFit', 'headroomMb'], min: 0, max: 65_536 },
   { path: ['agent', 'maxToolCallsPerTurn'], min: 1, max: 1000 },
+  { path: ['scratchpad', 'idleMinutes'], min: 1, max: 1440 },
   { path: ['agent', 'commandTimeoutMs'], min: 1000, max: 3_600_000 },
   { path: ['ultra', 'samples'], min: 1, max: 8 },
   { path: ['ultra', 'maxContinuations'], min: 0, max: 20 },
@@ -277,13 +289,23 @@ function migrateDownloads(s: AppSettings, raw: { downloads?: { version?: number 
   }
 }
 
+/*
+ * Keeping conversations ready on disk was off by default until it learned to save at quiet moments
+ * and survive a crash part way through a save. A stored "off" from before then is the old default,
+ * not anybody's choice, so it is switched on once and marked; turned off again later, it stays off.
+ */
+function migrateStateCache(s: AppSettings, raw: { runtime?: { stateCache?: { version?: number } } } | null): AppSettings {
+  if (raw?.runtime?.stateCache?.version === 2) return s
+  return { ...s, runtime: { ...s.runtime, stateCache: { ...s.runtime.stateCache, enabled: true, version: 2 } } }
+}
+
 let cache: AppSettings | null = null
 
 export function loadSettings(): AppSettings {
   if (cache) return cache
   try {
     const raw = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
-    cache = migrateDownloads(sanitizeLists(clampNumerics(merge(DEFAULT_SETTINGS, raw))), raw)
+    cache = migrateStateCache(migrateDownloads(sanitizeLists(clampNumerics(merge(DEFAULT_SETTINGS, raw))), raw), raw)
   } catch {
     cache = { ...DEFAULT_SETTINGS }
   }

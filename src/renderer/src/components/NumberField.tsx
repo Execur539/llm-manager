@@ -60,11 +60,7 @@ export default function NumberField({
           if (e.key === 'Enter') e.currentTarget.blur()
         }}
       />
-      {hint && (
-        <span className="faint" style={{ marginLeft: 6 }}>
-          {hint}
-        </span>
-      )}
+      {hint && <span className="faint">{hint}</span>}
     </>
   )
 }

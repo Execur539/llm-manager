@@ -37,7 +37,8 @@ await build({
     credentialRefs: path.join(ROOT, 'src/main/agent/credential-refs.ts'),
     reuseMeter: path.join(ROOT, 'src/main/runtime/reuse-meter.ts'),
     promptState: path.join(ROOT, 'src/main/agent/prompt-state.ts'),
-    stateCache: path.join(ROOT, 'src/main/runtime/state-cache.ts')
+    stateCache: path.join(ROOT, 'src/main/runtime/state-cache.ts'),
+    speed: path.join(ROOT, 'src/main/autofit/speed.ts')
   },
   outdir: path.join(ROOT, 'scripts/built'),
   bundle: true,

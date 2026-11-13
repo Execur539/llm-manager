@@ -22,6 +22,11 @@ const EVENT_CHANNELS = [
   'chat:media-progress',
   'chat:context',
   'chat:message',
+  // Chat's own tool use: a call starting, and the frames a look at a video returned.
+  'chat:tool-call',
+  'chat:tool-frames',
+  // What chat's scratchpad holds changed: something added, deleted or cleared for being unused.
+  'scratchpad:changed',
   // The model named or renamed a conversation, either kind.
   'chat:titled',
   'chat:notes',
@@ -109,7 +114,10 @@ const api = {
   },
 
   /** Tells the renderer it is running in the desktop shell rather than a remote browser. */
-  isDesktop: true
+  isDesktop: true,
+
+  /** Whether the window's base is the Mica material, so the sidebar can let it through. */
+  mica: process.argv.includes('--llmm-mica')
 }
 
 contextBridge.exposeInMainWorld('api', api)

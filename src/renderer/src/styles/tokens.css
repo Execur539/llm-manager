@@ -1,0 +1,124 @@
+/*
+ * Design tokens.
+ *
+ * Graphite, quiet, and precise. Neutral greys with the faintest cool cast carry nearly everything;
+ * colour is kept for the one accent (actions, selection, focus), for status, and for data. Depth
+ * comes from small steps in luminance and hairlines at low alpha, not from heavy borders or a box
+ * drawn around every group. Type is the platform's own: Segoe UI Variable, which Windows 11 ships
+ * with optical sizes for text and display, so the app renders as crisply as the system around it.
+ *
+ * The older variable names (--bg, --surface-*, --text-dim, --accent-wash ...) are kept as the names,
+ * so everything that reads them follows the new values.
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* ---- canvas and surfaces: each a real step, so stacked panels read as depth ---- */
+  --bg: #111214; /* the content canvas */
+  --surface-1: #18191c; /* groups, cards, raised panels */
+  --surface-2: #1f2024; /* controls, hovered rows */
+  --surface-3: #27282d; /* pressed, active */
+  --surface-float: #1c1d21; /* menus, popovers, dialogs */
+  --bg-raised: var(--surface-1);
+  --bg-inset: #0c0d0f; /* wells: code, meters */
+  --field: rgba(255, 255, 255, 0.045);
+  --field-hover: rgba(255, 255, 255, 0.07);
+
+  /* ---- lines ---- */
+  --hairline: rgba(255, 255, 255, 0.06);
+  --border: rgba(255, 255, 255, 0.085);
+  --border-strong: rgba(255, 255, 255, 0.15);
+
+  /* ---- text ---- */
+  --text: #ededf0;
+  --text-dim: #a3a3ac;
+  --text-faint: #6f6f79;
+
+  /* ---- sidebar ---- */
+  --sidebar: #151619;
+  --sidebar-hover: rgba(255, 255, 255, 0.055);
+  --sidebar-active: rgba(255, 255, 255, 0.09);
+  --sidebar-border: rgba(255, 255, 255, 0.055);
+  --nav-fg: #b8b8c0;
+  --nav-fg-strong: #f5f5f7;
+  --nav-label: #6f6f79;
+  --nav-icon-idle: #84848e;
+
+  /* ---- accent: the one colour that means "act here" ---- */
+  --accent: #0a84ff;
+  --accent-hover: #2b95ff;
+  --accent-text: #55a7ff; /* accent as text on the dark canvas, where the fill blue is too deep */
+  --accent-dim: rgba(10, 132, 255, 0.5);
+  --accent-wash: rgba(10, 132, 255, 0.15);
+  --accent-wash-strong: rgba(10, 132, 255, 0.24);
+  --on-accent: #ffffff;
+
+  /* ---- status ---- */
+  --good: #30d158;
+  --warn: #ffb340;
+  --bad: #ff5a52;
+  --good-wash: rgba(48, 209, 88, 0.13);
+  --warn-wash: rgba(255, 179, 64, 0.13);
+  --bad-wash: rgba(255, 90, 82, 0.13);
+
+  /* ---- data: series colours for meters and charts, distinct and calm ---- */
+  --data-1: #3d8bff; /* weights */
+  --data-2: #4fc3d9; /* KV cache */
+  --data-3: #9b87f5; /* working memory */
+  --data-4: #4ccf8e; /* expert cache */
+  --data-5: #8a8a96; /* runtime and extras */
+
+  --scrim: rgba(5, 6, 8, 0.58);
+
+  /* ---- shape ---- */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-2xl: 20px;
+  --r-pill: 999px;
+
+  /* ---- depth ---- */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.36), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  --shadow-lg: 0 28px 70px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.07);
+  --lift: inset 0 1px 0 rgba(255, 255, 255, 0.045); /* a top edge catching light */
+
+  /* ---- type ---- */
+  --sans: 'Segoe UI Variable Text', 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+  --display: 'Segoe UI Variable Display', 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'Cascadia Mono', 'Cascadia Code', Consolas, monospace;
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-md: 13.5px;
+  --fs-lg: 15px;
+  --fs-xl: 20px;
+  --fs-2xl: 28px;
+
+  /* ---- rhythm and measure ---- */
+  --control-h: 32px;
+  --titlebar-h: 48px;
+  --measure: 72ch;
+  --chat-width: 780px;
+  --page: 1120px;
+
+  /* ---- motion ---- */
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-fast: 110ms;
+  --dur: 170ms;
+  --dur-slow: 260ms;
+}
+
+/* Honour a system request for less motion, everywhere. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

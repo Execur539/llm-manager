@@ -360,6 +360,30 @@ export const MIGRATIONS: { id: number; sql: string }[] = [
              WHERE m.chat_id = chats.id AND m.role = 'user' ORDER BY m.created_at, m.rowid LIMIT 1),
           '');
     `
+  },
+  {
+    id: 13,
+    sql: `
+    -- What a model's loads cost outside llama.cpp's own buffers, per card: the CUDA runtime, the
+    -- vision projector, a separate MTP head. Measured from each load against llama.cpp's dry run,
+    -- so the next plan uses the real figure instead of a guess or a blanket margin.
+    ALTER TABLE model_configs ADD COLUMN extras TEXT;
+
+    -- Decode speed the server reported at the end of each reply, with the plan's shape, so the
+    -- speed a plan is expected to reach comes from this machine rather than a formula.
+    CREATE TABLE IF NOT EXISTS plan_speeds (
+      model_id TEXT NOT NULL,
+      gpu_layers INTEGER NOT NULL,
+      cpu_moe_layers INTEGER NOT NULL,
+      cache_slots INTEGER NOT NULL,
+      draft INTEGER NOT NULL,
+      context_length INTEGER NOT NULL,
+      tokens_per_second REAL NOT NULL,
+      tokens INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_speeds_model ON plan_speeds(model_id, created_at);
+    `
   }
 ]
 

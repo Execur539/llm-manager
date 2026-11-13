@@ -138,10 +138,16 @@ function markerJson(messages, name) {
     else if (text[i] === '}') {
       depth--
       if (depth === 0) {
+        const raw = text.slice(start, i + 1)
         try {
-          return JSON.parse(text.slice(start, i + 1))
+          return JSON.parse(raw)
         } catch {
-          return null
+          // A message sent as content parts arrives here stringified, its quotes escaped.
+          try {
+            return JSON.parse(raw.replace(/\\"/g, '"'))
+          } catch {
+            return null
+          }
         }
       }
     }

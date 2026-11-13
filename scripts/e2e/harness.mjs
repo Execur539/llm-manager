@@ -288,6 +288,8 @@ const AUDIT_FN = () => {
 
     // Elements deliberately hidden from users are not judged on layout.
     if (el.closest('[aria-hidden="true"], [inert]')) continue
+    // Visually hidden on purpose: a label for screen readers, clipped to a pixel by design.
+    if (el.closest('.sr-only')) continue
 
     // Does anything between this element and the document scroll horizontally?
     function scrollableAncestor(node) {
@@ -470,7 +472,8 @@ const AUDIT_FN = () => {
       const type = el.getAttribute('type')
       if (type === 'checkbox' || type === 'radio' || type === 'range') continue
       const c = parseRgba(getComputedStyle(el).backgroundColor)
-      if (!c || c[3] === 0) continue
+      // A faint white wash over a dark page is a dark field, not a browser-default white box.
+      if (!c || c[3] < 0.25) continue
       if (luminance(c.slice(0, 3)) > 0.4) {
         add('unthemed-control', `background ${getComputedStyle(el).backgroundColor} on a dark theme`, el)
       }
@@ -483,6 +486,7 @@ const AUDIT_FN = () => {
   for (const el of textEls) {
     const style = getComputedStyle(el)
     if (style.display === 'none' || style.visibility === 'hidden') continue
+    if (el.closest('.sr-only')) continue
     const fgRaw = parseRgba(style.color)
     if (!fgRaw) continue
     const bg = bgOf(el)

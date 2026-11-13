@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
 import type { HardwareSnapshot, ModelRecord } from '@shared/types'
-import { fmtBytes, invoke } from '../lib/api'
+import { fmtBytes, invoke, displayModelName } from '../lib/api'
 import { Spinner } from '../components/Spinner'
 import type { LoadedModel, View } from '../App'
+import { Toolbar } from '../lib/shell'
 
 interface LiveStats {
   tokensPerSecond: number
@@ -73,8 +74,7 @@ export default function Dashboard({
 
   return (
     <>
-      <h1>Dashboard</h1>
-      <p className="subtitle">Everything here is measured at runtime. No hardware values are assumed.</p>
+      <Toolbar title="Dashboard" />
 
       {vendor && vendor.missing.length > 0 && (
         <div className="card" style={{ borderColor: '#5a4515' }}>
@@ -105,156 +105,191 @@ export default function Dashboard({
         </div>
       )}
 
-      <div className="grid-2 grid-top">
-        {(hardware?.gpus ?? []).map((g) => {
-          // Free VRAM cannot be measured on some AMD/Intel drivers. Deriving "used" from an
-          // unmeasured figure produced a confident "0 B used" and an empty bar, which asserts
-          // something we do not know — worse than saying nothing.
-          const measured = g.freeVram >= 0
-          const used = measured ? g.totalVram - g.freeVram : 0
-          const pct = measured && g.totalVram > 0 ? Math.min(100, (used / g.totalVram) * 100) : 0
-          return (
-            <div className="card" key={`${g.index}-${g.name}`}>
-              <div className="card-title">
-                <span className="truncate" title={g.name}>{g.name}</span>
-                <span
-                  className={`badge ${g.freeIsMeasured ? 'good' : 'warn'}`}
-                  title={
-                    g.freeIsMeasured
-                      ? 'Free VRAM read from the driver'
-                      : 'This driver does not report free VRAM, so the figure is estimated from the total'
-                  }
-                >
-                  {g.freeIsMeasured ? 'measured' : 'estimated'}
-                </span>
-              </div>
-              <div className={`meter${measured ? '' : ' unknown'}`}>
-                {measured && <span style={{ width: `${pct}%` }} />}
-              </div>
-              <div className="row" style={{ justifyContent: 'space-between', marginTop: 6, fontSize: 11 }}>
-                <span className="faint">{measured ? `${fmtBytes(used)} used` : 'usage unknown'}</span>
-                <span className="faint">
-                  {measured ? `${fmtBytes(g.freeVram)} free of ${fmtBytes(g.totalVram)}` : `${fmtBytes(g.totalVram)} total`}
-                </span>
-              </div>
-              <div className="faint gpu-util">
-                {g.utilisation >= 0 ? `GPU ${g.utilisation}% busy` : 'utilisation not reported'}
+      {/*
+        * The model, first and large: whether one is running, and how it is doing. Everything else on
+        * this page is the machine it runs on.
+        */}
+      {loaded ? (
+        <section className="card dash-hero" aria-label="Inference">
+          <span className="sr-only">Inference</span>
+          <div className="dash-hero-head">
+            <span className="dash-status">
+              <span className="pulse-dot" aria-hidden="true" />
+              Running
+            </span>
+            <h2 className="dash-model truncate" title={loaded.model}>
+              {displayModelName(loaded.model)}
+            </h2>
+          </div>
+          <div className="dash-stats">
+            <div className="stat">
+              <div className="stat-label">Speed</div>
+              <div className="stat-value">
+                {live?.tokensPerSecond ? live.tokensPerSecond.toFixed(1) : '—'}
+                <span className="stat-unit">tok/s</span>
               </div>
             </div>
-          )
-        })}
-
-        {/*
-          * Still asking is not the same answer as "none".
-          *
-          * A driver slow to answer at startup used to produce "No GPU detected" — a verdict the app
-          * then planned every model by. While detection is provisional the card says what is known
-          * and why, until a retry settles it.
-          */}
-        {hardware?.detection?.state === 'provisional' && (
-          <div className="card" data-testid="gpu-detecting">
-            <div className="card-title">
-              {hardware.gpus.length ? 'Confirming GPUs…' : 'Detecting GPUs…'}
-              <Spinner size={13} />
-            </div>
-            <div className="dim">
-              {hardware.detection.reason
-                ? `The GPU driver has not answered yet (${hardware.detection.reason}).`
-                : 'The GPU driver has not answered yet.'}{' '}
-              Retrying automatically; plans made before it answers may leave GPUs out.
-            </div>
-          </div>
-        )}
-
-        {hardware && hardware.gpus.length === 0 && hardware.detection?.state !== 'provisional' && (
-          <div className="card">
-            <div className="card-title">No GPU detected</div>
-            <div className="dim">Inference will run on CPU. Expect a few tokens per second on larger models.</div>
-          </div>
-        )}
-
-        <div className="card">
-          <div className="card-title">System</div>
-          <dl className="kv">
-            <dt>Backend</dt>
-            <dd>{hardware?.backend.toUpperCase() ?? '—'}</dd>
-            <dt>CPU</dt>
-            {/* Wraps rather than truncating: a cut-off CPU name has no way to be read. */}
-            <dd title={hardware?.cpuName ?? undefined}>{hardware?.cpuName ?? '—'}</dd>
-            <dt>Threads</dt>
-            <dd>{hardware?.cpuThreads ?? '—'}</dd>
-            <dt>RAM</dt>
-            <dd>{fmtBytes(hardware?.freeRam)} free of {fmtBytes(hardware?.totalRam)}</dd>
-          </dl>
-        </div>
-
-        <div className="card">
-          <div className="card-title">
-            Inference
-            {loaded && <span className="badge good">live</span>}
-          </div>
-          {loaded ? (
-            <>
-              <dl className="kv">
-                <dt>Model</dt>
-                <dd className="truncate">{loaded.model}</dd>
-                <dt>Speed</dt>
-                <dd>{live?.tokensPerSecond ? `${live.tokensPerSecond.toFixed(1)} tok/s` : '—'}</dd>
-                <dt>First token</dt>
-                <dd>{live?.ttftMs != null ? `${live.ttftMs} ms` : '—'}</dd>
-                <dt>Context</dt>
-                <dd>
-                  {(live?.contextUsed ?? 0).toLocaleString()} / {loaded.plan.contextLength.toLocaleString()}
-                </dd>
-              </dl>
-              <div className="meter" style={{ marginTop: 8 }}>
-                <span style={{ width: `${live?.kvFillPercent ?? 0}%` }} />
+            <div className="stat">
+              <div className="stat-label">First token</div>
+              <div className="stat-value">
+                {live?.ttftMs != null ? live.ttftMs.toLocaleString() : '—'}
+                <span className="stat-unit">ms</span>
               </div>
-              <div className="faint" style={{ fontSize: 11, marginTop: 4 }}>
-                KV cache fill — reserved in full at load, so it cannot overflow mid-chat
+            </div>
+            <div className="stat">
+              <div className="stat-label">Context in use</div>
+              <div className="stat-value">
+                {Math.round(live?.kvFillPercent ?? 0)}
+                <span className="stat-unit">%</span>
               </div>
-            </>
-          ) : (
-            <>
-              <div className="dim">No model loaded.</div>
-              <button className="primary" style={{ marginTop: 10 }} onClick={() => onNavigate('library')}>
+              <div className="stat-sub">
+                {(live?.contextUsed ?? 0).toLocaleString()} of {loaded.plan.contextLength.toLocaleString()} tokens
+              </div>
+            </div>
+            <div className="stat">
+              <div className="stat-label">Layers on GPU</div>
+              <div className="stat-value">
+                {loaded.plan.gpuLayers}
+                <span className="stat-unit">of {loaded.plan.totalLayers}</span>
+              </div>
+            </div>
+          </div>
+          <div className="dash-actions">
+            <button className="primary" onClick={() => onNavigate('chat')}>
+              Open chat
+            </button>
+            <button onClick={() => onNavigate('agent')}>Open agent</button>
+          </div>
+        </section>
+      ) : (
+        <section className="card dash-hero idle" aria-label="Inference">
+          <span className="sr-only">Inference</span>
+          <div className="dash-hero-head">
+            <span className="dash-status idle">Idle</span>
+            <h2 className="dash-model">No model loaded.</h2>
+          </div>
+          <p className="dash-lede">
+            {models.length
+              ? `Load one of your ${models.length} ${models.length === 1 ? 'model' : 'models'} to chat, run the agent, or serve the API.`
+              : 'Find a model to download, then load it here to chat, run the agent, or serve the API.'}
+          </p>
+          <div className="dash-actions">
+            {models.length > 0 && (
+              <button className="primary" onClick={() => onNavigate('library')}>
                 Choose a model
               </button>
-            </>
-          )}
-        </div>
-
-        <div className="card">
-          <div className="card-title">Library</div>
-          <dl className="kv">
-            <dt>Models</dt>
-            <dd>{models.length}</dd>
-            <dt>On disk</dt>
-            <dd>{fmtBytes(models.reduce((a, m) => a + m.bytes, 0))}</dd>
-            <dt>Multimodal</dt>
-            <dd>{models.filter((m) => m.caps.vision || m.caps.audio).length}</dd>
-          </dl>
-          {models.length === 0 && (
-            <button className="primary" style={{ marginTop: 10 }} onClick={() => onNavigate('discover')}>
+            )}
+            <button className={models.length ? '' : 'primary'} onClick={() => onNavigate('discover')}>
               Find a model
             </button>
-          )}
-        </div>
+          </div>
+        </section>
+      )}
 
-        {history && history.totalTokensOut > 0 && (
-          <div className="card">
-            <div className="card-title">All time</div>
-            <dl className="kv">
-              <dt>Tokens generated</dt>
-              <dd>{history.totalTokensOut.toLocaleString()}</dd>
-              <dt>API requests</dt>
-              <dd>{history.totalRequests.toLocaleString()}</dd>
-              <dt>Active time</dt>
-              <dd>{history.activeHours.toFixed(1)} h</dd>
-            </dl>
+      {/* The cards the models run on, as a list of meters rather than a wall of boxes. */}
+      <section className="dash-section">
+        <h2 className="section-title">Graphics</h2>
+        {hardware?.detection?.state === 'provisional' && (
+          <div className="card note" data-testid="gpu-detecting">
+            <Spinner size={13} />
+            <span>
+              {hardware.gpus.length ? 'Confirming GPUs. ' : 'Detecting GPUs. '}
+              {hardware.detection.reason
+                ? `The GPU driver has not answered yet (${hardware.detection.reason}). `
+                : 'The GPU driver has not answered yet. '}
+              Retrying automatically; plans made before it answers may leave GPUs out.
+            </span>
           </div>
         )}
-      </div>
+        {hardware && hardware.gpus.length === 0 && hardware.detection?.state !== 'provisional' && (
+          <div className="card dash-empty">
+            <strong>No GPU detected.</strong> Models will run on the processor, at a few tokens per second for the larger ones.
+          </div>
+        )}
+        {(hardware?.gpus.length ?? 0) > 0 && (
+          <div className="card gpu-list">
+            {(hardware?.gpus ?? []).map((g) => {
+              const measured = g.freeVram >= 0
+              const used = measured ? g.totalVram - g.freeVram : 0
+              const pct = measured && g.totalVram > 0 ? Math.min(100, (used / g.totalVram) * 100) : 0
+              const unusable = hardware?.backend === 'cuda' && g.vendor !== 'nvidia'
+              return (
+                <div className={`gpu-row${unusable ? ' unusable' : ''}`} key={`${g.index}-${g.name}`}>
+                  <div className="gpu-row-head">
+                    <span className="gpu-name truncate" title={g.name}>
+                      {g.name.replace(/^NVIDIA GeForce /, '')}
+                    </span>
+                    <span className="gpu-figures">
+                      {measured
+                        ? `${fmtBytes(used)} of ${fmtBytes(g.totalVram)}`
+                        : `${fmtBytes(g.totalVram)}, use not reported`}
+                      {g.utilisation >= 0 && <span className="gpu-busy">{g.utilisation}% busy</span>}
+                    </span>
+                  </div>
+                  <div className={`meter${measured ? '' : ' unknown'}`} title={g.freeIsMeasured ? 'Read from the driver' : 'Estimated from the total; this driver does not report free memory'}>
+                    {measured && <span style={{ width: `${pct}%` }} />}
+                  </div>
+                  {unusable && <div className="gpu-note">Shares system memory; not used for models with the CUDA backend.</div>}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </section>
+
+      <section className="dash-section">
+        <h2 className="section-title">System</h2>
+        <div className="dash-tiles">
+          <div className="card dash-tile">
+            <div className="stat-label">Memory</div>
+            <div className="stat-value small">
+              {fmtBytes(Math.max(0, (hardware?.totalRam ?? 0) - (hardware?.freeRam ?? 0)))}
+              <span className="stat-unit">of {fmtBytes(hardware?.totalRam)} in use</span>
+            </div>
+            <div className="meter">
+              <span
+                style={{
+                  width: `${hardware?.totalRam ? Math.min(100, ((hardware.totalRam - (hardware.freeRam ?? 0)) / hardware.totalRam) * 100) : 0}%`
+                }}
+              />
+            </div>
+          </div>
+          <div className="card dash-tile">
+            <div className="stat-label">Processor</div>
+            <div className="dash-tile-text" title={hardware?.cpuName ?? undefined}>
+              {hardware?.cpuName ?? '—'}
+            </div>
+            <div className="stat-sub">
+              {hardware?.cpuThreads ?? '—'} threads · {hardware?.backend.toUpperCase() ?? '—'} backend
+            </div>
+          </div>
+          <div className="card dash-tile">
+            <div className="stat-label">Library</div>
+            <div className="stat-value small">
+              {models.length}
+              <span className="stat-unit">{models.length === 1 ? 'model' : 'models'}</span>
+            </div>
+            <div className="stat-sub">
+              {fmtBytes(models.reduce((a, m) => a + m.bytes, 0))} on disk ·{' '}
+              {models.filter((m) => m.caps.vision || m.caps.audio).length} multimodal
+            </div>
+          </div>
+          {history && history.totalTokensOut > 0 && (
+            <div className="card dash-tile">
+              <div className="stat-label">All time</div>
+              <div className="stat-value small">
+                {history.totalTokensOut >= 1e6
+                  ? `${(history.totalTokensOut / 1e6).toFixed(1)}M`
+                  : history.totalTokensOut.toLocaleString()}
+                <span className="stat-unit">tokens</span>
+              </div>
+              <div className="stat-sub">
+                {history.totalRequests.toLocaleString()} API requests · {history.activeHours.toFixed(1)} h active
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
     </>
   )
 }

@@ -1,0 +1,1414 @@
+/*
+ * Conversations: the transcript, the answer as it arrives, tool calls, and the composer.
+ *
+ * The column is a reading measure wide and centred, with the scrollbar at the pane's edge. Your
+ * messages are bubbles on the right; the model's answers are plain text, set slightly larger and
+ * looser than the interface around them, because they are what you came to read.
+ */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------------------------------------------------------------- the column */
+
+.chat {
+  --measure: var(--chat-width);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.chat > * {
+  width: 100%;
+  max-width: calc(var(--chat-width) + 48px);
+  margin-left: auto;
+  margin-right: auto;
+  flex-shrink: 0;
+  padding-left: 24px;
+  padding-right: 24px;
+}
+
+/* The transcript spans the pane, so its scrollbar sits at the edge rather than beside the text. */
+.chat > .messages {
+  max-width: none;
+  padding: 0;
+}
+
+.chat > .card {
+  width: calc(100% - 48px);
+  max-width: var(--chat-width);
+  padding: 11px 14px;
+  margin-top: 4px;
+  margin-bottom: 10px;
+}
+
+.messages {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.messages-content {
+  max-width: calc(var(--chat-width) + 48px);
+  margin: 0 auto;
+  padding: 12px 24px 28px;
+}
+
+/* ---------------------------------------------------------------- messages */
+
+.msg {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  margin: 0 0 26px;
+}
+
+.msg-main {
+  min-width: 0;
+}
+
+.msg .who {
+  margin-bottom: 4px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-faint);
+}
+
+/* Yours: a bubble on the right. */
+.msg.from-user {
+  align-items: flex-end;
+}
+
+.msg.from-user > .msg-main {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  max-width: min(82%, 640px);
+}
+
+.msg.from-user .body {
+  width: fit-content;
+  max-width: 100%;
+  margin: 0;
+  padding: 9px 15px;
+  border: none;
+  border-radius: 19px 19px 6px 19px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 14.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The model's: plain text across the column. */
+.msg.from-assistant > .msg-main {
+  width: 100%;
+}
+
+.msg.from-assistant .markdown,
+.msg.from-assistant .body {
+  color: #dedee3;
+  font-size: 14.5px;
+  line-height: 1.68;
+}
+
+.msg .body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Copy, edit, retry: on hover, floating at the turn's corner. */
+.msg-actions {
+  position: absolute;
+  top: -14px;
+  right: 0;
+  z-index: 2;
+  display: flex;
+  gap: 1px;
+  padding: 2px;
+  border: none;
+  border-radius: var(--r-md);
+  background: var(--surface-float);
+  box-shadow: var(--shadow-md);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(3px);
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    transform var(--dur) var(--ease);
+}
+
+.msg.from-user > .msg-actions {
+  right: auto;
+  left: auto;
+  top: -16px;
+}
+
+.msg:hover > .msg-actions,
+.msg:focus-within > .msg-actions,
+.msg-actions.confirming {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
+}
+
+.msg-actions .row-action {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+}
+
+/* Rewriting a turn in place. */
+.msg-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+
+.msg.from-user > .msg-main:has(.msg-editor) {
+  width: 100%;
+  max-width: 100%;
+}
+
+.msg-editor-pane textarea {
+  display: block;
+  width: 100%;
+  min-height: 72px;
+  padding: 10px 12px;
+  font-size: 14px;
+  line-height: 1.55;
+  border-radius: var(--r-lg);
+}
+
+.msg-editor-pane.cot textarea {
+  min-height: 56px;
+  border-style: dashed;
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}
+
+.msg-editor-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  color: var(--text-faint);
+}
+
+.msg-editor-pane.cot .msg-editor-label {
+  color: var(--accent-text);
+}
+
+.msg-editor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.msg-editor-actions .tiny-note {
+  margin: 0 auto 0 0;
+}
+
+/* Carry on from where an answer stopped. */
+.continue-row {
+  margin: -8px 0 24px;
+}
+
+.continue-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}
+
+.continue-button:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  background: var(--accent-wash);
+  color: var(--accent-text);
+}
+
+/* Where the model starts reading a summary instead of the messages above. */
+.summary-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 6px 0 26px;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.summary-divider::before,
+.summary-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--hairline);
+}
+
+/* Waiting for the first token: three dots breathing. */
+.thinking {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+}
+
+.thinking .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  animation: waiting 1.3s var(--ease-in-out) infinite;
+}
+
+.thinking .dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.thinking .dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes waiting {
+  0%,
+  70%,
+  100% {
+    opacity: 0.3;
+    transform: none;
+  }
+  35% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+.prompt-progress {
+  width: min(320px, 100%);
+  padding: 4px 0;
+}
+
+/* ---------------------------------------------------------------- thinking */
+
+/*
+ * The model's reasoning, folded: one quiet line until opened. While it streams the label shimmers,
+ * which says "working" without a spinner competing with the answer.
+ */
+.thinking-block {
+  margin: 0 0 12px;
+  border: none;
+  border-radius: 0;
+  background: none;
+  overflow: visible;
+}
+
+.thinking-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: auto;
+  min-height: 26px;
+  margin-left: -6px;
+  padding: 0 8px 0 4px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: none;
+  box-shadow: none;
+  color: var(--text-faint);
+  font-size: var(--fs-sm);
+  font-weight: 400;
+}
+
+.thinking-head:hover:not(:disabled) {
+  background: var(--field-hover);
+  color: var(--text-dim);
+}
+
+.thinking-head:active:not(:disabled) {
+  transform: none;
+}
+
+.thinking-chevron {
+  margin: 0;
+  transform: rotate(-90deg);
+  transition: transform var(--dur) var(--ease);
+}
+
+.thinking-block.open .thinking-chevron {
+  transform: none;
+}
+
+.thinking-label {
+  font-weight: 500;
+}
+
+.thinking-label.live {
+  background: linear-gradient(90deg, var(--text-faint) 0%, var(--text) 45%, var(--text-faint) 90%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 1.8s linear infinite;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+
+.thinking-size {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+  opacity: 0.85;
+}
+
+.thinking-size::before {
+  content: '· ';
+}
+
+.thinking-body {
+  max-height: 320px;
+  overflow-y: auto;
+  margin: 6px 0 2px 4px;
+  padding: 2px 0 2px 16px;
+  border: none;
+  border-left: 2px solid var(--hairline);
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  animation: fade-in var(--dur) var(--ease);
+}
+
+/* ---------------------------------------------------------------- tool calls */
+
+/* A tool call is one line: what ran, on what, and how it went; open it for the detail. */
+.msg-aside {
+  display: block;
+  margin: -12px 0 18px;
+}
+
+.msg-aside + .msg-aside {
+  margin-top: -14px;
+}
+
+.tool-card {
+  margin: 4px 0;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  font-family: var(--sans);
+  font-size: var(--fs-sm);
+  overflow: hidden;
+  transition: border-color var(--dur-fast) var(--ease);
+}
+
+.tool-card:hover {
+  border-color: var(--border);
+}
+
+.tool-card summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 10px 0 12px;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.tool-card summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-status {
+  position: relative;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-faint);
+}
+
+.tool-status.ok {
+  background: var(--good);
+}
+
+.tool-status.failed {
+  background: var(--bad);
+}
+
+.tool-status.running {
+  background: var(--warn);
+  animation: status-pulse 1.2s var(--ease-in-out) infinite;
+}
+
+@keyframes status-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.tool-name {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.tool-detail {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.tool-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: var(--fs-xs);
+}
+
+.tool-chevron {
+  color: var(--text-faint);
+  transform: rotate(-90deg);
+  transition: transform var(--dur) var(--ease);
+}
+
+.tool-card[open] .tool-chevron {
+  transform: none;
+}
+
+.tool-card .detail {
+  padding: 4px 12px 12px;
+  border-top: 1px solid var(--hairline);
+  white-space: normal;
+}
+
+.detail-label {
+  margin: 10px 0 5px;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-faint);
+}
+
+.detail-pre {
+  max-height: 280px;
+  margin: 0;
+  overflow: auto;
+  background: var(--bg-inset);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* A call the model is still writing. */
+.tool-card.pending {
+  border-style: dashed;
+  background: transparent;
+}
+
+.pending-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 36px;
+  padding: 0 12px;
+}
+
+.pending-caret {
+  width: 2px;
+  height: 14px;
+  margin-left: auto;
+  border-radius: 1px;
+  background: var(--warn);
+  animation: blink 1.05s step-end infinite;
+}
+
+/* ---------------------------------------------------------------- markdown */
+
+.markdown {
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.markdown > *:first-child {
+  margin-top: 0;
+}
+
+.markdown > *:last-child {
+  margin-bottom: 0;
+}
+
+.md-p {
+  margin: 0 0 14px;
+  white-space: pre-wrap;
+}
+
+.md-heading {
+  margin: 24px 0 10px;
+  font-family: var(--display);
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+h1.md-heading {
+  font-size: 22px;
+}
+
+h2.md-heading {
+  font-size: 19px;
+}
+
+h3.md-heading {
+  font-size: 16.5px;
+}
+
+h4.md-heading {
+  font-size: 15px;
+}
+
+h5.md-heading,
+h6.md-heading {
+  font-size: 14px;
+  color: var(--text-dim);
+}
+
+.md-list {
+  margin: 0 0 14px;
+  padding-left: 22px;
+}
+
+.md-list li {
+  margin-bottom: 5px;
+  padding-left: 2px;
+}
+
+.md-list li::marker {
+  color: var(--text-faint);
+}
+
+.md-list .md-list {
+  margin: 5px 0 0;
+}
+
+.md-code {
+  padding: 1.5px 5px;
+  border: none;
+  border-radius: var(--r-xs);
+  background: rgba(255, 255, 255, 0.07);
+  color: #e8e8ec;
+  font-family: var(--mono);
+  font-size: 0.86em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Code: a well with its language and a copy button on a header strip. */
+.md-codeblock {
+  margin: 4px 0 16px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+
+.md-codehead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 34px;
+  padding: 0 6px 0 14px;
+  border-bottom: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.md-lang {
+  position: static;
+  padding: 0;
+  background: none;
+  box-shadow: none;
+  font-family: var(--sans);
+  font-size: var(--fs-xs);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-faint);
+}
+
+.md-copy {
+  min-height: 24px;
+  gap: 5px;
+  padding: 0 8px;
+  border-radius: var(--r-sm);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+}
+
+.md-copy:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+}
+
+.md-pre {
+  position: relative;
+  max-height: 480px;
+  margin: 0;
+  padding: 12px 16px 14px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  overflow: auto;
+}
+
+.md-pre code {
+  display: block;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: #d4d4da;
+  white-space: pre;
+}
+
+.md-quote {
+  margin: 0 0 14px;
+  padding: 2px 0 2px 14px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-dim);
+}
+
+.md-table-wrap {
+  margin: 4px 0 16px;
+  overflow-x: auto;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+}
+
+.md-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.md-table th,
+.md-table td {
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--hairline);
+  white-space: nowrap;
+}
+
+.md-table th {
+  position: static;
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.md-table tr:last-child td {
+  border-bottom: none;
+}
+
+.md-hr {
+  margin: 20px 0;
+  border: none;
+  border-top: 1px solid var(--hairline);
+}
+
+.markdown a {
+  color: var(--accent-text);
+  text-decoration: none;
+}
+
+.markdown a:hover {
+  text-decoration: underline;
+}
+
+.body.streaming {
+  position: relative;
+}
+
+.body.streaming .cursor,
+.continuing .cursor {
+  vertical-align: baseline;
+}
+
+/* ---------------------------------------------------------------- the composer */
+
+/*
+ * One floating card: what you are writing, and under it everything about how it goes: attach,
+ * effort, how full the context is, and send. It sits on the transcript, so the last answer can
+ * scroll under it, with a fade so the edge is soft.
+ */
+.composer {
+  position: relative;
+  flex-shrink: 0;
+  margin: 0 auto;
+  padding-top: 6px;
+  padding-bottom: 14px;
+}
+
+.composer::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 28px;
+  background: linear-gradient(to bottom, transparent, var(--bg));
+  pointer-events: none;
+}
+
+.composer-shell {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 12px 10px 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-2xl);
+  background: var(--surface-1);
+  box-shadow:
+    0 10px 30px rgba(0, 0, 0, 0.28),
+    var(--lift);
+  transition:
+    border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
+}
+
+.composer-shell:focus-within {
+  border-color: var(--border-strong);
+  box-shadow:
+    0 10px 30px rgba(0, 0, 0, 0.32),
+    0 0 0 3px rgba(255, 255, 255, 0.035),
+    var(--lift);
+}
+
+.composer-shell textarea,
+.composer-shell textarea:hover {
+  width: 100%;
+  min-width: 0;
+  min-height: 26px;
+  max-height: 220px;
+  padding: 2px 4px 6px 2px;
+  border: none;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  font-size: 14.5px;
+  line-height: 1.55;
+  resize: none;
+  field-sizing: content;
+}
+
+.composer-shell textarea:focus,
+.composer-shell textarea:focus-visible {
+  outline: none;
+  border: none;
+  box-shadow: none;
+}
+
+.composer-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+}
+
+.composer-spacer {
+  flex: 1 1 auto;
+}
+
+.attach-button {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  min-height: 30px;
+  margin-left: -4px;
+  padding: 0;
+  border: none;
+  border-radius: var(--r-pill);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-dim);
+}
+
+.attach-button:hover:not(:disabled) {
+  background: var(--field-hover);
+  color: var(--text);
+}
+
+.send-button {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    0 1px 3px rgba(0, 0, 0, 0.35);
+  color: #fff;
+}
+
+.send-button:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.send-button:active:not(:disabled) {
+  transform: scale(0.92);
+}
+
+.send-button:disabled {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: none;
+  color: var(--text-faint);
+}
+
+.send-button.stopping {
+  background: var(--text);
+  color: var(--bg);
+}
+
+.send-button.stopping:hover:not(:disabled) {
+  background: #fff;
+}
+
+.composer-hint {
+  margin: 7px 4px 0;
+  font-size: 11px;
+  color: var(--text-faint);
+  text-align: center;
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease);
+}
+
+.composer:focus-within .composer-hint {
+  opacity: 0.85;
+}
+
+/* Back to the newest message, when you have scrolled up. */
+.jump-latest {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+  min-height: 30px;
+  padding: 0 12px 0 10px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: var(--surface-float);
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(6px);
+  transition:
+    opacity var(--dur) var(--ease),
+    transform var(--dur-slow) var(--ease),
+    background-color var(--dur-fast) var(--ease);
+}
+
+.jump-latest.show {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%);
+}
+
+.jump-latest:hover:not(:disabled) {
+  background: var(--surface-3);
+}
+
+/* Summarising older turns, above the composer. */
+.compacting-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 9px 13px;
+  border: none;
+  border-radius: var(--r-lg);
+  background: var(--warn-wash);
+  color: #ffd9a3;
+  font-size: var(--fs-sm);
+}
+
+/* ---------------------------------------------------------------- context ring */
+
+.context-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  padding: 0 6px 0 4px;
+  min-height: 26px;
+  border-radius: var(--r-pill);
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+  cursor: default;
+}
+
+.context-meter:hover {
+  background: var(--field-hover);
+  color: var(--text-dim);
+}
+
+.context-ring-track,
+.context-ring-fill {
+  fill: none;
+  stroke-width: 2.2;
+}
+
+.context-ring-track {
+  stroke: rgba(255, 255, 255, 0.12);
+}
+
+.context-ring-fill {
+  stroke: var(--text-dim);
+  stroke-linecap: round;
+  transition: stroke-dasharray var(--dur-slow) var(--ease);
+}
+
+.context-meter.filling .context-ring-fill {
+  stroke: var(--warn);
+}
+
+.context-meter.full .context-ring-fill {
+  stroke: var(--bad);
+}
+
+.context-meter.full .context-text {
+  color: var(--bad);
+}
+
+.context-text {
+  font-family: var(--sans);
+}
+
+/* ---------------------------------------------------------------- effort */
+
+.reasoning {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+  user-select: none;
+}
+
+.reasoning-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, 0.055);
+  box-shadow: none;
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+}
+
+.reasoning-trigger:hover:not(:disabled),
+.reasoning-trigger.open {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+}
+
+.reasoning[data-kind='effort'] .reasoning-trigger::after {
+  content: '';
+  width: 7px;
+  height: 7px;
+  margin-top: -3px;
+  border: none;
+  border-right: 1.6px solid currentColor;
+  border-bottom: 1.6px solid currentColor;
+  opacity: 0.7;
+  transform: rotate(45deg);
+  transition: transform var(--dur) var(--ease);
+}
+
+.reasoning[data-kind='effort'] .reasoning-trigger.open::after {
+  margin-top: 3px;
+  transform: rotate(-135deg);
+}
+
+/* In the composer the popover opens upwards from the left, where the chip now sits. */
+.reasoning-pop {
+  position: absolute;
+  left: -8px;
+  right: auto;
+  bottom: calc(100% + 12px);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 260px;
+  padding: 14px 16px 14px;
+  border: none;
+  border-radius: var(--r-xl);
+  background: var(--surface-float);
+  box-shadow: var(--shadow-lg);
+  cursor: default;
+  animation: pop-in var(--dur) var(--ease);
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+}
+
+.reasoning-hint {
+  min-height: calc(2 * 1.5em);
+  margin: 2px 0 0;
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+.reasoning-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.reasoning-value {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.reasoning-anchors {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.slider-stop {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.slider-stop.is-default {
+  background: var(--accent-text);
+}
+
+.slider input[type='range']::-webkit-slider-thumb {
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+
+.slider input[type='range']:focus-visible::-webkit-slider-thumb {
+  background: #fff;
+  box-shadow:
+    0 1px 4px rgba(0, 0, 0, 0.5),
+    0 0 0 4px var(--accent-wash);
+}
+
+.slider-track::before {
+  content: '';
+  position: absolute;
+  top: -2px;
+  left: 0;
+  right: 0;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* The on/off switch, for models with a thinking toggle rather than levels. */
+.switch {
+  width: 34px;
+  min-width: 34px;
+  height: 20px;
+  min-height: 20px;
+  border: none;
+  background: rgba(255, 255, 255, 0.16);
+  box-shadow: none;
+}
+
+.switch.on {
+  background: var(--accent);
+}
+
+.switch-knob {
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.switch.on .switch-knob {
+  background: #fff;
+  transform: translateX(14px);
+}
+
+.switch:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.switch.on:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+/* ---------------------------------------------------------------- narrow */
+
+@media (max-width: 900px) {
+  .chat > *,
+  .messages-content {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .msg.from-user > .msg-main {
+    max-width: 90%;
+  }
+}
+
+/* ---------------------------------------------------------------- slider internals */
+
+/*
+ * The levels slider: a native range input for the dragging and the keyboard, with its own track
+ * and stops drawn underneath so the stops can sit exactly where the thumb lands on each level.
+ */
+.slider {
+  --thumb: 16px;
+  --slider-h: 20px;
+  position: relative;
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  width: 100%;
+  height: var(--slider-h);
+}
+
+.slider-track {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.slider input[type='range'] {
+  position: relative;
+  width: 100%;
+  height: var(--slider-h);
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  box-shadow: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.slider input[type='range']:focus {
+  outline: none;
+}
+
+.slider input[type='range']::-webkit-slider-runnable-track {
+  height: var(--slider-h);
+  border: none;
+  background: none;
+}
+
+.slider input[type='range']::-webkit-slider-thumb {
+  box-sizing: border-box;
+  width: var(--thumb);
+  height: var(--thumb);
+  margin-top: calc((var(--slider-h) - var(--thumb)) / 2);
+  border: none;
+  border-radius: 50%;
+  appearance: none;
+  cursor: grab;
+  transition: box-shadow var(--dur) var(--ease);
+}
+
+.slider:hover input[type='range']:not(:disabled)::-webkit-slider-thumb {
+  box-shadow:
+    0 1px 4px rgba(0, 0, 0, 0.5),
+    0 0 0 4px var(--accent-wash);
+}
+
+.slider input[type='range']:active::-webkit-slider-thumb {
+  cursor: grabbing;
+  box-shadow:
+    0 1px 4px rgba(0, 0, 0, 0.5),
+    0 0 0 6px var(--accent-wash);
+}
+
+.slider input[type='range']:disabled {
+  cursor: default;
+}
+
+.slider input[type='range']:disabled::-webkit-slider-thumb {
+  background: var(--text-faint);
+  box-shadow: none;
+  cursor: default;
+}
+
+/* Each level, a dot on the track at the place the thumb's centre lands for it. */
+.slider-stop {
+  position: absolute;
+  top: 0;
+  left: calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--stop, 0));
+  width: 4px;
+  height: 4px;
+  margin-left: -2px;
+  border-radius: 50%;
+  transform: translateY(-50%);
+  transition: background-color var(--dur) var(--ease);
+}
+
+.switch {
+  position: relative;
+  padding: 0;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  transition: background-color var(--dur) var(--ease);
+}
+
+.switch-knob {
+  position: absolute;
+  border-radius: 50%;
+  transition: transform var(--dur) var(--ease);
+}
+
+.reasoning[data-kind='toggle'] {
+  gap: 10px;
+}
+
+.reasoning[data-kind='toggle'] .reasoning-value {
+  min-width: 8ch;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.reasoning-trigger:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.reasoning:has(input:disabled) {
+  opacity: 0.55;
+}
+
+.context-text {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.params-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.send-button .spinner {
+  border-color: rgba(255, 255, 255, 0.3);
+  border-top-color: var(--on-accent);
+}
+
+/* The agent's question: room to answer in a sentence or two. */
+.modal textarea[data-testid='question-input'] {
+  width: 100%;
+  min-height: 46px;
+  resize: vertical;
+  font: inherit;
+}
+
+.modal .actions .tiny-note {
+  margin-right: auto;
+  text-align: left;
+}
+
+/* ---------------------------------------------------------------- what a tool looked at */
+
+/* The frames a look at a video returned, under its line: what the model saw, at a glance. */
+.tool-frames {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  padding-bottom: 4px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.tool-frames img {
+  flex: 0 0 auto;
+  height: 64px;
+  width: auto;
+  border-radius: var(--r-sm);
+  background: var(--bg-inset);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}

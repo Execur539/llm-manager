@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { invoke, on } from '../lib/api'
 import ConfirmDialog from '../components/ConfirmDialog'
+import { Toolbar } from '../lib/shell'
 
 interface RemoteStatus {
   tunnel: { running: boolean; url: string | null; error: string | null }
@@ -91,7 +92,7 @@ export default function RemoteView(): JSX.Element {
 
   return (
     <>
-      <h1>Remote access</h1>
+      <Toolbar title="Remote access" />
       <p className="subtitle">
         Reach this machine's models from a browser anywhere. Everything sits behind a password, and the
         inference server itself is never exposed directly.

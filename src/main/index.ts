@@ -5,8 +5,9 @@
  * bridge to IPC, and orderly shutdown. Everything else lives in its own module.
  */
 
-import { app, BrowserWindow, ipcMain, Menu, Tray, dialog, nativeImage, protocol, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, Tray, dialog, nativeImage, nativeTheme, powerMonitor, protocol, shell } from 'electron'
 import path from 'node:path'
+import os from 'node:os'
 import { ensureDirs } from './storage/paths'
 import { loadSettings, patchSettings } from './storage/settings'
 import { getDb } from './storage/db'
@@ -20,7 +21,7 @@ import { apiServer } from './api/server'
 import { remoteWeb } from './remote/web'
 import { llama } from './runtime/llama'
 import { vendorDiagnostics } from './runtime/binaries'
-import { handlers, invokeBridge, setEmitter, setLibrary, shutdown, modelsDir, libraryFolders, startHardwareRefresh, stopHardwareRefresh } from './bridge'
+import { handlers, invokeBridge, setEmitter, setLibrary, shutdown, modelsDir, libraryFolders, startHardwareRefresh, stopHardwareRefresh, parkBeforeSleep } from './bridge'
 import { handleMediaProtocol } from './chat/media'
 import { installCrashHandlers, logger } from './log'
 
@@ -52,35 +53,53 @@ function emitToSurfaces(channel: string, payload: unknown): void {
 }
 
 function createWindow(): void {
+  /*
+   * The app draws its own title bar.
+   *
+   * Windows still draws the window buttons, over the right of the app's toolbar, at the toolbar's
+   * height and in its colours, so they look like part of it. On Windows 11 22H2 and later the
+   * window's base is Mica, the system material that picks up the desktop behind it; the sidebar
+   * lets it through and the content area paints over it. Dark, whatever the system theme, because
+   * the interface is.
+   */
+  nativeTheme.themeSource = 'dark'
+  const build = Number(os.release().split('.')[2] ?? 0)
+  const mica = process.platform === 'win32' && build >= 22621 && !process.env.LLMM_E2E
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
     minWidth: 1040,
     minHeight: 660,
     show: false,
-    // Matches --bg in styles.css, so the window does not flash the old cool-grey before paint.
-    backgroundColor: '#1f1e1d',
+    // Matches --bg in the stylesheet, so the window does not flash another colour before paint.
+    backgroundColor: mica ? '#00000000' : '#111214',
+    ...(mica ? { backgroundMaterial: 'mica' as const } : {}),
     title: 'LLM Manager',
     autoHideMenuBar: true,
+    titleBarStyle: 'hidden',
+    titleBarOverlay: { color: '#111214', symbolColor: '#a2a2ab', height: 48 },
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      additionalArguments: mica ? ['--llmm-mica'] : []
     }
   })
 
   /*
-   * A taskbar pin starts the portable exe, not the copy it unpacked.
+   * A taskbar pin starts the newest version, whatever happens to the files around it.
    *
    * Windows pins whatever process owns the window, which here is the unpacked app in a folder
-   * named after its version — a pin that cannot be updated in place and that breaks when the next
-   * version unpacks elsewhere. Telling the shell what to relaunch makes a new pin point at the
-   * launcher instead. Skipped under test, where there is no launcher.
+   * named after its version: a pin that breaks when the next version unpacks elsewhere. Telling
+   * the shell what to relaunch makes a new pin point at the stub the launcher keeps in
+   * %LOCALAPPDATA%\LLMManager, which starts whichever portable exe last ran, wherever it is now.
+   * Before a launcher new enough to install the stub has run, the portable exe itself. Skipped
+   * under test, where there is no launcher.
    */
   if (process.platform === 'win32' && !process.env.LLMM_E2E) {
-    void import('./update').then(({ portableOrigin }) => {
-      const exe = portableOrigin()
+    void import('./update').then(({ portableOrigin, stableEntry }) => {
+      const exe = stableEntry() ?? portableOrigin()
       if (!exe || !mainWindow || mainWindow.isDestroyed()) return
       try {
         mainWindow.setAppDetails({
@@ -144,6 +163,22 @@ function createWindow(): void {
       mainWindow?.hide()
     }
   })
+
+  /*
+   * A new version started by an update takes the place of the old exe once it has shown it runs.
+   *
+   * Its window loading, and still being alive a few seconds later, is that proof. Until then the
+   * old exe is untouched, so a version that fails to come up costs nothing: every shortcut still
+   * starts the one that worked.
+   */
+  if (process.env.LLMM_UPDATE_TARGET) {
+    mainWindow.webContents.once('did-finish-load', () => {
+      setTimeout(() => {
+        if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isCrashed()) return
+        void import('./update').then(({ completeUpdate }) => completeUpdate())
+      }, 3000)
+    })
+  }
 
   if (process.env['ELECTRON_RENDERER_URL']) {
     void mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
@@ -296,8 +331,16 @@ protocol.registerSchemesAsPrivileged([
   { scheme: 'llmm-media', privileges: { standard: true, secure: true, stream: true, supportFetchAPI: false } }
 ])
 
+/*
+ * One identity for every version, so the window, its pins and the stub that starts it all group
+ * under one taskbar button rather than one per unpacked copy.
+ */
+if (process.platform === 'win32') app.setAppUserModelId('dev.llmmanager.app')
+
 app.whenReady().then(async () => {
   installCrashHandlers()
+  // Started by an update: the version that started this one closes first, so the two never share the database.
+  if (process.env.LLMM_UPDATE_FROM_PID) await (await import('./update')).waitForPreviousVersion()
   ensureDirs()
   getDb()
 
@@ -305,8 +348,19 @@ app.whenReady().then(async () => {
   // the directory exists, and unawaited so a slow disk never delays the window.
   void handlers['attachments:prune']?.()
 
-  // An update an older version installed in the wrong place is finished in the background.
-  void import('./update').then(({ repairMisplacedUpdate }) => repairMisplacedUpdate())
+  /*
+   * Update housekeeping, in the background: finish an install an older version put in the wrong
+   * place, report one that never started, and, once the window is up and the disk is quiet, keep
+   * every shortcut the user made pointing at the newest version.
+   */
+  // Chat's scratchpad: whatever a crash left in its folder goes, then idle files are swept from here on.
+  void import('./scratchpad').then(({ startScratchpad }) => startScratchpad())
+
+  void import('./update').then(async ({ repairMisplacedUpdate, settleUnfinishedUpdate, repairShortcuts }) => {
+    await repairMisplacedUpdate()
+    await settleUnfinishedUpdate()
+    setTimeout(() => void repairShortcuts().catch((err: unknown) => logger.warn('update', 'shortcut repair failed', { error: String(err) })), 15_000)
+  })
 
   setEmitter(emitToSurfaces)
 
@@ -322,6 +376,14 @@ app.whenReady().then(async () => {
   registerIpc()
   createWindow()
   createTray()
+
+  /*
+   * The machine going to sleep, or Windows signing out or shutting down, is the app being stopped
+   * without the goodbye a quit gets. What the model has read of the open conversation is saved
+   * first, if a quiet moment has not saved it already.
+   */
+  powerMonitor.on('suspend', () => void parkBeforeSleep(10_000))
+  mainWindow?.on('session-end', () => void parkBeforeSleep(5_000))
 
   downloadQueue.setToken(getHfToken())
   downloadQueue.setConnections(loadSettings().downloads.connections)

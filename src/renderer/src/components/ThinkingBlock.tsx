@@ -53,10 +53,9 @@ export default function ThinkingBlock({
         aria-expanded={open}
         data-testid="thinking-toggle"
       >
-        <Icon name="sparkle" size={12} />
-        <span className="thinking-label">{streaming ? 'Thinking…' : 'Thought process'}</span>
-        {!streaming && <span className="thinking-size">{approxWords(text)} words</span>}
         <Icon name="chevron" size={13} className="thinking-chevron" />
+        <span className={`thinking-label${streaming ? ' live' : ''}`}>{streaming ? 'Thinking…' : 'Thought process'}</span>
+        {!streaming && <span className="thinking-size">{approxWords(text)} words</span>}
       </button>
 
       {open && (

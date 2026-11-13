@@ -13,6 +13,8 @@ interface DesktopApi {
   send: (channel: string, ...args: unknown[]) => void
   on: (channel: EventChannel, cb: (payload: never) => void) => () => void
   isDesktop: boolean
+  /** The window's base is Mica: the sidebar is translucent and the page leaves the body unpainted. */
+  mica?: boolean
   /**
    * Real on-disk path of a dropped File, from the preload.
    *
@@ -98,6 +100,11 @@ export function on<T = unknown>(channel: EventChannel, cb: (payload: T) => void)
 }
 
 // ---------------------------------------------------------------- formatting helpers
+
+/** A model file's name without the parts nobody says: the extension and a shard suffix. */
+export function displayModelName(file: string): string {
+  return file.replace(/\.gguf$/i, '').replace(/-0*\d+-of-0*\d+$/i, '')
+}
 
 export function fmtBytes(n: number | null | undefined): string {
   if (n === null || n === undefined || !Number.isFinite(n)) return '—'

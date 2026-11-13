@@ -1,13 +1,12 @@
 /**
- * One turn in a transcript.
+ * One turn of a conversation.
  *
- * Shared by Chat and Agent so the two transcripts cannot drift apart visually. The avatar column
- * is what makes the roles line up: previously the user's text was indented by its own bubble
- * padding while the assistant's started at the container edge, so the two were a few pixels out
- * of alignment down the whole conversation.
+ * Your messages sit on the right in a bubble; the model's answers run as plain text across the
+ * column, the way a reply reads in a document. Avatars and "You" / "Assistant" labels said the same
+ * thing the layout already says, twice per message, so they are gone from sight and kept only for
+ * screen readers. Other roles (a system note, a tool) keep a visible label, since nothing else
+ * would tell them apart.
  */
-
-import Icon from './Icon'
 
 const LABELS: Record<string, string> = {
   user: 'You',
@@ -24,25 +23,17 @@ export default function MessageRow({
 }: {
   role: string
   children: React.ReactNode
-  /**
-   * Controls floated over the top-right of the turn.
-   *
-   * A slot rather than a fixed set of buttons, because what can be done to a turn depends on
-   * which transcript it is in — and because it is floated, an empty slot costs nothing.
-   */
   actions?: React.ReactNode
   testId?: string
 }): JSX.Element {
   const label = LABELS[role] ?? role
+  const quiet = role === 'user' || role === 'assistant'
 
   return (
     <div className={`msg from-${role}`} data-testid={testId}>
       {actions}
-      <div className="msg-avatar" aria-hidden="true">
-        <Icon name={role === 'user' ? 'user' : role === 'tool' ? 'chip' : 'sparkle'} size={13} />
-      </div>
       <div className="msg-main">
-        <div className="who">{label}</div>
+        {quiet ? <span className="sr-only">{label}</span> : <div className="who">{label}</div>}
         {children}
       </div>
     </div>

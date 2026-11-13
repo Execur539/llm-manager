@@ -100,6 +100,7 @@ Var Staging
 Var ExitCode
 Var Drive
 Var FreeMb
+Var UpdateTarget
 
 Section
   StrCpy $RuntimeDir "$LOCALAPPDATA\LLMManager\runtime-${VERSION}"
@@ -124,9 +125,33 @@ Section
   ; Its own path too, so an update replaces this exact file rather than guessing its name.
   System::Call 'kernel32::SetEnvironmentVariable(t "LLMM_PORTABLE_EXE", t "$EXEPATH")'
 
+  ; Where shortcuts lead. The stub below starts whichever portable exe is recorded here, so a run
+  ; records itself: shortcuts follow the exe when it is moved, from its first run in the new place.
+  ; A download waiting to take the place of another exe records that exe instead, since that is
+  ; where the app will live once the new version has installed itself. A launcher left in the
+  ; unpack cache by an old updater records nothing.
+  ReadEnvStr $UpdateTarget "LLMM_UPDATE_TARGET"
+  ${If} $UpdateTarget != ""
+    WriteRegStr HKCU "Software\LLM Manager" "Launcher" "$UpdateTarget"
+  ${ElseIf} $1 != $CacheRoot
+    WriteRegStr HKCU "Software\LLM Manager" "Launcher" "$EXEPATH"
+  ${EndIf}
+
+  ; The entry point every pin is given: a small stub that never moves (build/stub.nsi). Written
+  ; on every run so it is never older than the launcher; skipped quietly while something has it open.
+  !ifdef STUB
+    CreateDirectory "$LOCALAPPDATA\LLMManager"
+    SetOutPath "$LOCALAPPDATA\LLMManager"
+    SetOverwrite try
+    File "/oname=${APPEXE}" "${STUB}"
+    SetOverwrite on
+  !endif
+
   ; Fast path: a completed extraction of *this* build already exists.
   ${If} ${FileExists} "$Marker"
     ${AndIf} ${FileExists} "$RuntimeDir\${APPEXE}"
+      ; Started from its own folder, as on the first run.
+      SetOutPath "$RuntimeDir"
       Exec '"$RuntimeDir\${APPEXE}"'
       Return
   ${EndIf}
@@ -227,11 +252,18 @@ FunctionEnd
 ; Guarded: an older build (before LLMM_PORTABLE_DIR existed) could have placed the user's model
 ; library inside its runtime directory. Deleting that would destroy tens of gigabytes of models,
 ; so any directory holding user data is left alone even though it is stale.
+;
+; Each removed version leaves a forwarder behind: the stub, where its app used to be. A taskbar pin
+; or shortcut made to that version's app then starts the newest one instead of nothing.
 Function CleanOldRuntimes
   FindFirst $0 $1 "$LOCALAPPDATA\LLMManager\runtime-*"
   loop:
     StrCmp $1 "" done
     StrCmp $1 "runtime-${VERSION}" next
+    ${If} ${FileExists} "$LOCALAPPDATA\LLMManager\$1\.forwarder"
+      ; Already only a forwarder.
+      Goto next
+    ${EndIf}
     ${If} ${FileExists} "$LOCALAPPDATA\LLMManager\$1\LLMManagerModels\*.*"
       ; Contains a model library — never delete.
       Goto next
@@ -243,6 +275,18 @@ Function CleanOldRuntimes
     Rename "$LOCALAPPDATA\LLMManager\$1" "$LOCALAPPDATA\LLMManager\staging-old-$1"
     IfErrors next
     RMDir /r "$LOCALAPPDATA\LLMManager\staging-old-$1"
+    !ifdef STUB
+      ${If} ${FileExists} "$LOCALAPPDATA\LLMManager\${APPEXE}"
+        CreateDirectory "$LOCALAPPDATA\LLMManager\$1"
+        CopyFiles /SILENT "$LOCALAPPDATA\LLMManager\${APPEXE}" "$LOCALAPPDATA\LLMManager\$1\${APPEXE}"
+        ${If} ${FileExists} "$LOCALAPPDATA\LLMManager\$1\${APPEXE}"
+          FileOpen $2 "$LOCALAPPDATA\LLMManager\$1\.forwarder" w
+          FileClose $2
+        ${Else}
+          RMDir "$LOCALAPPDATA\LLMManager\$1"
+        ${EndIf}
+      ${EndIf}
+    !endif
   next:
     FindNext $0 $1
     Goto loop

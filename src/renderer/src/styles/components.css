@@ -1,0 +1,805 @@
+/*
+ * Component styles carried over from the original stylesheet: the parameters panel, the agent's
+ * ultra samples, attachments and media, the reasoning control's extras, question
+ * and permission prompts, and the discover list.
+ *
+ * Ported as they were, then set on the new tokens; each component keeps the reasoning its
+ * comments give. Loaded after views.css.
+ */
+.indent {
+  margin-top: 12px;
+  padding-left: 14px;
+  border-left: 1px solid var(--border);
+}
+
+.radio {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 0;
+  cursor: pointer;
+}
+
+.radio input {
+  margin-top: 3px;
+}
+
+.tool-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.resolved-action {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+}
+
+/*
+ * A search result is a button, not a div with a click handler: it was unreachable by keyboard
+ * and gave no sign it could be activated at all.
+ */
+.repo-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  min-height: 0;
+  cursor: pointer;
+}
+
+.repo-card:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.repo-name {
+  font-weight: 600;
+  font-size: var(--fs-md);
+}
+
+/* The owner is context, the model name is the thing being chosen. */
+.repo-owner {
+  color: var(--text-faint);
+  font-weight: 400;
+}
+
+.repo-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 3px;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.repo-meta > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.repo-go {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  opacity: 0;
+  transition: opacity 110ms ease;
+}
+
+.repo-card:hover .repo-go,
+.repo-card:focus-visible .repo-go {
+  opacity: 1;
+}
+
+.reasoning-label {
+  flex-shrink: 0;
+}
+
+/* The chosen one sits under the handle, which covers it — hidden so no rim shows around it. */
+.slider-stop.current {
+  opacity: 0;
+}
+
+/*
+ * The per-request parameters, on the right of the conversation.
+ *
+ * Mirrors the conversation rail on the left: a scroll of its own and a hairline between it and
+ * the transcript, taking no width from the composer while it is closed.
+ */
+.params-panel {
+  width: 272px;
+  flex-shrink: 0;
+  min-height: 0;
+  overflow-y: auto;
+  border-left: 1px solid var(--hairline);
+  padding: 0 6px 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.params-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.params-title {
+  margin-right: auto;
+  font-family: var(--display);
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+
+.params-note {
+  margin: 0;
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+  color: var(--text-faint);
+}
+
+.params-group-title {
+  margin-bottom: 9px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+details.params-group > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+details.params-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.params-group > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+details.params-group > summary::before {
+  content: '';
+  width: 12px;
+  height: 12px;
+  background: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+  transform: rotate(-90deg);
+  transition: transform var(--dur) var(--ease);
+}
+
+details.params-group[open] > summary::before {
+  transform: none;
+}
+
+.param + .param {
+  margin-top: 11px;
+}
+
+.param {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.param-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.param-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+}
+
+/* A parameter that has been set reads brighter than one left at its default. */
+.param.set .param-label {
+  color: var(--text);
+}
+
+.param-input {
+  width: 78px;
+  height: 26px;
+  min-height: 26px;
+  padding: 2px 7px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.param-select {
+  width: 128px;
+  height: 26px;
+  min-height: 26px;
+}
+
+.param-reset {
+  width: 22px;
+  min-width: 22px;
+  height: 22px;
+  min-height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-faint);
+}
+
+.param-reset:hover:not(:disabled) {
+  background: var(--field-hover);
+  color: var(--text);
+}
+
+.param-reset:disabled {
+  visibility: hidden;
+}
+
+.param-slider {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+/* At its default the slider only shows where the default sits. */
+.param-slider.unset {
+  opacity: 0.45;
+}
+
+.params-text {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+  font-size: var(--fs-sm);
+}
+
+@media (max-width: 1250px) {
+  .params-panel {
+    width: 240px;
+  }
+}
+
+/* Too narrow for a third column: the panel floats over the conversation instead. */
+@media (max-width: 900px) {
+  .params-panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 35;
+    width: min(320px, 90vw);
+    padding: 16px;
+    border-left: 1px solid var(--border-strong);
+    background: var(--sidebar);
+    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.35);
+  }
+}
+
+.compacting-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.compacting-elapsed {
+  flex-shrink: 0;
+  color: var(--warn);
+  font-variant-numeric: tabular-nums;
+}
+
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 280px;
+  padding: 5px 6px 5px 9px;
+  border: none;
+  border-radius: var(--r-md);
+  background: var(--field);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+  font-size: var(--fs-xs);
+  animation: attach-in 140ms ease-out;
+}
+
+/* A file the model cannot use is staged but flagged, rather than silently dropped later. */
+.attachment.warned {
+  background: var(--warn-wash);
+  box-shadow: inset 0 0 0 1px rgba(255, 179, 64, 0.28);
+}
+
+.attachment.warned .icon {
+  color: var(--warn);
+}
+
+.attachment > .icon {
+  flex-shrink: 0;
+  color: var(--text-faint);
+}
+
+.attachment-name {
+  min-width: 0;
+  color: var(--text-dim);
+}
+
+.attachment-meta {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.attachment-remove {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  min-width: 18px;
+  height: 18px;
+  min-height: 0;
+  padding: 0;
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  border-radius: var(--r-sm);
+}
+
+.attachment-remove:hover:not(:disabled) {
+  background: var(--field-hover);
+  color: var(--text);
+  border: none;
+}
+
+/* ---- drop target ---- */
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-lg);
+  background: var(--scrim);
+  backdrop-filter: blur(1px);
+  /* The overlay must not eat the drop event it is announcing. */
+  pointer-events: none;
+  animation: fade-in 110ms ease-out;
+}
+
+.drop-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 26px 34px;
+  border: 1.5px dashed var(--accent);
+  border-radius: var(--r-lg);
+  background: var(--surface-1);
+  box-shadow: var(--shadow-lg);
+  color: var(--accent);
+}
+
+.drop-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.drop-hint {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+
+/*
+ * Ultra's attempts, above the answer they produced.
+ *
+ * Styled as scaffolding rather than transcript: inset, quieter than a message, and collapsed by
+ * default. They have to be visibly *not* the answer — a turn that shows three drafts and a reply
+ * in the same treatment is a turn where the reader cannot tell which one to believe.
+ */
+.ultra-block {
+  margin: 0 0 12px;
+  border-radius: var(--r-md);
+  background: rgba(255, 255, 255, 0.03);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+  overflow: hidden;
+}
+
+.ultra-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.ultra-status {
+  margin-left: auto;
+  color: var(--accent-text);
+}
+
+.ultra-sample + .ultra-sample {
+  border-top: 1px solid var(--hairline);
+}
+
+.ultra-sample-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 0;
+  padding: 6px 10px;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: var(--fs-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ultra-sample-head:hover:not(:disabled) {
+  background: var(--field);
+}
+
+/* A numeral rather than a bullet: which attempt this is matters when comparing them. */
+.ultra-index {
+  display: grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--surface-2);
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+
+.ultra-sample-label {
+  flex-shrink: 0;
+}
+
+.ultra-sample-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  font-size: var(--fs-xs);
+}
+
+.ultra-tag {
+  padding: 1px 6px;
+  border-radius: var(--r-xs);
+  background: var(--accent-wash);
+  color: var(--accent-text);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+
+.ultra-chevron {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  transition: transform 130ms ease;
+}
+
+.ultra-sample.open .ultra-chevron {
+  transform: rotate(180deg);
+}
+
+.ultra-sample-body {
+  padding: 2px 12px 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.ultra-sub {
+  margin: 10px 0 4px;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+
+.ultra-pre {
+  max-height: 240px;
+  overflow-y: auto;
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  /* The model's own line breaks carry structure worth keeping. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The stop past the model's own maximum, marked so it never passes for a native level. */
+.slider-stop.is-ultra {
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-wash);
+}
+
+.ultra-config {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 9px;
+  border-top: 1px solid var(--hairline);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+
+.ultra-config input {
+  width: 56px;
+  min-height: 0;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg-inset);
+  color: var(--text);
+  font: inherit;
+  text-align: center;
+}
+
+/* The course of action Ultra settled on, above the work it directs. */
+.ultra-plan {
+  padding: 2px 12px 10px;
+  border-top: 1px solid var(--hairline);
+  background: var(--accent-wash);
+}
+
+/* The stored plan sits under the message that prompted it, not inside it. */
+.turn-plan {
+  margin-top: 8px;
+}
+
+.turn-plan .ultra-plan {
+  border-top: none;
+}
+
+/* ---------------------------------------------------------------- agent questions
+
+   The agent pausing to ask something. Shares the modal shell with the approval prompt, but
+   reads differently on purpose: an approval is a decision about an action and shows a resolved
+   command, while this is a conversation and shows a sentence. */
+.question-text {
+  margin: 0 0 14px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--text);
+}
+
+.question-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.question-option {
+  min-height: var(--control-h);
+  padding: 0 12px;
+  font-size: var(--fs-sm);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.question-option:hover:not(:disabled) {
+  background: var(--accent-wash);
+  box-shadow: inset 0 0 0 1px var(--accent-dim);
+}
+
+/*
+ * The files a turn was sent with, under its text.
+ *
+ * Sized to sit inside the transcript rather than dominate it: a message with a video in it is
+ * still a message, and a player that fills the pane pushes the conversation off screen. The
+ * ceiling is a height, not a width, so a portrait phone video and a widescreen capture both come
+ * out the same size on the page instead of the vertical one being three times taller.
+ */
+.msg-media {
+  display: flex;
+  flex-wrap: wrap;
+  /* Each card keeps its own height: stretching made an audio player as tall as the image beside
+     it, which is a small control in a large empty box. */
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.media-frame {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  /*
+   * Bounded so a message stays a message.
+   *
+   * Left to itself a 16:9 frame takes the full column and pushes the reply below the fold, which
+   * makes scrolling back through a conversation with a few clips in it tedious. Wide enough to
+   * watch, narrow enough that two can sit side by side.
+   */
+  max-width: min(100%, 420px);
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  overflow: hidden;
+}
+
+.media-frame img,
+.media-frame video {
+  display: block;
+  width: 100%;
+  max-height: 260px;
+  /* Contain, not cover: this is evidence, and cropping it to fit would be a lie about the frame. */
+  object-fit: contain;
+  background: var(--bg-inset);
+  /*
+   * Chromium's built-in media controls follow this, and default to the light set — a white
+   * play bar under a dark transcript, which looked like a rendering fault rather than a choice.
+   */
+  color-scheme: dark;
+}
+
+/* Positioned so the version toggle can sit over the picture rather than beneath it. */
+.media-stage {
+  position: relative;
+  display: flex;
+  background: var(--bg-inset);
+}
+
+/*
+ * Which of the two clips is playing.
+ *
+ * Over the video and out of the way of its own controls, which occupy the bottom edge. Kept
+ * legible against whatever frame is behind it by its own background rather than by hoping the
+ * footage is dark.
+ */
+.media-toggle {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--r-md);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(20, 19, 18, 0.82);
+  backdrop-filter: blur(6px);
+}
+
+.media-toggle button {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 0;
+  padding: 3px 9px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: var(--fs-xs);
+  font-weight: 550;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.media-toggle button:hover:not(.on) {
+  color: #fff;
+}
+
+.media-toggle button.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+.media-caption {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.media-size {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * What the sampler did, shown only while its own clip is on screen.
+ *
+ * Separated by a rule rather than by spacing because it is a different kind of statement from
+ * the filename above it — one names the file, the other explains what was done to it.
+ */
+.media-note {
+  padding: 7px 10px;
+  border-top: 1px solid var(--hairline);
+  background: var(--bg-inset);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.media-audio {
+  min-width: 280px;
+  padding-bottom: 10px;
+}
+
+.media-audio audio {
+  width: calc(100% - 20px);
+  margin: 0 10px;
+  height: 32px;
+  color-scheme: dark;
+}
+
+/* A document was inlined as text, so there is nothing to play — only something to name. */
+.media-chip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+
+.media-chip.missing {
+  border-color: rgba(255, 179, 64, 0.28);
+  color: var(--text-faint);
+}
+
+/*
+ * The preparing-an-attachment line, in the place the prompt readout would otherwise be.
+ *
+ * Shaped like `.thinking` rather than like the progress meter: there is no percentage to show,
+ * because the passes take wildly different amounts of time and dividing a bar evenly between
+ * them would claim a precision that does not exist.
+ */
+.media-stage-note {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 0;
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+}
+
+.media-stage-file {
+  min-width: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+/* ---------------------------------------------------------------- motion these use */
+@keyframes attach-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

@@ -1,5 +1,28 @@
-import { Fragment, memo, useRef, type JSX, type ReactNode } from 'react'
+import { Fragment, memo, useRef, useState, type JSX, type ReactNode } from 'react'
 import { parseBlocks, parseInline, streamingParser, type Block, type StreamingBlocks } from '../lib/markdown'
+import Icon from './Icon'
+
+/** Copies a code block, and says so for a moment. */
+function CopyButton({ text }: { text: string }): JSX.Element {
+  const [copied, setCopied] = useState(false)
+  return (
+    <button
+      type="button"
+      className="md-copy"
+      onClick={() => {
+        void navigator.clipboard?.writeText(text).then(() => {
+          setCopied(true)
+          setTimeout(() => setCopied(false), 1400)
+        })
+      }}
+      aria-label={copied ? 'Copied' : 'Copy code'}
+      title={copied ? 'Copied' : 'Copy code'}
+    >
+      <Icon name={copied ? 'check' : 'copy'} size={13} />
+      <span>{copied ? 'Copied' : 'Copy'}</span>
+    </button>
+  )
+}
 
 /**
  * Minimal markdown renderer for assistant messages.
@@ -111,13 +134,18 @@ function renderBlock(block: Block, key: string, tail: ReactNode): JSX.Element {
     }
     case 'code':
       return (
-        <pre className="md-pre" key={key}>
-          {block.lang && <span className="md-lang">{block.lang}</span>}
-          <code>
-            {block.lines.join('\n')}
-            {tail}
-          </code>
-        </pre>
+        <div className="md-codeblock" key={key}>
+          <div className="md-codehead">
+            <span className="md-lang">{block.lang || 'text'}</span>
+            <CopyButton text={block.lines.join('\n')} />
+          </div>
+          <pre className="md-pre">
+            <code>
+              {block.lines.join('\n')}
+              {tail}
+            </code>
+          </pre>
+        </div>
       )
     case 'list':
       return renderList(block, key, tail)

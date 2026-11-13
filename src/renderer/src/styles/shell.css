@@ -1,0 +1,1088 @@
+/*
+ * The window: sidebar, title bar, page, and the things that float over them.
+ */
+
+.app {
+  --sidebar-width: 260px;
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  height: 100%;
+}
+
+.app.sidebar-collapsed {
+  --sidebar-width: 60px;
+}
+
+/* ---------------------------------------------------------------- sidebar */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 10px 10px;
+  background: var(--sidebar);
+  border-right: 1px solid var(--sidebar-border);
+  overflow: hidden;
+}
+
+/* On Mica the material shows through, darkened so text keeps its contrast. */
+html.mica .sidebar {
+  background: rgba(17, 18, 21, 0.5);
+}
+
+/* The top of the sidebar is part of the title bar: same height, and it drags the window. */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  height: var(--titlebar-h);
+  padding: 0 2px 0 6px;
+  font-family: var(--display);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--nav-fg-strong);
+}
+
+html.desktop .brand {
+  -webkit-app-region: drag;
+}
+
+html.desktop .brand button,
+html.desktop .brand .badge {
+  -webkit-app-region: no-drag;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  color: #fff;
+  background: linear-gradient(165deg, #45a2ff 0%, #0a74ec 55%, #075ccc 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.18),
+    0 1px 3px rgba(0, 0, 0, 0.45);
+}
+
+.brand-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-toggle {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  box-shadow: none;
+  color: var(--nav-icon-idle);
+}
+
+.sidebar-toggle:hover:not(:disabled) {
+  background: var(--sidebar-hover);
+  color: var(--nav-fg-strong);
+}
+
+/* ---- navigation ---- */
+
+.nav-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex-shrink: 0;
+}
+
+.nav-section + .nav-section {
+  margin-top: 14px;
+}
+
+.nav-group {
+  display: none;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  width: 100%;
+  height: 32px;
+  min-height: 0;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--r-md);
+  background: transparent;
+  box-shadow: none;
+  color: var(--nav-fg);
+  font-size: var(--fs-md);
+  font-weight: 500;
+  text-align: left;
+  user-select: none;
+}
+
+.nav-item > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-item .icon {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: var(--nav-icon-idle);
+  transition: color var(--dur-fast) var(--ease);
+}
+
+.nav-item:hover:not(:disabled) {
+  background: var(--sidebar-hover);
+  color: var(--nav-fg-strong);
+}
+
+.nav-item:hover:not(:disabled) .icon {
+  color: var(--nav-fg-strong);
+}
+
+.nav-item:active:not(:disabled) {
+  transform: none;
+  background: var(--sidebar-active);
+}
+
+.nav-item.active,
+.nav-item.active:hover:not(:disabled) {
+  background: var(--sidebar-active);
+  color: var(--nav-fg-strong);
+}
+
+.nav-item.active .icon,
+.nav-item.active:hover:not(:disabled) .icon {
+  color: var(--accent-text);
+}
+
+/* A view's list lives here; empty, it is the space that keeps Settings at the foot. */
+.sidebar-slot {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  margin-top: 14px;
+}
+
+.nav-bottom {
+  margin-top: 8px;
+}
+
+/* ---- conversations, in the sidebar ---- */
+
+.sidebar .side-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: auto;
+  margin: 0;
+  padding: 0 0 6px;
+  border: none;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.side-list-label {
+  padding: 12px 10px 5px;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  color: var(--nav-label);
+}
+
+.new-button {
+  display: flex;
+  justify-content: flex-start;
+  gap: 8px;
+  flex-shrink: 0;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.sidebar .new-button,
+.sidebar .new-button.primary {
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid var(--hairline);
+  box-shadow: none;
+  color: var(--nav-fg-strong);
+  font-weight: 500;
+}
+
+.sidebar .new-button:hover:not(:disabled) {
+  background: var(--sidebar-active);
+}
+
+.new-button::before {
+  content: '';
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  background: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 20h9'/%3E%3Cpath d='M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+  opacity: 0.85;
+}
+
+.side-item {
+  position: relative;
+  padding: 6px 10px;
+  border: none;
+  border-radius: var(--r-md);
+  color: var(--nav-fg);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.side-item:hover {
+  background: var(--sidebar-hover);
+  color: var(--nav-fg-strong);
+}
+
+.side-item.active {
+  background: var(--accent-wash-strong);
+  border: none;
+  color: #e8f2ff;
+}
+
+.side-item-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.side-item-meta {
+  margin-top: 1px;
+  font-size: 11px;
+}
+
+.side-item.active .side-item-meta,
+.side-item.active .faint {
+  color: rgba(214, 232, 255, 0.72);
+}
+
+/* In the sidebar a row is its title; when and how long belong on hover, not on every line. */
+.sidebar .side-item-meta {
+  display: none;
+}
+
+.side-item-actions {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  display: flex;
+  gap: 1px;
+  padding: 2px;
+  border-radius: var(--r-sm);
+  background: var(--surface-float);
+  box-shadow: var(--shadow-md);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-50%) translateX(3px);
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    transform var(--dur) var(--ease);
+}
+
+.side-item:hover .side-item-actions,
+.side-item:focus-within .side-item-actions,
+.side-item-actions.confirming {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(-50%);
+}
+
+.row-action {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  min-height: 24px;
+  padding: 0;
+  border-radius: 5px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-dim);
+}
+
+.row-action:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
+.row-action.danger:hover:not(:disabled) {
+  background: var(--bad-wash);
+  color: var(--bad);
+}
+
+.rename-input {
+  width: 100%;
+  min-height: 24px !important;
+  padding: 0 6px !important;
+  font-size: 13px !important;
+}
+
+/* ---- conversations, as a column when the sidebar shows icons only ---- */
+
+.split {
+  display: flex;
+  gap: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.split > .side-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex-shrink: 0;
+  width: 240px;
+  min-height: 0;
+  padding: 4px 10px 10px;
+  border-right: 1px solid var(--hairline);
+  overflow-y: auto;
+}
+
+.split > .side-list .new-button {
+  margin-bottom: 8px;
+}
+
+/* ---- the loaded model ---- */
+
+.sidebar-footer {
+  flex-shrink: 0;
+  margin-top: 8px;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  font-size: inherit;
+  color: inherit;
+}
+
+.model-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 8px 8px 11px;
+  border-radius: var(--r-lg);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--hairline);
+}
+
+.model-chip-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.loaded-name {
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--text);
+}
+
+.loaded-name,
+.loaded-meta {
+  margin: 0;
+  font-family: var(--sans);
+}
+
+.loaded-meta {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.model-chip-action {
+  min-height: 26px;
+  padding: 0 9px;
+  border-radius: var(--r-sm);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.model-chip-action:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
+.loaded-empty {
+  display: flex;
+  justify-content: flex-start;
+  gap: 9px;
+  width: 100%;
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-lg);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-faint);
+  font-size: var(--fs-sm);
+  font-weight: 400;
+}
+
+.loaded-empty:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+}
+
+/* ---- icons only ---- */
+
+.sidebar-collapsed .sidebar {
+  align-items: center;
+  padding: 0 0 10px;
+}
+
+.sidebar-collapsed .brand {
+  justify-content: center;
+  gap: 6px;
+  padding: 0;
+}
+
+.sidebar-collapsed .brand-mark,
+.sidebar-collapsed .brand-name,
+.sidebar-collapsed .brand .badge,
+.sidebar-collapsed .nav-item > span,
+.sidebar-collapsed .sidebar-slot,
+.sidebar-collapsed .model-chip-text,
+.sidebar-collapsed .model-chip-action,
+.sidebar-collapsed .loaded-empty span {
+  display: none;
+}
+
+.sidebar-collapsed .nav-item {
+  width: 38px;
+  height: 36px;
+  padding: 0;
+  justify-content: center;
+}
+
+.sidebar-collapsed .nav-bottom {
+  margin-top: auto;
+}
+
+.sidebar-collapsed .sidebar-footer {
+  width: 100%;
+  padding: 0 10px;
+}
+
+.sidebar-collapsed .model-chip {
+  justify-content: center;
+  padding: 12px 0;
+}
+
+.sidebar-collapsed .loaded-empty {
+  justify-content: center;
+  padding: 0;
+}
+
+/* ---- the sidebar's edge, draggable ---- */
+
+.sidebar-resizer {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--sidebar-width) - 3px);
+  width: 6px;
+  z-index: 20;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.sidebar-resizer::after {
+  content: '';
+  position: absolute;
+  inset: 0 2px;
+  background: transparent;
+  transition: background-color var(--dur) var(--ease);
+}
+
+.sidebar-resizer:hover::after,
+.sidebar-resizer:focus-visible::after,
+.resizing-sidebar .sidebar-resizer::after {
+  background: var(--accent-dim);
+}
+
+.sidebar-resizer:focus-visible {
+  outline: none;
+}
+
+.resizing-sidebar,
+.resizing-sidebar * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+/* ---------------------------------------------------------------- main */
+
+.main {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+/* The title bar: a view's title, its actions, and room for the window's buttons. */
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+  height: var(--titlebar-h);
+  padding: 0 14px 0 24px;
+}
+
+html.desktop .titlebar {
+  -webkit-app-region: drag;
+  /* Windows draws its three window buttons over the right of this bar. */
+  padding-right: 152px;
+}
+
+html.desktop .titlebar button,
+html.desktop .titlebar input,
+html.desktop .titlebar select,
+html.desktop .titlebar a,
+html.desktop .titlebar label,
+html.desktop .titlebar [role='button'],
+html.desktop .titlebar .reasoning {
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.titlebar-heading {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--display);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: var(--text);
+}
+
+.titlebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+/* Toolbar buttons are quiet until hovered; the primary action keeps its fill. */
+.titlebar-actions > button:not(.primary):not(.danger),
+.titlebar-actions > .params-toggle {
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-dim);
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.titlebar-actions > button:not(.primary):not(.danger):hover:not(:disabled) {
+  background: var(--field-hover);
+  color: var(--text);
+}
+
+.titlebar-actions > button.active,
+.titlebar-actions > button[aria-pressed='true'] {
+  background: var(--field-hover);
+  color: var(--text);
+}
+
+.titlebar-actions > select {
+  min-height: 30px;
+  font-size: 13px;
+}
+
+.titlebar-divider {
+  width: 1px;
+  height: 16px;
+  margin: 0 6px;
+  background: var(--border);
+}
+
+/* The page scrolls under the title bar, with the scrollbar at the window's edge. */
+.main-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 32px 40px;
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: var(--page);
+  margin: 0 auto;
+}
+
+/* Conversation views fill the pane and scroll inside themselves. */
+.main.fill .main-scroll {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+}
+
+.main.fill .page {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-width: none;
+}
+
+.main.fill .page > * {
+  flex: 0 0 auto;
+}
+
+.main.fill .page > .split,
+.main.fill .page > .chat,
+.main.fill .page > .dropzone {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* A message from the app about the app, under the title bar. */
+.main > .app-banner,
+.app-banner {
+  width: auto;
+  max-width: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  margin: 0 24px 10px;
+  padding: 9px 10px 9px 14px;
+  border-radius: var(--r-md);
+  background: var(--accent-wash);
+  color: #cfe5ff;
+  font-size: var(--fs-sm);
+}
+
+.app-banner .icon {
+  flex-shrink: 0;
+  color: var(--accent-text);
+}
+
+.app-banner-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.5;
+}
+
+.app-banner button.tiny {
+  background: transparent;
+  box-shadow: none;
+  color: var(--accent-text);
+}
+
+/* ---------------------------------------------------------------- dialogs */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--scrim);
+  backdrop-filter: blur(6px) saturate(120%);
+  animation: fade-in var(--dur) var(--ease);
+}
+
+.modal {
+  width: min(560px, 92vw);
+  max-height: 86vh;
+  overflow: auto;
+  padding: 24px;
+  border: none;
+  border-radius: var(--r-xl);
+  background: var(--surface-float);
+  box-shadow: var(--shadow-lg);
+  animation: dialog-in var(--dur-slow) var(--ease);
+}
+
+.modal h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.modal .actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.modal-label {
+  margin-bottom: 6px;
+}
+
+.confirm-modal {
+  width: min(480px, 92vw);
+}
+
+.confirm-body p {
+  margin: 0 0 10px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.confirm-body p:last-child {
+  margin-bottom: 0;
+}
+
+.confirm-phrase {
+  display: block;
+  margin-top: 16px;
+}
+
+.confirm-phrase span {
+  display: block;
+  margin-bottom: 6px;
+  font-size: var(--fs-xs);
+}
+
+.confirm-phrase input {
+  width: 100%;
+  font-family: var(--mono);
+}
+
+/* The words to type are the point of the line, so they read at full strength. */
+.confirm-phrase code {
+  color: var(--text);
+}
+
+/* "Remember this" is a quieter decision than "allow this once". */
+.actions-remember {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--hairline);
+  font-size: var(--fs-sm);
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+}
+
+/* ---------------------------------------------------------------- toasts */
+
+.toast-stack {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  max-width: min(440px, calc(100vw - 36px));
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 8px 10px 14px;
+  border: none;
+  border-radius: var(--r-lg);
+  background: rgba(36, 37, 42, 0.92);
+  backdrop-filter: blur(14px) saturate(140%);
+  box-shadow: var(--shadow-md);
+  font-size: var(--fs-sm);
+  pointer-events: auto;
+  animation: toast-in var(--dur-slow) var(--ease);
+}
+
+.toast::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-faint);
+}
+
+.toast.success::before {
+  background: var(--good);
+}
+
+.toast.error::before {
+  background: var(--bad);
+}
+
+.toast.info::before {
+  background: var(--accent);
+}
+
+.toast-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.toast-close {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 26px;
+  min-width: 26px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-faint);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.toast-close:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+}
+
+/* ---------------------------------------------------------------- empty states */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 100%;
+  padding: 48px 24px 72px;
+  text-align: center;
+  animation: fade-in var(--dur-slow) var(--ease);
+}
+
+.empty-mark {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  margin-bottom: 16px;
+  border-radius: 15px;
+  background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
+  box-shadow: var(--lift), 0 0 0 1px var(--hairline);
+  color: var(--text-dim);
+}
+
+.empty-title {
+  font-family: var(--display);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.empty-body {
+  max-width: 44ch;
+  margin: 6px 0 0;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.empty-hint {
+  max-width: 44ch;
+  margin: 8px 0 0;
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+}
+
+.empty-action {
+  margin-top: 18px;
+}
+
+/* ---------------------------------------------------------------- narrow windows */
+
+.rail-toggle {
+  display: none;
+}
+
+.rail-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: var(--scrim);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur) var(--ease);
+}
+
+@media (max-width: 1250px) {
+  .app:not(.sidebar-collapsed) {
+    --sidebar-width: 220px;
+  }
+
+  .main-scroll {
+    padding: 6px 22px 32px;
+  }
+}
+
+/* Below this the sidebar is an icon rail and conversations open as a drawer. */
+@media (max-width: 900px) {
+  .app,
+  .app:not(.sidebar-collapsed) {
+    --sidebar-width: 60px;
+  }
+
+  .sidebar {
+    align-items: center;
+    padding: 0 0 10px;
+  }
+
+  .brand {
+    justify-content: center;
+    padding: 0;
+  }
+
+  .brand-mark,
+  .brand-name,
+  .brand .badge,
+  .nav-item > span,
+  .sidebar-slot,
+  .model-chip-text,
+  .model-chip-action,
+  .loaded-empty span,
+  .sidebar-resizer {
+    display: none;
+  }
+
+  .nav-item {
+    width: 38px;
+    height: 36px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .nav-bottom {
+    margin-top: auto;
+  }
+
+  .sidebar-footer {
+    width: 100%;
+    padding: 0 10px;
+  }
+
+  .model-chip,
+  .loaded-empty {
+    justify-content: center;
+    padding: 12px 0;
+  }
+
+  .rail-toggle {
+    display: inline-flex;
+  }
+
+  .split > .side-list {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 60px;
+    z-index: 31;
+    width: 270px;
+    padding: 14px 10px;
+    background: var(--surface-float);
+    border-right: none;
+    box-shadow: var(--shadow-lg);
+    transform: translateX(calc(-100% - 60px));
+    transition: transform var(--dur-slow) var(--ease);
+  }
+
+  .split > .side-list.open {
+    transform: none;
+  }
+
+  .rail-backdrop.open {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .titlebar {
+    padding-left: 14px;
+  }
+}
+
+/* ---------------------------------------------------------------- the rail toggle */
+
+/* Shown only when the sidebar is a rail, where the conversations open as a drawer. */
+.rail-toggle {
+  width: var(--control-h);
+  min-width: var(--control-h);
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+/* The conversation pane and its drop target fill what the page leaves them. */
+.dropzone {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}

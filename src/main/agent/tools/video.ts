@@ -13,15 +13,12 @@
  */
 
 import fs from 'node:fs'
-import fsp from 'node:fs/promises'
 import path from 'node:path'
-import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import type { Tool, ToolOutput } from './base'
 import { schema, str, int } from './base'
 import type { ContentPart } from '../../runtime/llama'
 import { runtimeBinary } from '../../runtime/binaries'
-import { TOOL_OUTPUT_DIR } from '../../storage/paths'
 
 const num = (description: string): Record<string, unknown> => ({ type: 'number', description })
 
@@ -66,11 +63,38 @@ function run(exe: string, args: string[], timeoutMs: number, signal?: AbortSigna
   })
 }
 
+/** The same, keeping what ffmpeg writes to stdout as bytes: a frame piped out rather than saved. */
+function runBytes(exe: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<Buffer> {
+  return new Promise((resolve) => {
+    const child = spawn(exe, args, { windowsHide: true })
+    const chunks: Buffer[] = []
+    const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs)
+    const stop = (): void => {
+      child.kill('SIGKILL')
+    }
+    signal?.addEventListener('abort', stop, { once: true })
+    child.stdout?.on('data', (d: Buffer) => chunks.push(d))
+    child.stderr?.resume()
+    const done = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', stop)
+      resolve(Buffer.concat(chunks))
+    }
+    child.on('close', done)
+    child.on('error', done)
+  })
+}
+
 function ffprobe(): string {
   return runtimeBinary('ffmpeg').replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1')
 }
 
-/** Length, shape, frame rate and whether there is a soundtrack. Null when it is not a readable video. */
+/**
+ * Length, shape, frame rate and whether there is a soundtrack. Null when it is not a readable video.
+ *
+ * `file` is a path or a URL: the chat scratchpad serves a video it holds in memory over loopback
+ * HTTP, which ffprobe and ffmpeg read with range requests as if it were a file.
+ */
 export async function videoFacts(file: string, signal?: AbortSignal): Promise<VideoFacts | null> {
   const { stdout } = await run(
     ffprobe(),
@@ -133,33 +157,122 @@ export function pickMoments(start: number, end: number, count: number, fps: numb
   return span === 0 ? [Math.min(last, from)] : moments
 }
 
-/** One frame at one moment, as a JPEG no wider than `width`. */
-async function frameAt(file: string, at: number, width: number, out: string, signal?: AbortSignal): Promise<boolean> {
-  await run(
+/**
+ * One frame at one moment, as a JPEG no wider than `width`, or null when none could be read.
+ *
+ * Piped out on stdout rather than written to a file, so looking at a video leaves nothing on disk:
+ * that matters for the chat scratchpad, which keeps what it holds in memory unless told otherwise.
+ */
+async function frameAt(source: string, at: number, width: number, signal?: AbortSignal): Promise<Buffer | null> {
+  const bytes = await runBytes(
     runtimeBinary('ffmpeg'),
     [
-      '-hide_banner', '-loglevel', 'error', '-y',
+      '-hide_banner', '-loglevel', 'error',
       // Before the input: seeks by index to the nearest keyframe and decodes only from there, so
       // a frame late in a long video costs the same as one at the start.
       '-ss', at.toFixed(3),
-      '-i', file,
+      '-i', source,
       '-frames:v', '1',
       '-vf', `scale='min(${width},iw)':-2`,
       '-q:v', '2',
-      out
+      '-f', 'image2pipe',
+      '-c:v', 'mjpeg',
+      'pipe:1'
     ],
     60_000,
     signal
   )
-  return fs.existsSync(out) && fs.statSync(out).size > 0
+  // A JPEG starts FF D8; anything else is an error message or nothing at all.
+  return bytes.length > 2 && bytes[0] === 0xff && bytes[1] === 0xd8 ? bytes : null
 }
 
 /** What an attached or named video is, in a sentence, for a model that has not looked at it yet. */
-export function describeVideo(file: string, facts: VideoFacts): string {
+export function describeVideo(name: string, facts: VideoFacts): string {
   return (
-    `${path.basename(file)} is ${clock(facts.duration)} long, ${facts.width}x${facts.height} at ` +
+    `${path.basename(name)} is ${clock(facts.duration)} long, ${facts.width}x${facts.height} at ` +
     `${Math.round(facts.fps)} frames a second, ${facts.hasSound ? 'with sound' : 'without sound'}`
   )
+}
+
+/** What one look at a video asks for, as the model wrote it. */
+export interface LookRequest {
+  start?: unknown
+  end?: unknown
+  frames?: unknown
+  detail?: unknown
+}
+
+/**
+ * Look at part of a video: frames spread over the stretch asked for, each labelled with its time.
+ *
+ * Shared by the agent's watch_video, which names a file on disk, and chat's, which names something
+ * in its scratchpad. `source` is what ffmpeg reads (a path, or a loopback URL); `name` is what the
+ * model calls it, so the text it gets back never mentions a URL or a folder it cannot use.
+ */
+export async function lookAtVideo(
+  source: string,
+  name: string,
+  args: LookRequest,
+  opts: { vision: boolean; signal: AbortSignal; again?: string }
+): Promise<ToolOutput> {
+  const facts = await videoFacts(source, opts.signal)
+  if (!facts) return `${name} could not be read as a video.`
+  const about = describeVideo(name, facts)
+  if (!opts.vision) {
+    return `${about}. The loaded model has no vision projector, so its frames cannot be shown to you.`
+  }
+
+  const detail: Detail = (['low', 'medium', 'high'] as const).includes(String(args.detail) as Detail)
+    ? (String(args.detail) as Detail)
+    : 'low'
+  const level = DETAIL[detail]
+  const start = Number.isFinite(Number(args.start)) ? Number(args.start) : 0
+  const end = args.end === undefined || args.end === null || !Number.isFinite(Number(args.end)) ? facts.duration : Number(args.end)
+  if (start >= facts.duration) {
+    return `${about}. It ends at ${clock(facts.duration)}, so there is nothing at ${clock(start)}.`
+  }
+  const wanted = Math.max(1, Math.round(Number(args.frames ?? 8)) || 8)
+  const moments = pickMoments(start, end, Math.min(wanted, level.maxFrames), facts.fps, facts.duration)
+
+  // A few at a time: each is its own short decode, and a dozen at once would only contend.
+  const frames: (Buffer | null)[] = new Array(moments.length).fill(null)
+  let next = 0
+  await Promise.all(
+    Array.from({ length: Math.min(4, moments.length) }, async () => {
+      while (next < moments.length && !opts.signal.aborted) {
+        const i = next++
+        frames[i] = await frameAt(source, moments[i], level.width, opts.signal)
+      }
+    })
+  )
+
+  const media: ContentPart[] = []
+  const shown: number[] = []
+  for (let i = 0; i < moments.length; i++) {
+    const bytes = frames[i]
+    if (!bytes) continue
+    shown.push(moments[i])
+    media.push({ type: 'text', text: `Frame at ${clock(moments[i])}:` })
+    media.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${bytes.toString('base64')}` } })
+  }
+  if (!shown.length) return `${about}. No frames could be read between ${clock(start)} and ${clock(end)}.`
+
+  const shownWidth = Math.min(level.width, facts.width)
+  // Even, as the scaler makes it.
+  const shownHeight = Math.round((shownWidth * facts.height) / facts.width / 2) * 2
+  const tokensEach = Math.ceil(shownWidth / PATCH) * Math.ceil(shownHeight / PATCH)
+  const gap = shown.length > 1 ? (shown[shown.length - 1] - shown[0]) / (shown.length - 1) : 0
+  const capped = wanted > level.maxFrames ? ` (${level.maxFrames} is the most at ${detail} detail)` : ''
+
+  const text =
+    `${about}.\n` +
+    `Showing ${shown.length} frame${shown.length === 1 ? '' : 's'}${capped} from ${clock(shown[0])} to ` +
+    `${clock(shown[shown.length - 1])}` +
+    (gap > 0 ? `, about ${gap >= 1 ? `${gap.toFixed(gap >= 10 ? 0 : 1)} s` : `${Math.round(gap * 1000)} ms`} apart` : '') +
+    `, at ${detail} detail (${shownWidth}x${shownHeight}, ${level.what}; roughly ${(tokensEach * shown.length).toLocaleString()} tokens).\n` +
+    `Times: ${shown.map(clock).join(', ')}.\n` +
+    (opts.again ?? 'To see a moment more closely, call watch_video again with start and end around it, and more frames or higher detail.')
+  return { text, media }
 }
 
 const watchVideo: Tool = {
@@ -188,72 +301,7 @@ const watchVideo: Tool = {
       ? path.normalize(String(args.path))
       : path.resolve(ctx.cwd, String(args.path))
     if (!fs.existsSync(file)) return `${file} does not exist.`
-
-    const facts = await videoFacts(file, ctx.signal)
-    if (!facts) return `${file} could not be read as a video.`
-    const about = describeVideo(file, facts)
-    if (!ctx.vision) {
-      return `${about}. The loaded model has no vision projector, so its frames cannot be shown to you.`
-    }
-
-    const detail: Detail = (['low', 'medium', 'high'] as const).includes(String(args.detail) as Detail)
-      ? (String(args.detail) as Detail)
-      : 'low'
-    const level = DETAIL[detail]
-    const start = Number.isFinite(Number(args.start)) ? Number(args.start) : 0
-    const end = args.end === undefined || !Number.isFinite(Number(args.end)) ? facts.duration : Number(args.end)
-    if (start >= facts.duration) {
-      return `${about}. It ends at ${clock(facts.duration)}, so there is nothing at ${clock(start)}.`
-    }
-    const wanted = Math.max(1, Math.round(Number(args.frames ?? 8)) || 8)
-    const moments = pickMoments(start, end, Math.min(wanted, level.maxFrames), facts.fps, facts.duration)
-
-    const dir = path.join(TOOL_OUTPUT_DIR, `watch-${crypto.randomBytes(4).toString('hex')}`)
-    await fsp.mkdir(dir, { recursive: true })
-    try {
-      const files = moments.map((_, i) => path.join(dir, `frame-${String(i).padStart(3, '0')}.jpg`))
-      // A few at a time: each is its own short decode, and a dozen at once would only contend.
-      const ok: boolean[] = new Array(moments.length).fill(false)
-      let next = 0
-      await Promise.all(
-        Array.from({ length: Math.min(4, moments.length) }, async () => {
-          while (next < moments.length && !ctx.signal.aborted) {
-            const i = next++
-            ok[i] = await frameAt(file, moments[i], level.width, files[i], ctx.signal)
-          }
-        })
-      )
-
-      const media: ContentPart[] = []
-      const shown: number[] = []
-      for (let i = 0; i < moments.length; i++) {
-        if (!ok[i]) continue
-        const bytes = await fsp.readFile(files[i])
-        shown.push(moments[i])
-        media.push({ type: 'text', text: `Frame at ${clock(moments[i])}:` })
-        media.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${bytes.toString('base64')}` } })
-      }
-      if (!shown.length) return `${about}. No frames could be read between ${clock(start)} and ${clock(end)}.`
-
-      const shownWidth = Math.min(level.width, facts.width)
-      // Even, as the scaler makes it.
-      const shownHeight = Math.round((shownWidth * facts.height) / facts.width / 2) * 2
-      const tokensEach = Math.ceil(shownWidth / PATCH) * Math.ceil(shownHeight / PATCH)
-      const gap = shown.length > 1 ? (shown[shown.length - 1] - shown[0]) / (shown.length - 1) : 0
-      const capped = wanted > level.maxFrames ? ` (${level.maxFrames} is the most at ${detail} detail)` : ''
-
-      const text =
-        `${about}.\n` +
-        `Showing ${shown.length} frame${shown.length === 1 ? '' : 's'}${capped} from ${clock(shown[0])} to ` +
-        `${clock(shown[shown.length - 1])}` +
-        (gap > 0 ? `, about ${gap >= 1 ? `${gap.toFixed(gap >= 10 ? 0 : 1)} s` : `${Math.round(gap * 1000)} ms`} apart` : '') +
-        `, at ${detail} detail (${shownWidth}x${shownHeight}, ${level.what}; roughly ${(tokensEach * shown.length).toLocaleString()} tokens).\n` +
-        `Times: ${shown.map(clock).join(', ')}.\n` +
-        'To see a moment more closely, call watch_video again with start and end around it, and more frames or higher detail.'
-      return { text, media }
-    } finally {
-      await fsp.rm(dir, { recursive: true, force: true }).catch(() => undefined)
-    }
+    return lookAtVideo(file, file, args, { vision: ctx.vision, signal: ctx.signal })
   }
 }
 

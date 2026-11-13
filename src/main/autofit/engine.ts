@@ -24,6 +24,7 @@ import type {
   HardwareSnapshot,
   KvType,
   ModelArchInfo,
+  PlanCorrection,
   PlanDevice,
   VramSegments
 } from '@shared/types'
@@ -105,8 +106,8 @@ function kvPairName(kv: KvChoice): string {
   return `${kv.k}-${kv.v}`
 }
 
-/** CUDA runtime + cuBLAS workspace claimed per device before any weights load. */
-const CUDA_CONTEXT_OVERHEAD = 350 * MB
+/** CUDA runtime + cuBLAS workspace claimed per device before any weights load (measured 0.39 GB). */
+const CUDA_CONTEXT_OVERHEAD = 400 * MB
 /** Graph/scratch allocations that don't scale with batch or context. */
 const BASE_GRAPH_OVERHEAD = 96 * MB
 /**
@@ -139,6 +140,15 @@ const MMPROJ_OVERHEAD = 2.4
 
 /** Floor for the projector's compute buffer, independent of how small the projector itself is. */
 const MMPROJ_MIN_COMPUTE = 512 * 1024 * 1024
+
+/**
+ * Kept free beyond the user's reserve when nothing about the plan has been measured.
+ *
+ * Small, because what it guards against is allocator slack and a few hundred megabytes of driver
+ * variance, not errors in the estimate: those are measured away. Plans llama.cpp has confirmed
+ * use a smaller figure; see the planner.
+ */
+export const DEFAULT_SAFETY = 256 * MB
 
 export const DEFAULT_CONSTRAINTS: FitConstraints = {
   /*
@@ -227,6 +237,30 @@ export function kvCacheBytes(arch: ModelArchInfo, contextLength: number, kv: KvT
 }
 
 /**
+ * Each block's share of the cache, in block order.
+ *
+ * Only attention blocks cache per token; a hybrid model's state-space blocks hold a fixed state.
+ * Spreading the whole cache evenly over every block put a twelfth of an attention layer on each
+ * of them, so which card got which blocks moved half a gigabyte between cards on a 500K context
+ * that the estimate could not see. llama.cpp's hybrid layout puts attention on every n-th block,
+ * the last of each group (block i when (i + 1) % n == 0), with n the ratio of blocks to attention
+ * blocks, which is how this reads it without the interval being stored.
+ */
+export function kvPerLayer(arch: ModelArchInfo, contextLength: number, kv: KvType | KvChoice): number[] {
+  const n = arch.blockCount
+  const total = kvCacheBytes(arch, contextLength, kv)
+  const ssm = arch.ssmLayers ?? 0
+  const attention = arch.attentionLayers || n
+  if (!(ssm > 0 && attention > 0 && attention < n)) return new Array<number>(n).fill(n > 0 ? total / n : 0)
+  const interval = Math.max(2, Math.round(n / attention))
+  const state = (arch.ssmStateBytesPerLayer ?? 0) * SSM_STATE_SAFETY
+  const isAttention = (il: number): boolean => (il + 1) % interval === 0
+  const attentionCount = Array.from({ length: n }, (_, il) => il).filter(isAttention).length || 1
+  const perAttention = Math.max(0, total - ssm * state) / attentionCount
+  return Array.from({ length: n }, (_, il) => (isAttention(il) ? perAttention : state))
+}
+
+/**
  * Compute-buffer estimate.
  *
  * The dominant term without flash attention is the attention score matrix, which is
@@ -242,7 +276,14 @@ export function computeBufferBytes(
 ): number {
   const activations = batchSize * arch.embeddingLength * 2 * 6
   const attention = flashAttention ? batchSize * arch.headDim * arch.headCount * 2 * 4 : batchSize * contextLength * arch.headCount * 2
-  return activations + attention + BASE_GRAPH_OVERHEAD
+  /*
+   * A sparse-attention indexer scores every cached token for every token of the batch, whatever
+   * flash attention does for the main heads. On Qwen3.8-Flash-Next at ubatch 2048 the compute
+   * buffer on one card grew from 1.5 GB at 64K to 3.7 GB at 500K: about 2.7 bytes per
+   * (batch token x context token). Measured plans replace this with llama.cpp's own figure.
+   */
+  const indexer = (arch.indexerKeyLength ?? 0) > 0 ? batchSize * contextLength * 2.7 : 0
+  return activations + attention + indexer + BASE_GRAPH_OVERHEAD
 }
 
 /**
@@ -257,9 +298,6 @@ export function logitsBufferBytes(arch: ModelArchInfo, batchSize: number): numbe
   // The physical batch is llama.cpp's default 512 whatever the logical batch; this app never sets it.
   return Math.min(batchSize, 512) * arch.vocabSize * 4
 }
-
-/** How full a plan may leave a device on a routed model. See `attempt` for why it is not 1. */
-const MOE_FIT_MARGIN = 0.92
 
 /**
  * Compute-buffer cost of one block whose routed experts run on the CPU.
@@ -338,31 +376,32 @@ export function gpuKey(gpu: GpuDevice): string {
 }
 
 /**
- * Extra headroom per card from how far a model's last load overshot its prediction.
+ * Usable bytes on a device: what is free, less what is kept free on purpose, less what goes to
+ * things outside llama.cpp's own buffers.
  *
- * The overshoot plus a quarter again, so one correction does not land exactly on the edge it
- * missed. Undershoots give nothing back: a plan that was too careful costs context, not a crash.
+ * There is no hidden margin beyond these. Each used to be a separate guess (a fixed runtime
+ * overhead, a fraction of the card for routed models, a learned blob of "overshoot") and together
+ * they left gigabytes unused on cards where the user had asked for 512 MB to be kept free.
  */
-export function learnHeadroom(
-  lastLoad: { keys: string[]; predicted: number[]; actual: number[] } | null
-): Record<string, number> {
-  const out: Record<string, number> = {}
-  if (!lastLoad) return out
-  lastLoad.keys.forEach((key, i) => {
-    const actual = lastLoad.actual[i] ?? 0
-    const over = actual - (lastLoad.predicted[i] ?? 0)
-    if (actual > 0 && over > 0) out[key] = Math.round(over * 1.25)
-  })
-  return out
-}
-
-/** Usable bytes on a device after headroom and fixed runtime overhead. */
-function deviceBudget(gpu: GpuDevice, headroomBytes: number, backend: string): number {
+function deviceBudget(gpu: GpuDevice, keepFree: number, extras: number): number {
   // P1: prefer the measured free figure; fall back to a discounted total only when we
   // genuinely have no way to measure, and never to the raw total.
   const free = gpu.freeIsMeasured && gpu.freeVram >= 0 ? gpu.freeVram : gpu.totalVram * UNMEASURED_FREE_FRACTION
-  const overhead = backend === 'cuda' ? CUDA_CONTEXT_OVERHEAD : 0
-  return Math.max(0, free - headroomBytes - overhead)
+  return Math.max(0, free - keepFree - extras)
+}
+
+/**
+ * The extras each card is charged before anything was measured on this machine.
+ *
+ * The CUDA runtime on every card; the vision projector and a separate MTP head on the first, which
+ * is where llama-server puts them. Fitted to Qwen3.8-Flash-Next's 500K load on an RTX 5080 and
+ * 4070 Ti: 0.39 GB of runtime per card, a 0.9 GB projector taking 1.7 GB with its encoder buffers.
+ * Replaced by the measured figure after the model's first load.
+ */
+export function priorExtras(cards: number, backend: string, companionBytes: number, draftBytes: number): number[] {
+  const runtime = backend === 'cuda' ? CUDA_CONTEXT_OVERHEAD : 0
+  const projector = companionBytes > 0 ? companionBytes + Math.max(MMPROJ_MIN_COMPUTE, companionBytes * 0.9) : 0
+  return Array.from({ length: cards }, (_, d) => runtime + (d === 0 ? projector + draftBytes : 0))
 }
 
 /**
@@ -378,6 +417,8 @@ export function proportionalSplit(budgets: number[]): number[] {
 interface Attempt {
   fits: boolean
   perGpu: number[]
+  /** The expert cache's share of `perGpu`. */
+  cachePerGpu: number[]
   /** `perGpu` split by kind; the parts of each card add up to its figure there. */
   segments: VramSegments[]
   /** Blocks per GPU, with the output layer counted on the card that takes the last block. */
@@ -513,6 +554,23 @@ function placeItems(
   }
   const fitsAll = (need: number[]): boolean => need.every((x, d) => x <= budgets[d])
 
+  /*
+   * Two cards: try every cut and keep the one that leaves the most room on the tighter card.
+   *
+   * A proportional cut is a fair first guess and nothing more: it left 0.85 GB spare on an RTX 5080
+   * beside 0.37 GB on a 4070 Ti, room the expert cache could have used. Forty-odd cuts cost nothing.
+   */
+  if (devices === 2 && items.length > 1) {
+    let best: { counts: number[]; perGpu: number[]; slack: number } | null = null
+    for (let k = 0; k <= items.length; k++) {
+      const counts = [k, items.length - k]
+      const need = measure(counts)
+      const slack = Math.min(budgets[0] - need[0], budgets[1] - need[1])
+      if (!best || slack > best.slack) best = { counts, perGpu: need, slack }
+    }
+    if (best) return { counts: best.counts, perGpu: best.perGpu }
+  }
+
   const even = cutProportional(items, caps)
   const evenNeed = measure(even)
   if (devices === 1 || fitsAll(evenNeed)) return { counts: even, perGpu: evenNeed }
@@ -535,14 +593,16 @@ function deviceSegments(
   kv: number[],
   staging: number[],
   compute: number,
-  logits: number
+  logits: number,
+  cache: number[]
 ): VramSegments[] {
-  const out = counts.map(() => ({ weights: 0, kv: 0, compute: 0 }))
+  const out = counts.map(() => ({ weights: 0, kv: 0, compute: 0, cache: 0, extras: 0 }))
   let k = 0
   let outputDevice = 0
   counts.forEach((n, d) => {
     for (let j = 0; j < n; j++, k++) {
-      out[d].weights += weights[k]
+      out[d].weights += weights[k] - cache[k]
+      out[d].cache += cache[k]
       out[d].kv += kv[k]
       out[d].compute += staging[k]
     }
@@ -575,6 +635,54 @@ function deviceSegments(
  */
 let planExpertCacheSlots = 0
 
+/*
+ * The rest of one planning call's context, set by planFit for its duration like the slots above:
+ * measured corrections to apply, the extras each card carries, and what each card keeps free.
+ */
+let planCorrections: PlanCorrection[] = []
+let planExtras: number[] = []
+let planKeepFree: number[] = []
+
+/**
+ * How far llama.cpp's own figure differs from the estimate, per card, for a configuration.
+ *
+ * Taken from measurements of the same cache types, batch and placement, interpolated across
+ * context: the difference is nearly all compute buffer, which tracks context and not much else.
+ * When nothing matching has been measured, the nearest measurement with the same batch is used,
+ * and when there is none, nothing is corrected.
+ */
+export function correctionFor(
+  corrections: readonly PlanCorrection[],
+  q: { contextLength: number; kvType: KvChoice; ubatch: number; flashAttention: boolean; gpuLayers: number; cpuMoeLayers: number },
+  cards: number
+): number[] {
+  const zero = new Array<number>(cards).fill(0)
+  const sameBatch = corrections.filter(
+    (c) => c.ubatch === q.ubatch && c.flashAttention === q.flashAttention && c.offset.length === cards
+  )
+  if (!sameBatch.length) return zero
+  const group = sameBatch.filter(
+    (c) =>
+      c.kvType === q.kvType.k &&
+      c.kvTypeV === q.kvType.v &&
+      c.gpuLayers === q.gpuLayers &&
+      c.cpuMoeLayers === q.cpuMoeLayers
+  )
+  const pool = group.length ? group : sameBatch
+  const near = [...pool].sort(
+    (a, b) => Math.abs(a.contextLength - q.contextLength) - Math.abs(b.contextLength - q.contextLength)
+  )[0]
+  if (!group.length) return near.offset
+  const below = group.filter((c) => c.contextLength <= q.contextLength).sort((a, b) => b.contextLength - a.contextLength)[0]
+  const above = group.filter((c) => c.contextLength >= q.contextLength).sort((a, b) => a.contextLength - b.contextLength)[0]
+  if (below && above && above.contextLength !== below.contextLength) {
+    const t = (q.contextLength - below.contextLength) / (above.contextLength - below.contextLength)
+    return below.offset.map((o, d) => o + (above.offset[d] - o) * t)
+  }
+  // One side only: carry the nearest offset across, which the next measurement then corrects.
+  return near.offset
+}
+
 function expertCacheBytes(arch: ModelArchInfo, expertsBytes: number): number {
   if (planExpertCacheSlots <= 0 || arch.expertCount <= 0) return 0
   return ((planExpertCacheSlots + 1) * expertsBytes) / arch.expertCount
@@ -594,8 +702,7 @@ function attempt(
   const totalLayers = arch.blockCount
   const costs = layerCosts(arch)
   const kvTotal = kvCacheBytes(arch, contextLength, kvType)
-  // Attention layers are interleaved through the stack, so an even spread is how the cache lands.
-  const kvPerBlock = totalLayers > 0 ? kvTotal / totalLayers : 0
+  const kvByBlock = kvPerLayer(arch, contextLength, kvType)
   const firstOnGpu = Math.max(0, totalLayers - gpuLayers)
   const cpuMoe = Math.max(0, Math.min(cpuMoeLayers, totalLayers))
 
@@ -606,20 +713,23 @@ function attempt(
   const itemWeights: number[] = []
   const itemKv: number[] = []
   const itemStaging: number[] = []
+  const itemCache: number[] = []
   for (let il = 0; il < totalLayers; il++) {
     const expertsOnHost = il < cpuMoe
     if (il < firstOnGpu) {
-      hostBytes += costs.dense[il] + costs.experts[il] + kvPerBlock
+      hostBytes += costs.dense[il] + costs.experts[il] + kvByBlock[il]
       continue
     }
-    const onGpu = costs.dense[il] + (expertsOnHost ? expertCacheBytes(arch, costs.experts[il]) : costs.experts[il])
+    const cacheBytes = expertsOnHost ? expertCacheBytes(arch, costs.experts[il]) : 0
+    const onGpu = costs.dense[il] + (expertsOnHost ? cacheBytes : costs.experts[il])
     // Staging travels with the block, because that is where llama.cpp allocates it.
     const staging = expertsOnHost ? hostExpertStaging(arch, batchSize) : 0
     weightsOnGpu += onGpu
-    items.push(onGpu + kvPerBlock + staging)
+    items.push(onGpu + kvByBlock[il] + staging)
     itemWeights.push(onGpu)
-    itemKv.push(kvPerBlock)
+    itemKv.push(kvByBlock[il])
     itemStaging.push(staging)
+    itemCache.push(cacheBytes)
     if (expertsOnHost) hostBytes += costs.experts[il]
   }
 
@@ -630,7 +740,8 @@ function attempt(
     return {
       fits: true,
       perGpu: budgets.map(() => 0),
-      segments: budgets.map(() => ({ weights: 0, kv: 0, compute: 0 })),
+      segments: budgets.map(() => ({ weights: 0, kv: 0, compute: 0, cache: 0, extras: 0 })),
+      cachePerGpu: budgets.map(() => 0),
       layerSplit: budgets.map(() => 0),
       hostBytes: hostBytes + costs.output + compute + logits,
       kvBytes: kvTotal,
@@ -643,24 +754,36 @@ function attempt(
   itemWeights.push(costs.output)
   itemKv.push(0)
   itemStaging.push(0)
+  itemCache.push(0)
   weightsOnGpu += costs.output
 
-  const { counts, perGpu } = placeItems(items, budgets, compute, logits)
-  const segments = deviceSegments(counts, itemWeights, itemKv, itemStaging, compute, logits)
+  // llama.cpp's own figures for configurations like this one, where they have been measured.
+  const offset = correctionFor(
+    planCorrections,
+    { contextLength, kvType, ubatch: batchSize, flashAttention, gpuLayers, cpuMoeLayers: cpuMoe },
+    budgets.length
+  )
+  // Placed against budgets less the correction, so the cut accounts for what the cards will really hold.
+  const placed = placeItems(items, budgets.map((b, d) => b - offset[d]), compute, logits)
+  const counts = placed.counts
+  const perGpu = placed.perGpu.map((need, d) => (counts[d] > 0 ? need + offset[d] : need))
+  const segments = deviceSegments(counts, itemWeights, itemKv, itemStaging, compute, logits, itemCache)
+  segments.forEach((seg, d) => {
+    if (counts[d] > 0) seg.compute = Math.max(0, seg.compute + offset[d])
+  })
+  const cachePerGpu = segments.map((seg) => seg.cache ?? 0)
   /*
-   * A routed model does not get to fill a card to the last megabyte.
+   * No fraction of the card held back.
    *
-   * Its two largest allocations are the ones this engine models least well — the staging buffers
-   * above, and a compute buffer that has to be found in one contiguous piece after ten gigabytes
-   * of weights are already down. Plans that cleared the budget by a hundred megabytes failed at
-   * load repeatedly on exactly those. The margin costs one expert layer and turns a failed load
-   * into a slightly slower one.
+   * A routed model used to be allowed only 92% of each card, against allocations this engine
+   * modelled badly. Those are measured now, and what is kept free is what the user asked for plus
+   * an allowance stated in the plan, rather than eight percent of a card nobody chose.
    */
-  const margin = arch.expertCount > 0 ? MOE_FIT_MARGIN : 1
   return {
-    fits: perGpu.every((need, i) => need <= budgets[i] * margin),
+    fits: perGpu.every((need, i) => need <= budgets[i]),
     perGpu,
     segments,
+    cachePerGpu,
     layerSplit: counts,
     hostBytes,
     kvBytes: kvTotal,
@@ -806,8 +929,12 @@ function buildPlan(
     ...(overrideTensors ? { overrideTensors } : {}),
     batchSize,
     flashAttention,
-    predictedVramPerGpu: a.perGpu,
-    vramSegments: a.segments,
+    predictedVramPerGpu: a.perGpu.map((v, d) => v + (planExtras[d] ?? 0)),
+    llamaVramPerGpu: a.perGpu.map((v, d) => v - (a.cachePerGpu[d] ?? 0)),
+    cacheVramPerGpu: a.cachePerGpu,
+    extrasPerGpu: a.perGpu.map((_, d) => planExtras[d] ?? 0),
+    reservePerGpu: a.perGpu.map((_, d) => planKeepFree[d] ?? 0),
+    vramSegments: a.segments.map((seg, d) => ({ ...seg, extras: planExtras[d] ?? 0 })),
     predictedHostBytes: a.hostBytes,
     kvBytes: a.kvBytes,
     weightsOnGpuBytes: a.weightsOnGpu,
@@ -858,26 +985,38 @@ function planFitInner(
     )
   }
 
-  const budgets = usableGpus.map((g) =>
-    deviceBudget(g, constraints.headroomBytes + (constraints.learnedHeadroom?.[gpuKey(g)] ?? 0), hw.backend)
-  )
-
-  // The vision encoder loads onto the primary device and brings its own image-processing
-  // buffers, so charge it there with margin rather than splitting it across devices.
-  const companion = constraints.companionBytes ?? 0
-  if (companion > 0 && budgets.length > 0) {
-    const charged = Math.max(companion * MMPROJ_OVERHEAD, companion + MMPROJ_MIN_COMPUTE)
-    budgets[0] = Math.max(0, budgets[0] - charged)
+  /*
+   * What each card keeps free, and what it carries outside llama.cpp's own buffers.
+   *
+   * The reserve is the user's, from Settings, and the safety allowance is stated rather than hidden.
+   * The extras (runtime, vision projector, MTP head) are charged to the card that holds them, and
+   * counted in that card's prediction, so a load is compared with a figure that includes them. They
+   * were once subtracted here and left out of the prediction, so every load looked gigabytes "over"
+   * on the first card, and the next plan reserved that again on top.
+   */
+  const safety = constraints.safetyBytes ?? DEFAULT_SAFETY
+  const keepFree = usableGpus.map(() => constraints.headroomBytes + safety)
+  const extras =
+    constraints.extrasPerGpu && constraints.extrasPerGpu.length === usableGpus.length
+      ? constraints.extrasPerGpu
+      : priorExtras(usableGpus.length, hw.backend, constraints.companionBytes ?? 0, constraints.draftBytes ?? 0)
+  planExtras = extras
+  planKeepFree = keepFree
+  const budgets = usableGpus.map((g, d) => deviceBudget(g, keepFree[d], extras[d]))
+  if (usableGpus.length) {
     notes.push(
-      `Reserving ${fmtBytes(charged)} on ${usableGpus[0].name} for the vision projector and its image buffers.`
+      `Keeping ${fmtBytes(constraints.headroomBytes)} free on each card as set in Settings, plus ` +
+        `${fmtBytes(safety)} for allocator slack.`
     )
-  }
-
-  // A separate MTP head drafts on the primary device too (llama-server is told so).
-  const draft = constraints.draftBytes ?? 0
-  if (draft > 0 && budgets.length > 0) {
-    budgets[0] = Math.max(0, budgets[0] - draft)
-    notes.push(`Reserving ${fmtBytes(draft)} on ${usableGpus[0].name} for the MTP draft head.`)
+    const extraNote = usableGpus
+      .map((g, d) => (extras[d] > 0 ? `${fmtBytes(extras[d])} on ${g.name.replace(/^NVIDIA GeForce /, '')}` : ''))
+      .filter(Boolean)
+    if (extraNote.length) {
+      notes.push(
+        `Runtime, vision projector and MTP head: ${extraNote.join(', ')}` +
+          (constraints.extrasPerGpu ? ', as measured on the last load.' : ', estimated until the first load measures them.')
+      )
+    }
   }
 
   const totalBudget = budgets.reduce((a, b) => a + b, 0)
@@ -889,11 +1028,11 @@ function planFitInner(
         `assuming ${Math.round(UNMEASURED_FREE_FRACTION * 100)}% of total is available.`
     )
   }
-  if (usableGpus.length > 1) {
+  if (usableGpus.length === 2) {
+    notes.push('Layers are split between the two cards wherever that leaves the most room on the tighter one.')
+  } else if (usableGpus.length > 2) {
     const pct = proportionalSplit(budgets).map((s) => `${Math.round(s * 100)}%`)
-    notes.push(
-      `Split across ${usableGpus.length} GPUs by free capacity: ${pct.join(' / ')} — proportional, not even.`
-    )
+    notes.push(`Split across ${usableGpus.length} GPUs by free capacity: ${pct.join(' / ')}.`)
   }
 
   // Honour user overrides exactly — they are respected, never silently changed.
@@ -1364,7 +1503,11 @@ function withCacheSlots(arch: ModelArchInfo, slots: number, plan: () => FitResul
  * because each layer's share lands on the card that holds the layer, so the cards fill unevenly.
  */
 const EXPERT_CACHE_MIN_SLOTS = 16
-const EXPERT_CACHE_MARGIN_SLOTS = 8
+/*
+ * Slots held back from what the search found. Two, where it was eight: the plans are measured now,
+ * and what guards against allocator slack is the stated allowance every card keeps free.
+ */
+const EXPERT_CACHE_MARGIN_SLOTS = 2
 
 function autoExpertCache(arch: ModelArchInfo, hw: HardwareSnapshot, constraints: FitConstraints): FitResult {
   const plain = withCacheSlots(arch, 0, () => planFitInner(arch, hw, constraints))
@@ -1396,7 +1539,51 @@ function autoExpertCache(arch: ModelArchInfo, hw: HardwareSnapshot, constraints:
   }
   // A margin against allocator slack, unless every expert already fits.
   const slots = lo >= arch.expertCount - 1 ? lo : Math.max(EXPERT_CACHE_MIN_SLOTS, lo - EXPERT_CACHE_MARGIN_SLOTS)
-  return at(slots)
+  const result = at(slots)
+
+  /*
+   * Offer the faster cache, without taking it.
+   *
+   * With every expert in system RAM, VRAM the cache does not get is speed lost, and the value half
+   * of the KV cache is the one that tolerates four bits (about one changed answer in five hundred).
+   * So when coarser values would buy a real number of extra slots, that plan is put beside the chosen
+   * one rather than picked: the user's cache preference stands unless they choose otherwise.
+   */
+  const coarser: KvChoice = { k: chosen.kvType, v: 'q4_0' }
+  const allowed = !o.kvType && chosen.kvTypeV !== 'q4_0' && (!constraints.kvPairs || constraints.kvPairs.includes(kvPairName(coarser)))
+  if (allowed && result.chosen) {
+    const fast: FitConstraints = { ...pinned, overrides: { ...pinned.overrides, kvType: coarser.k, kvTypeV: coarser.v } }
+    const fastAt = (n: number): FitResult => withCacheSlots(arch, n, () => planFitInner(arch, hw, fast))
+    const fastKeeps = (r: FitResult): boolean => !!r.chosen && r.chosen.contextLength === chosen.contextLength
+    let flo = slots
+    let fhi = arch.expertCount - 1
+    if (fastKeeps(fastAt(flo))) {
+      while (flo < fhi) {
+        const mid = Math.ceil((flo + fhi) / 2)
+        if (fastKeeps(fastAt(mid))) flo = mid
+        else fhi = mid - 1
+      }
+      const fastSlots = flo >= arch.expertCount - 1 ? flo : Math.max(slots, flo - EXPERT_CACHE_MARGIN_SLOTS)
+      const fastPlan = fastAt(fastSlots).chosen
+      // Worth a button only if it is a step, not a rounding difference.
+      if (fastPlan && fastSlots >= slots + Math.max(8, slots * 0.25)) {
+        result.alternatives = [
+          {
+            ...fastPlan,
+            label: 'Faster',
+            rationale: [
+              ...fastPlan.rationale,
+              `Values at q4_0 instead of ${chosen.kvTypeV} free room for ${fastSlots - slots} more expert-cache slots ` +
+                `(${fastSlots} against ${slots}), so more of each token's experts are read from VRAM rather than system RAM.`,
+              'Keys are unchanged, which is the half that carries the accuracy; coarser values measure at roughly one changed answer in five hundred.'
+            ]
+          },
+          ...result.alternatives
+        ]
+      }
+    }
+  }
+  return result
 }
 
 export function planFit(
@@ -1405,10 +1592,18 @@ export function planFit(
   constraints: FitConstraints = DEFAULT_CONSTRAINTS
 ): FitResult {
   const requested = Math.floor(constraints.expertCacheSlots ?? 0)
-  const result =
-    requested < 0
-      ? autoExpertCache(arch, hw, constraints)
-      : withCacheSlots(arch, requested, () => planFitInner(arch, hw, constraints))
+  planCorrections = constraints.corrections ?? []
+  let result: FitResult
+  try {
+    result =
+      requested < 0
+        ? autoExpertCache(arch, hw, constraints)
+        : withCacheSlots(arch, requested, () => planFitInner(arch, hw, constraints))
+  } finally {
+    planCorrections = []
+    planExtras = []
+    planKeepFree = []
+  }
   const { batch, ubatch } = resolveBatches(constraints.overrides.batchSize, constraints.overrides.ubatchSize)
   /*
    * Name the cards each plan's per-card figures belong to.
@@ -1445,42 +1640,4 @@ export function fmtBytes(n: number): string {
     }
   }
   return `${Math.round(n)} B`
-}
-
-/**
- * Compare prediction against reality after a load and report the delta.
- * Persistent error feeds back into the headroom margin so the engine gets more accurate
- * on each specific machine over time.
- */
-export function verifyPrediction(plan: FitPlan, actualPerGpu: number[]): {
-  deltas: number[]
-  worstRatio: number
-  suggestion: string | null
-} {
-  const deltas = plan.predictedVramPerGpu.map((p, i) => (actualPerGpu[i] ?? 0) - p)
-  const ratios = plan.predictedVramPerGpu.map((p, i) => (p > 0 ? (actualPerGpu[i] ?? 0) / p : 1))
-  const worstRatio = ratios.length ? Math.max(...ratios) : 1
-
-  // A reading of zero means the measurement failed, not that the model used no memory —
-  // driver hiccup, a device we cannot poll, or a stand-in server during testing. Reporting
-  // "100% below prediction" from that is worse than saying nothing.
-  const measured = actualPerGpu.filter((v) => v > 0)
-  if (measured.length === 0) {
-    return { deltas, worstRatio, suggestion: null }
-  }
-
-  let suggestion: string | null = null
-  if (worstRatio > 1.1) {
-    const over = fmtBytes(Math.max(...deltas))
-    suggestion = `Used ${over} more VRAM than predicted (${Math.round((worstRatio - 1) * 100)}% over). Widening the safety margin for next time.`
-  } else if (worstRatio < 0.85) {
-    const spare = fmtBytes(Math.abs(Math.min(...deltas)))
-    // What the spare room is good for depends on what the plan left off the cards. Suggesting a
-    // bigger context to someone whose model is half in system RAM points them the wrong way.
-    const offGpu = (plan.cpuMoeLayers ?? 0) > 0 || plan.gpuLayers < plan.totalLayers
-    suggestion = offGpu
-      ? `Used ${spare} less VRAM than predicted. There is room to keep more of this model on the GPUs.`
-      : `Used ${spare} less VRAM than predicted. There is room to raise the context on this model.`
-  }
-  return { deltas, worstRatio, suggestion }
 }

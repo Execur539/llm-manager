@@ -40,7 +40,9 @@ export default function PendingToolCall({ name, args }: { name: string; args: st
     <div className="msg-aside">
       <div className="tool-card pending" data-testid="pending-tool-call">
         <div className="pending-row">
-          <span className="badge warn">writing</span>
+          <span className="tool-status running" title="Writing the call">
+            <span className="sr-only">writing</span>
+          </span>
           {/* The name arrives before the arguments, so it is briefly the only thing known. */}
           <span className="tool-name">{name || 'deciding…'}</span>
           {target && <span className="truncate tool-detail">{target}</span>}

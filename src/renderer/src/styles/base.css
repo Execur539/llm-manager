@@ -1,0 +1,968 @@
+/*
+ * Elements and controls.
+ *
+ * One definition of each control, where the old stylesheet had grown three checkboxes, two
+ * selects and two link buttons that fought each other by load order. Monospace is for code, paths
+ * and tool output only: figures use tabular numerals in the text face, which keeps them aligned
+ * without making every value look like a terminal.
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--sidebar);
+  color: var(--text);
+  font: 400 var(--fs-md) / 1.5 var(--sans);
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* On Mica the window's base is the system material, which the sidebar lets through. */
+html.mica body {
+  background: transparent;
+}
+
+::selection {
+  background: rgba(10, 132, 255, 0.38);
+}
+
+/* ---------------------------------------------------------------- type */
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--display);
+  color: var(--text);
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+h1 {
+  font-size: var(--fs-xl);
+  font-weight: 600;
+}
+
+h2 {
+  font-size: var(--fs-lg);
+  font-weight: 600;
+}
+
+h3 {
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+
+p {
+  margin: 0 0 10px;
+}
+
+a {
+  color: var(--accent-text);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+strong {
+  font-weight: 600;
+}
+
+code,
+kbd,
+pre,
+.mono {
+  font-family: var(--mono);
+  font-variant-ligatures: none;
+}
+
+/* Monospace runs large beside the text face at the same size. */
+.mono {
+  font-size: 0.92em;
+}
+
+/* Code inside a quiet line is still something to read exactly, so it never drops below dim. */
+.faint code {
+  color: var(--text-dim);
+}
+
+code.mono,
+:not(pre) > code {
+  font-size: 0.92em;
+  padding: 1px 5px;
+  border-radius: var(--r-xs);
+  background: rgba(255, 255, 255, 0.06);
+  border: none;
+}
+
+kbd {
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: var(--r-xs);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  color: var(--text-dim);
+}
+
+pre {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: var(--r-md);
+  background: var(--bg-inset);
+  border: 1px solid var(--hairline);
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow: auto;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid var(--hairline);
+  margin: 16px 0;
+}
+
+/* ---------------------------------------------------------------- scrollbars and focus */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.13);
+  border-radius: var(--r-pill);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.22);
+  background-clip: content-box;
+}
+
+/* One focus ring, for keyboards only. */
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+/* ---------------------------------------------------------------- buttons */
+
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: var(--control-h);
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: var(--lift);
+  transition:
+    background-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease),
+    transform 90ms var(--ease);
+}
+
+button:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: transparent;
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+button .icon {
+  flex-shrink: 0;
+}
+
+/* The one action a view wants you to take. */
+button.primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+button.primary:hover:not(:disabled) {
+  border-color: transparent;
+  background: var(--accent-hover);
+}
+
+button.danger {
+  border-color: transparent;
+  background: var(--bad-wash);
+  color: #ff8d86;
+  box-shadow: none;
+}
+
+button.danger:hover:not(:disabled) {
+  border-color: transparent;
+  background: rgba(255, 90, 82, 0.2);
+  color: #ffb4af;
+}
+
+button.danger.subtle {
+  background: transparent;
+  color: var(--text-faint);
+}
+
+button.danger.subtle:hover:not(:disabled) {
+  border-color: transparent;
+  background: var(--bad-wash);
+  color: #ff8d86;
+}
+
+/* Quiet: no fill until hovered. Toolbars and rows use these. */
+button.ghost,
+button.icon,
+.icon-button {
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-dim);
+}
+
+button.ghost:hover:not(:disabled),
+button.icon:hover:not(:disabled),
+.icon-button:hover:not(:disabled) {
+  background: var(--field-hover);
+  color: var(--text);
+}
+
+button.icon,
+.icon-button {
+  width: var(--control-h);
+  min-width: var(--control-h);
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+/* Reads as a link: for an action secondary to the one beside it. */
+button.link {
+  min-height: 18px;
+  padding: 0;
+  border: none;
+  background: none;
+  box-shadow: none;
+  color: var(--accent-text);
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: 2px;
+}
+
+button.link:hover:not(:disabled) {
+  background: none;
+  color: #7dbcff;
+  text-decoration-color: currentColor;
+}
+
+button.link:active:not(:disabled) {
+  transform: none;
+}
+
+button.tiny {
+  min-height: 24px;
+  padding: 0 9px;
+  font-size: 12px;
+  border-radius: var(--r-sm);
+}
+
+button.full {
+  width: 100%;
+}
+
+/* ---------------------------------------------------------------- fields */
+
+input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='file']),
+select,
+textarea {
+  min-height: var(--control-h);
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--field);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-md);
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease),
+    background-color var(--dur-fast) var(--ease);
+}
+
+input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='file']):hover,
+select:hover,
+textarea:hover {
+  border-color: var(--border-strong);
+}
+
+input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='file']):focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-wash);
+}
+
+textarea {
+  padding: 8px 10px;
+  line-height: 1.55;
+  resize: vertical;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-faint);
+  opacity: 1;
+}
+
+input:disabled,
+textarea:disabled,
+select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Steppers add clutter to a field that already answers to the arrow keys. */
+input[type='number'] {
+  appearance: textfield;
+}
+
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+/* A select with its own chevron, aligned like the rest of the controls. */
+select {
+  appearance: none;
+  padding-right: 30px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23a3a3ac' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+
+select option {
+  background: var(--surface-float);
+  color: var(--text);
+}
+
+input.narrow {
+  width: 9ch;
+  min-width: 9ch;
+  flex: 0 0 auto;
+}
+
+label {
+  cursor: pointer;
+}
+
+label.row {
+  user-select: none;
+}
+
+/* ---------------------------------------------------------------- checks, radios, switches */
+
+input[type='checkbox'],
+input[type='radio'] {
+  appearance: none;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  vertical-align: -3px;
+  border: 1.5px solid rgba(255, 255, 255, 0.3);
+  background: transparent no-repeat center / 12px 12px;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease),
+    transform 90ms var(--ease);
+}
+
+input[type='checkbox'] {
+  border-radius: 5px;
+}
+
+input[type='radio'] {
+  border-radius: 50%;
+}
+
+input[type='checkbox']:hover,
+input[type='radio']:hover {
+  border-color: rgba(255, 255, 255, 0.5);
+}
+
+input[type='checkbox']:checked {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 12.5 4.5 4.5L19 7.5'/%3E%3C/svg%3E");
+}
+
+input[type='radio']:checked {
+  border-color: var(--accent);
+  background-image: radial-gradient(circle, var(--accent) 0 4px, transparent 4.5px);
+  background-size: 100% 100%;
+}
+
+input[type='checkbox']:active,
+input[type='radio']:active {
+  transform: scale(0.92);
+}
+
+input[type='checkbox']:disabled,
+input[type='radio']:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/*
+ * A setting that is simply on or off is a switch.
+ *
+ * Still a checkbox underneath, so it keeps its keyboard behaviour, its label and everything that
+ * reads it; only the drawing changes.
+ */
+.kv input[type='checkbox'],
+.setting-control input[type='checkbox'],
+input[type='checkbox'].switch {
+  width: 34px;
+  height: 20px;
+  border-radius: var(--r-pill);
+  border: none;
+  background: rgba(255, 255, 255, 0.16);
+  position: relative;
+  vertical-align: -5px;
+}
+
+.kv input[type='checkbox']::after,
+.setting-control input[type='checkbox']::after,
+input[type='checkbox'].switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  transition: transform var(--dur) var(--ease);
+}
+
+.kv input[type='checkbox']:checked,
+.setting-control input[type='checkbox']:checked,
+input[type='checkbox'].switch:checked {
+  background: var(--accent);
+  background-image: none;
+}
+
+.kv input[type='checkbox']:checked::after,
+.setting-control input[type='checkbox']:checked::after,
+input[type='checkbox'].switch:checked::after {
+  transform: translateX(14px);
+}
+
+.kv input[type='checkbox']:hover:not(:checked),
+.setting-control input[type='checkbox']:hover:not(:checked),
+input[type='checkbox'].switch:hover:not(:checked) {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.kv input[type='checkbox']:active,
+.setting-control input[type='checkbox']:active,
+input[type='checkbox'].switch:active {
+  transform: none;
+}
+
+/* ---------------------------------------------------------------- range */
+
+input[type='range'] {
+  appearance: none;
+  height: 20px;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, 0.14);
+}
+
+input[type='range']::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+input[type='range']:active::-webkit-slider-thumb {
+  transform: scale(1.12);
+}
+
+/* ---------------------------------------------------------------- tags */
+
+/*
+ * A small label beside a value: quiet, in the text face, with corners rather than a pill. These
+ * were monospace capsules with borders, which on a row of five made every card look like a
+ * terminal printout.
+ */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 20px;
+  padding: 0 7px;
+  border-radius: var(--r-sm);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-dim);
+  font-family: var(--sans);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+  border: none;
+}
+
+.badge.good {
+  background: var(--good-wash);
+  color: #6fe08f;
+}
+
+.badge.warn {
+  background: var(--warn-wash);
+  color: #ffc76e;
+}
+
+.badge.bad {
+  background: var(--bad-wash);
+  color: #ff8d86;
+}
+
+/* A status dot, for when a word would be too loud. */
+.dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+}
+
+/* ---------------------------------------------------------------- utilities */
+
+.row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.faint {
+  color: var(--text-faint);
+}
+
+.dim {
+  color: var(--text-dim);
+}
+
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.tiny-note {
+  font-size: var(--fs-xs);
+  color: var(--text-faint);
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+.subtitle {
+  color: var(--text-dim);
+  font-size: var(--fs-md);
+  line-height: 1.6;
+  max-width: 68ch;
+  margin: 0 0 22px;
+}
+
+.empty {
+  color: var(--text-faint);
+  padding: 28px 16px;
+  text-align: center;
+}
+
+.empty.small {
+  font-size: var(--fs-sm);
+  padding: 18px 8px;
+}
+
+.spinner {
+  display: inline-block;
+  flex-shrink: 0;
+  border: 2px solid rgba(255, 255, 255, 0.16);
+  border-top-color: var(--text);
+  border-radius: 50%;
+  animation: spin 640ms linear infinite;
+}
+
+.primary .spinner {
+  border-color: rgba(255, 255, 255, 0.3);
+  border-top-color: #fff;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.skeleton-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.skeleton-row {
+  border-radius: var(--r-lg);
+  background: linear-gradient(90deg, var(--surface-1) 25%, var(--surface-2) 37%, var(--surface-1) 63%);
+  background-size: 400% 100%;
+  animation: sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  from {
+    background-position: 100% 50%;
+  }
+  to {
+    background-position: 0 50%;
+  }
+}
+
+/* A blinking caret at the end of streaming text. */
+.cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  vertical-align: text-bottom;
+  animation: blink 1.05s step-end infinite;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.pulse-dot,
+.dot-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--good);
+  flex-shrink: 0;
+  animation: breathe 2.6s var(--ease-in-out) infinite;
+}
+
+.dot-pulse {
+  width: 6px;
+  height: 6px;
+  background: var(--accent);
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(48, 209, 88, 0.42);
+  }
+  60% {
+    box-shadow: 0 0 0 5px rgba(48, 209, 88, 0);
+  }
+}
+
+/* ---------------------------------------------------------------- groups and definitions */
+
+/*
+ * A group of related things on a page: one quiet step above the canvas, no shadow, no heavy edge.
+ */
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  padding: 18px 20px;
+  margin-bottom: 14px;
+  box-shadow: none;
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 14px;
+  font-family: var(--display);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: var(--text);
+}
+
+/* A notice inside a page. */
+.card.note,
+.note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  border-radius: var(--r-md);
+  border: none;
+  background: var(--accent-wash);
+  color: #cfe5ff;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+
+.card.note strong {
+  color: #fff;
+}
+
+.card.note.dismissible {
+  justify-content: space-between;
+}
+
+.error-card {
+  background: var(--bad-wash);
+  border-color: rgba(255, 90, 82, 0.28);
+  color: #ffc9c5;
+}
+
+.dismissible {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.danger-zone {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--hairline);
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+}
+
+.grid-top {
+  align-items: start;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Label and value, aligned in two columns. Values are text, not code. */
+.kv {
+  display: grid;
+  grid-template-columns: minmax(min-content, max-content) 1fr;
+  gap: 8px 18px;
+  margin: 0;
+  font-size: var(--fs-md);
+}
+
+.card-wide .kv,
+.kv.kv-wide {
+  grid-template-columns: 180px 1fr;
+}
+
+.kv dt {
+  color: var(--text-dim);
+  white-space: nowrap;
+  padding-top: 5px;
+}
+
+.kv dd {
+  margin: 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 30px;
+  font-family: var(--sans);
+  overflow-wrap: anywhere;
+}
+
+.kv dd .faint,
+.kv dd label,
+.kv dd .note-text {
+  font-family: var(--sans);
+  font-size: var(--fs-sm);
+}
+
+.kv dd > input[type='number'] {
+  width: 11ch;
+  min-width: 11ch;
+  flex: 0 0 auto;
+}
+
+.kv dd > input[type='text'],
+.kv dd > input[type='password'] {
+  flex: 1 1 240px;
+  min-width: 0;
+  max-width: 420px;
+}
+
+.kv dd > select {
+  min-width: 16ch;
+  flex: 0 0 auto;
+}
+
+.kv-select {
+  width: 28ch;
+  flex: 0 0 auto;
+}
+
+/* A thin bar for "how full". */
+.meter {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width var(--dur-slow) var(--ease);
+}
+
+.meter.unknown {
+  background-image: repeating-linear-gradient(135deg, transparent 0 4px, rgba(255, 255, 255, 0.07) 4px 8px);
+}
+
+/* Tables: hairline rows, quiet headers that stay in view. */
+.table-wrap {
+  overflow: auto;
+  max-height: 380px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+th {
+  position: sticky;
+  top: 0;
+  padding: 8px 12px 8px 0;
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-faint);
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--hairline);
+}
+
+td {
+  padding: 7px 12px 7px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+
+/* ---------------------------------------------------------------- layout safety */
+
+/* A field in a row shrinks with it rather than pushing the row wider than its card. */
+.row > input,
+.row > select {
+  min-width: 0;
+}
+
+/* A single text field in a card stops at a readable length instead of crossing the page. */
+.card > .row > input[type='text'],
+.card > .row > input[type='password'],
+.card > .row > input[type='url'],
+.card > .row > input[type='email'] {
+  max-width: 460px;
+}
+
+/* Long output stays a box to scroll, not a page to scroll past. */
+pre {
+  max-height: 360px;
+}
+
+/* ---------------------------------------------------------------- reduced motion */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

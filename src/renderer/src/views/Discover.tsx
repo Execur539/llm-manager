@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import { fmtBytes, invoke, on, fmtRelative } from '../lib/api'
 import Icon from '../components/Icon'
 import { Skeleton, Spinner } from '../components/Spinner'
+import EmptyState from '../components/EmptyState'
+import { Toolbar } from '../lib/shell'
 
 interface HfModelSummary {
   id: string
@@ -259,167 +261,195 @@ export default function Discover({ onDownloaded }: { onDownloaded: () => Promise
     for (const d of g.items) if (from.includes(d.status)) void invoke(channel, d.id)
   }
 
+  const statusText = (g: DownloadGroup): string => g.status.charAt(0).toUpperCase() + g.status.slice(1)
+  const [selOwner, ...selRest] = (selected ?? '').split('/')
+
   return (
     <>
-      <h1>Find a model</h1>
-      <p className="subtitle">
-        Searches HuggingFace for GGUF repositories. Nothing is hardcoded, so models released today show up today.
-      </p>
+      <Toolbar title="Find a model" />
 
-      <div className="row" style={{ marginBottom: 16 }}>
-        <input
-          type="text"
-          placeholder="e.g. qwen3.8 27b, llama, gemma…"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && void search()}
-          style={{ flex: 1 }}
-        />
+      {/* One field, large: what this page is for. */}
+      <div className="discover-search">
+        <label className="search-field large">
+          <Icon name="search" size={17} />
+          <input
+            type="text"
+            placeholder="e.g. qwen3.8 27b, llama, gemma…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && void search()}
+            aria-label="Search Hugging Face for a model"
+          />
+        </label>
         <button className="primary" onClick={() => void search()} disabled={searching} data-testid="search-models">
-          {searching ? <Spinner size={13} /> : <Icon name="search" size={14} />}
+          {searching ? <Spinner size={13} /> : null}
           {searching ? 'Searching…' : 'Search'}
         </button>
       </div>
+      <p className="discover-note">
+        Searches Hugging Face for GGUF repositories. Nothing is hardcoded, so a model released today shows up today.
+      </p>
 
       {error && (
-        <div className="card" style={{ borderColor: '#5c2626' }}>
+        <div className="card error-card">
           <span className="badge bad">error</span> {error}
         </div>
       )}
 
       {active.length > 0 && (
-        <div className="card">
-          <div className="card-title">Downloads</div>
-          {active.map((g) => {
-            const pct = g.bytesTotal > 0 ? (g.bytesDone / g.bytesTotal) * 100 : 0
-            return (
-              <div key={g.key} style={{ marginBottom: 10 }}>
-                <div className="row" style={{ justifyContent: 'space-between', fontSize: 12 }}>
-                  <span className="truncate">{g.label}</span>
-                  <span className="faint">
-                    {fmtBytes(g.bytesDone)} / {fmtBytes(g.bytesTotal)}
-                    {g.speed > 0 && ` · ${fmtBytes(g.speed)}/s`}
-                  </span>
-                </div>
-                <div className="meter" style={{ marginTop: 4 }}>
-                  <span style={{ width: `${pct}%` }} />
-                </div>
-                <div className="row" style={{ marginTop: 6 }}>
-                  <span className="badge">{g.status}</span>
-                  {g.parts > 1 && (
-                    <span className="badge">
-                      {g.partsDone} of {g.parts} parts
+        <section className="page-section">
+          <h2 className="section-title">Downloads</h2>
+          <div className="card list-group">
+            {active.map((g) => {
+              const pct = g.bytesTotal > 0 ? (g.bytesDone / g.bytesTotal) * 100 : 0
+              return (
+                <div className="download-row" key={g.key}>
+                  <div className="download-head">
+                    <span className="download-name truncate" title={g.label}>
+                      {g.label}
                     </span>
-                  )}
-                  {['downloading', 'queued', 'verifying'].includes(g.status) && (
-                    <button onClick={() => act(g, 'downloads:pause', ['downloading', 'queued'])}>Pause</button>
-                  )}
-                  {g.items.some((d) => d.status === 'paused' || d.status === 'failed') && (
-                    <button onClick={() => act(g, 'downloads:resume', ['paused', 'failed'])}>Resume</button>
-                  )}
-                  <button
-                    className="danger"
-                    onClick={() => act(g, 'downloads:cancel', ['queued', 'downloading', 'verifying', 'paused'])}
-                  >
-                    Cancel
-                  </button>
+                    <span className="download-figures">
+                      {fmtBytes(g.bytesDone)} of {fmtBytes(g.bytesTotal)}
+                      {g.speed > 0 && ` · ${fmtBytes(g.speed)}/s`}
+                    </span>
+                  </div>
+                  <div className="meter">
+                    <span style={{ width: `${pct}%` }} />
+                  </div>
+                  <div className="download-foot">
+                    <span className="download-status">
+                      {statusText(g)}
+                      {g.parts > 1 && ` · ${g.partsDone} of ${g.parts} parts`}
+                    </span>
+                    <span className="spacer" />
+                    {['downloading', 'queued', 'verifying'].includes(g.status) && (
+                      <button className="ghost tiny" onClick={() => act(g, 'downloads:pause', ['downloading', 'queued'])}>
+                        Pause
+                      </button>
+                    )}
+                    {g.items.some((d) => d.status === 'paused' || d.status === 'failed') && (
+                      <button className="ghost tiny" onClick={() => act(g, 'downloads:resume', ['paused', 'failed'])}>
+                        Resume
+                      </button>
+                    )}
+                    <button
+                      className="danger subtle tiny"
+                      onClick={() => act(g, 'downloads:cancel', ['queued', 'downloading', 'verifying', 'paused'])}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  {g.error && <div className="badge bad model-error">{g.error}</div>}
                 </div>
-                {g.error && <div className="badge bad" style={{ marginTop: 4 }}>{g.error}</div>}
-              </div>
-            )
-          })}
-          <div className="faint" style={{ fontSize: 11 }}>
-            Downloads resume where they stopped, even after the app is closed.
+              )
+            })}
           </div>
-        </div>
+          <p className="section-note">Downloads resume where they stopped, even after the app is closed.</p>
+        </section>
       )}
 
       {!selected && (
-        <div className="list">
-          {results.map((r) => {
-            const [owner, ...rest] = r.id.split('/')
-            const name = rest.join('/') || r.id
-            return (
-              <button
-                type="button"
-                className="card row-card repo-card"
-                key={r.id}
-                onClick={() => void openRepo(r.id)}
-                title={`Open ${r.id}`}
-              >
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="truncate repo-name">
-                    {rest.length > 0 && <span className="repo-owner">{owner}/</span>}
-                    {name}
-                  </div>
-                  <div className="repo-meta">
-                    <span title={`${r.downloads.toLocaleString()} downloads`}>
-                      <Icon name="download" size={11} /> {fmtCount(r.downloads)}
-                    </span>
-                    <span title={`${r.likes.toLocaleString()} likes`}>
-                      <Icon name="star" size={11} /> {fmtCount(r.likes)}
-                    </span>
-                    {r.updatedAt && (
-                      <span title={new Date(r.updatedAt).toLocaleString()}>
-                        updated {fmtRelative(new Date(r.updatedAt).getTime())}
-                      </span>
-                    )}
-                  </div>
-                </div>
-                {r.gated && <span className="badge warn">gated</span>}
-                {/* The whole row is clickable; without a mark that is not obvious. */}
-                <Icon name="search" size={14} className="repo-go" />
-              </button>
-            )
-          })}
+        <section className="page-section">
+          {results.length > 0 && (
+            <div className="card list-group">
+              {results.map((r) => {
+                const [owner, ...rest] = r.id.split('/')
+                const name = rest.join('/') || r.id
+                return (
+                  <button
+                    type="button"
+                    className="row-card repo-card"
+                    key={r.id}
+                    onClick={() => void openRepo(r.id)}
+                    title={`Open ${r.id}`}
+                  >
+                    <div className="repo-main">
+                      <div className="truncate repo-name">
+                        {rest.length > 0 && <span className="repo-owner">{owner}/</span>}
+                        {name}
+                      </div>
+                      <div className="repo-meta">
+                        <span title={`${r.downloads.toLocaleString()} downloads`}>
+                          <Icon name="download" size={12} /> {fmtCount(r.downloads)}
+                        </span>
+                        <span title={`${r.likes.toLocaleString()} likes`}>
+                          <Icon name="star" size={12} /> {fmtCount(r.likes)}
+                        </span>
+                        {r.updatedAt && (
+                          <span title={new Date(r.updatedAt).toLocaleString()}>
+                            Updated {fmtRelative(new Date(r.updatedAt).getTime())}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    {r.gated && <span className="badge warn">Gated</span>}
+                    {/* The whole row opens; without a mark that is not obvious. */}
+                    <Icon name="chevron" size={15} className="repo-go" />
+                  </button>
+                )
+              })}
+            </div>
+          )}
           {searching && !results.length && <Skeleton rows={4} height={58} />}
           {!results.length && !searching && (
-            <div className="empty">Search for a model to get started.</div>
+            <EmptyState
+              icon="search"
+              title="Find a model to run"
+              body="Search by name or family. Each result opens onto its files, with the one that best fits your graphics cards recommended."
+            />
           )}
-        </div>
+        </section>
       )}
 
       {selected && (
-        <>
-          <div className="row" style={{ marginBottom: 12 }}>
-            <button onClick={() => setSelected(null)}>← Back to results</button>
-            <h2 style={{ margin: 0, fontSize: 15 }}>{selected}</h2>
+        <section className="page-section">
+          <div className="repo-head">
+            <button className="ghost repo-back" onClick={() => setSelected(null)} aria-label="Back to results">
+              <Icon name="chevron" size={15} />
+              Results
+            </button>
+            <h2 className="repo-title truncate" title={selected}>
+              {selRest.length > 0 && <span className="repo-owner">{selOwner}/</span>}
+              {selRest.join('/') || selected}
+            </h2>
           </div>
 
           {recommendation && (
-            <div className="card" style={{ borderColor: recommendation.fitsFullyOnGpu ? '#1f4a33' : '#5a4515' }}>
+            <div className="card recommend-card">
               <div className="card-title">
                 Recommended for your hardware
                 <span className={`badge ${recommendation.fitsFullyOnGpu ? 'good' : 'warn'}`}>
-                  {recommendation.fitsFullyOnGpu ? 'fits in VRAM' : 'uses system RAM'}
+                  {recommendation.fitsFullyOnGpu ? 'Fits in VRAM' : 'Uses system RAM'}
                 </span>
               </div>
-              <div className="mono" style={{ marginBottom: 6 }}>{recommendation.label}</div>
-              <div className="dim">{recommendation.reason}</div>
-              <button className="primary" style={{ marginTop: 10 }} onClick={() => void download(recommendation.variantId)}>
+              <div className="recommend-label">{recommendation.label}</div>
+              <p className="recommend-reason">{recommendation.reason}</p>
+              <button className="primary" onClick={() => void download(recommendation.variantId)}>
                 Download this one
               </button>
             </div>
           )}
 
-          <div className="row" style={{ margin: '14px 0 8px' }}>
-            <h3 style={{ margin: 0, fontSize: 13 }}>All variants ({modelVariants.length})</h3>
+          <div className="variants-head">
+            <h3 className="section-title">
+              All variants <span className="section-count">{modelVariants.length}</span>
+            </h3>
             {companions.length > 0 && (
-              <label className="faint row" style={{ gap: 6, fontSize: 12 }}>
+              <label className="check-label">
                 <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
-                show projectors and MTP modules
+                Show projectors and MTP modules
               </label>
             )}
           </div>
 
-          <div className="list">
+          <div className="card list-group">
             {modelVariants.map((v) => {
               const vi = info[v.id]
               return (
-                <div className="card row-card" key={v.id} data-testid="variant-row">
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
-                      <span className="truncate mono" style={{ fontSize: 12 }} title={v.id}>
+                <div className="row-card variant-row" key={v.id} data-testid="variant-row">
+                  <div className="variant-main">
+                    <div className="variant-title">
+                      <span className="variant-name truncate" title={v.id}>
                         {v.label}
                       </span>
                       {(vi?.mtpLayers ?? 0) > 0 && (
@@ -440,9 +470,9 @@ export default function Discover({ onDownloaded }: { onDownloaded: () => Promise
                         </span>
                       )}
                       {v.parts.length > 1 && <span className="badge">{v.parts.length} parts</span>}
-                      {!v.complete && <span className="badge bad">incomplete on HuggingFace</span>}
+                      {!v.complete && <span className="badge bad">Incomplete on Hugging Face</span>}
                     </div>
-                    <div className="faint" style={{ fontSize: 11 }}>
+                    <div className="variant-meta">
                       {fmtBytes(v.bytes)}
                       {v.quant && v.quant !== v.label && ` · ${v.quant}`}
                       {!v.complete && ` · part${v.missing.length === 1 ? '' : 's'} ${v.missing.join(', ')} missing`}
@@ -460,27 +490,29 @@ export default function Discover({ onDownloaded }: { onDownloaded: () => Promise
             })}
             {showAll &&
               companions.map((v) => (
-                <div className="card row-card" key={v.id}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div className="truncate mono" style={{ fontSize: 12 }}>{v.id}</div>
-                    <div className="faint" style={{ fontSize: 11 }}>
+                <div className="row-card variant-row" key={v.id}>
+                  <div className="variant-main">
+                    <div className="variant-name truncate" title={v.id}>
+                      {v.id}
+                    </div>
+                    <div className="variant-meta">
                       {fmtBytes(v.bytes)} ·{' '}
                       {v.kind === 'mmproj'
-                        ? 'vision projector — fetched automatically with a model'
-                        : 'separate MTP module — not a standalone model; used automatically with the model it belongs to (CUDA)'}
+                        ? 'vision projector, fetched automatically with a model'
+                        : 'separate MTP module: not a standalone model, used automatically with the model it belongs to (CUDA)'}
                     </div>
                   </div>
                   {v.kind === 'mmproj' && <button onClick={() => void download(v.id)}>Download</button>}
                 </div>
               ))}
-            {!files.length && <div className="empty">Loading files…</div>}
+            {!files.length && <div className="empty small">Loading files…</div>}
           </div>
 
-          <p className="faint" style={{ fontSize: 11, marginTop: 10 }}>
+          <p className="section-note">
             A model split into parts downloads as one: every part, in one go. Multimodal models need their mmproj
-            companion — it is fetched automatically alongside the model.
+            companion, which is fetched automatically alongside the model.
           </p>
-        </>
+        </section>
       )}
     </>
   )
