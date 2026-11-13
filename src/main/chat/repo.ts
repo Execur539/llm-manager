@@ -13,6 +13,19 @@ import path from 'node:path'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import { all, get, run, transaction } from '../storage/db'
+import {
+  LockedError,
+  chatBox,
+  chatOfFile,
+  forgetOwner,
+  isLocked,
+  plainBox,
+  primeRecord,
+  protectedIds,
+  readOpen,
+  statusOf,
+  type Box
+} from '../protect/keys'
 import type { AgentMessage, AgentSessionState, MessageAttachment } from '@shared/types'
 
 export interface ChatSummary {
@@ -24,6 +37,12 @@ export interface ChatSummary {
   createdAt: number
   updatedAt: number
   messageCount: number
+  /** Stored encrypted; see protect/. */
+  protected?: boolean
+  /** Protected by a password and not unlocked: the title is a stand-in and nothing else can be read. */
+  locked?: boolean
+  /** Whether a password is set. */
+  password?: boolean
 }
 
 interface ChatRow {
@@ -40,7 +59,38 @@ interface ChatRow {
   summary: string | null
   summary_upto: string | null
   title_by_user: number
+  protection: string | null
 }
+
+const lockedTitle = (kind: string): string => (kind === 'agent' ? 'Locked session' : 'Locked chat')
+
+/** The chat's box, from a row that already says whether it is protected. */
+function boxOfRow(r: ChatRow): Box {
+  primeRecord({ kind: 'chat', id: r.id }, r.protection)
+  return chatBox(r.id)
+}
+
+/** The box of the conversation a message belongs to. */
+function boxOfMessage(messageId: string): Box {
+  const row = get<{ chat_id: string }>('SELECT chat_id FROM messages WHERE id = ?', messageId)
+  return row ? chatBox(row.chat_id) : plainBox()
+}
+
+/** The box of the conversation an attachment belongs to. */
+function boxOfAttachment(id: string): Box {
+  const row = get<{ chat_id: string }>(
+    'SELECT m.chat_id FROM attachments a JOIN messages m ON m.id = a.message_id WHERE a.id = ?',
+    id
+  )
+  return row ? chatBox(row.chat_id) : plainBox()
+}
+
+/**
+ * How an attachment's path is stored. The app's kept copies have names that say nothing and stay
+ * readable, so tidying files never needs a key; a path to the user's own file is encrypted with the
+ * rest when the conversation is protected.
+ */
+const storedPath = (box: Box, file: string): string => (chatOfFile(file) ? file : box.seal(file))
 
 interface MessageRow {
   id: string
@@ -98,21 +148,70 @@ export function listChats(kind?: 'chat' | 'agent'): ChatSummary[] {
         'SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS n FROM chats c ORDER BY updated_at DESC'
       )
 
-  return rows.map((r) => ({
-    id: r.id,
-    title: r.title,
-    kind: r.kind as 'chat' | 'agent',
-    modelId: r.model_id,
-    cwd: r.cwd,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
-    messageCount: r.n
-  }))
+  return rows.map((r) => {
+    const box = boxOfRow(r)
+    const status = statusOf({ kind: 'chat', id: r.id })
+    let title = lockedTitle(r.kind)
+    if (!status.locked) {
+      try {
+        title = box.open(r.title)
+      } catch {
+        title = '(unreadable title)'
+      }
+    }
+    return {
+      id: r.id,
+      title,
+      kind: r.kind as 'chat' | 'agent',
+      modelId: r.model_id,
+      cwd: r.cwd,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+      // A locked conversation shows only that it exists and when it was last used.
+      messageCount: status.locked ? 0 : r.n,
+      ...(status.protected ? { protected: true, locked: status.locked, password: status.password } : {})
+    }
+  })
+}
+
+/** The conversation's own fields, readable, for an export. Throws while it is locked. */
+export function chatHeader(id: string): {
+  id: string
+  title: string
+  kind: string
+  model_id: string | null
+  cwd: string | null
+  created_at: number
+  updated_at: number
+  summary: string | null
+} | null {
+  const row = get<ChatRow>('SELECT * FROM chats WHERE id = ?', id)
+  if (!row) return null
+  const box = boxOfRow(row)
+  if (box.locked) throw new LockedError('chat')
+  return {
+    id: row.id,
+    title: box.open(row.title),
+    kind: row.kind,
+    model_id: row.model_id,
+    cwd: row.cwd,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    summary: box.openOrNull(row.summary)
+  }
+}
+
+/** The title as the user sees it: the stand-in while locked. */
+export function chatTitle(id: string): string | null {
+  const row = get<ChatRow>('SELECT * FROM chats WHERE id = ?', id)
+  if (!row) return null
+  const box = boxOfRow(row)
+  return box.locked ? lockedTitle(row.kind) : box.open(row.title)
 }
 
 /** A name the user gave; the model never renames over it. */
 export function renameChat(id: string, title: string): void {
-  run('UPDATE chats SET title = ?, title_by_user = 1, updated_at = ? WHERE id = ?', title, Date.now(), id)
+  run('UPDATE chats SET title = ?, title_by_user = 1, updated_at = ? WHERE id = ?', chatBox(id).seal(title), Date.now(), id)
 }
 
 /**
@@ -125,9 +224,11 @@ export function setModelTitle(id: string, text: string): string | null {
   const title = cleanTitle(text)
   if (!title) return null
   const row = get<ChatRow>('SELECT * FROM chats WHERE id = ?', id)
-  if (!row || row.title_by_user || row.title === title) return null
+  if (!row || row.title_by_user) return null
+  const box = boxOfRow(row)
+  if (box.open(row.title) === title) return null
   // Not a change of activity, so the conversation keeps its place in the list.
-  run('UPDATE chats SET title = ? WHERE id = ?', title, id)
+  run('UPDATE chats SET title = ? WHERE id = ?', box.seal(title), id)
   return title
 }
 
@@ -137,23 +238,42 @@ export function titleState(id: string): { title: string; byUser: boolean; userTu
     "SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id AND m.role = 'user') AS turns FROM chats c WHERE id = ?",
     id
   )
-  return row ? { title: row.title, byUser: !!row.title_by_user, userTurns: row.turns } : null
+  return row ? { title: boxOfRow(row).open(row.title), byUser: !!row.title_by_user, userTurns: row.turns } : null
 }
 
 export function deleteChat(id: string): void {
   run('DELETE FROM chats WHERE id = ?', id)
+  forgetOwner({ kind: 'chat', id })
 }
 
 export function searchChats(query: string): { chatId: string; title: string; snippet: string }[] {
   // `%` and `_` are LIKE wildcards, so a literal search for "50%" or "read_file" matched far
   // more than the user asked for — and then the snippet could not find the term it matched on.
   const escaped = query.replace(/[\\%_]/g, (c) => `\\${c}`)
-  return all<{ chat_id: string; title: string; content: string }>(
-    `SELECT m.chat_id, c.title, m.content
+  const found = all<{ chat_id: string; title: string; content: string; created_at: number }>(
+    `SELECT m.chat_id, c.title, m.content, m.created_at
      FROM messages m JOIN chats c ON c.id = m.chat_id
-     WHERE m.content LIKE ? ESCAPE '\\' ORDER BY m.created_at DESC LIMIT 50`,
+     WHERE c.protection IS NULL AND m.content LIKE ? ESCAPE '\\' ORDER BY m.created_at DESC LIMIT 50`,
     `%${escaped}%`
-  ).map((r) => {
+  )
+  /*
+   * Protected conversations are never matched in the database, where their words are encrypted.
+   * The ones that are unlocked are searched here instead, in memory; locked ones are not searched.
+   */
+  const needle = query.toLowerCase()
+  for (const id of protectedIds('chat')) {
+    if (isLocked({ kind: 'chat', id })) continue
+    const box = chatBox(id)
+    const title = chatTitle(id) ?? ''
+    for (const r of all<{ content: string; created_at: number }>('SELECT content, created_at FROM messages WHERE chat_id = ?', id)) {
+      const content = box.open(r.content)
+      if (content.toLowerCase().includes(needle)) found.push({ chat_id: id, title, content, created_at: r.created_at })
+    }
+  }
+  return found
+    .sort((a, b) => b.created_at - a.created_at)
+    .slice(0, 50)
+    .map((r) => {
     const idx = r.content.toLowerCase().indexOf(query.toLowerCase())
     const start = Math.max(0, idx - 60)
     return {
@@ -165,6 +285,7 @@ export function searchChats(query: string): { chatId: string; title: string; sni
 }
 
 export function appendMessage(chatId: string, message: AgentMessage): void {
+  const box = chatBox(chatId)
   transaction(() => {
     /*
      * An upsert, not INSERT OR REPLACE.
@@ -194,12 +315,12 @@ export function appendMessage(chatId: string, message: AgentMessage): void {
       message.id,
       chatId,
       message.role,
-      message.content,
-      message.reasoning ?? null,
-      message.plan ?? null,
-      message.toolCalls ? JSON.stringify(message.toolCalls) : null,
-      message.toolResult ? JSON.stringify(message.toolResult) : null,
-      message.followUp ?? null,
+      box.seal(message.content),
+      box.sealOrNull(message.reasoning),
+      box.sealOrNull(message.plan),
+      message.toolCalls ? box.seal(JSON.stringify(message.toolCalls)) : null,
+      message.toolResult ? box.seal(JSON.stringify(message.toolResult)) : null,
+      box.sealOrNull(message.followUp),
       message.createdAt
     )
     run('UPDATE chats SET updated_at = ? WHERE id = ?', Date.now(), chatId)
@@ -214,17 +335,19 @@ export function appendMessage(chatId: string, message: AgentMessage): void {
  * SQLite meant a transcript that could come back with a tool result above the call that made it.
  */
 export function loadMessages(chatId: string): AgentMessage[] {
+  const box = chatBox(chatId)
+  if (box.locked) throw new LockedError('chat')
   const attachments = attachmentsByMessage(chatId)
   return all<MessageRow>('SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at, rowid', chatId).map((r) => ({
     id: r.id,
     role: r.role as AgentMessage['role'],
-    content: r.content,
+    content: box.open(r.content),
     attachments: attachments.get(r.id),
-    reasoning: r.reasoning ?? undefined,
-    plan: r.plan ?? undefined,
-    toolCalls: r.tool_calls ? JSON.parse(r.tool_calls) : undefined,
-    toolResult: r.tool_result ? JSON.parse(r.tool_result) : undefined,
-    followUp: r.follow_up ?? undefined,
+    reasoning: box.openOrNull(r.reasoning) ?? undefined,
+    plan: box.openOrNull(r.plan) ?? undefined,
+    toolCalls: r.tool_calls ? JSON.parse(box.open(r.tool_calls)) : undefined,
+    toolResult: r.tool_result ? JSON.parse(box.open(r.tool_result)) : undefined,
+    followUp: box.openOrNull(r.follow_up) ?? undefined,
     createdAt: r.created_at
   }))
 }
@@ -251,9 +374,11 @@ export function truncateFrom(chatId: string, messageId: string): number {
 export function loadSession(chatId: string): AgentSessionState | null {
   const row = get<ChatRow>('SELECT * FROM chats WHERE id = ?', chatId)
   if (!row) return null
+  const box = boxOfRow(row)
+  if (box.locked) throw new LockedError('chat')
   return {
     id: row.id,
-    title: row.title,
+    title: box.open(row.title),
     /*
      * The home directory, not the process's.
      *
@@ -268,13 +393,18 @@ export function loadSession(chatId: string): AgentSessionState | null {
     taskList: all<{ id: string; text: string; done: number }>(
       'SELECT id, text, done FROM tasks WHERE chat_id = ? ORDER BY ord',
       chatId
-    ).map((t) => ({ id: t.id, text: t.text, done: !!t.done })),
+    ).map((t) => ({ id: t.id, text: box.open(t.text), done: !!t.done })),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     contextUsed: row.context_used ?? undefined,
-    summary: row.summary ?? undefined,
+    summary: box.openOrNull(row.summary) ?? undefined,
     summaryUpto: row.summary_upto ?? undefined
   }
+}
+
+/** Whether a conversation is locked: protected by a password and not unlocked. */
+export function chatLocked(chatId: string): boolean {
+  return isLocked({ kind: 'chat', id: chatId })
 }
 
 /**
@@ -286,7 +416,7 @@ export function loadSession(chatId: string): AgentSessionState | null {
  * up, not every step it took getting there.
  */
 export function setSummary(chatId: string, summary: string, uptoMessageId: string): void {
-  run('UPDATE chats SET summary = ?, summary_upto = ? WHERE id = ?', summary, uptoMessageId, chatId)
+  run('UPDATE chats SET summary = ?, summary_upto = ? WHERE id = ?', chatBox(chatId).seal(summary), uptoMessageId, chatId)
 }
 
 /**
@@ -305,7 +435,7 @@ export function getSummary(chatId: string): { summary: string; uptoMessageId: st
     'SELECT summary, summary_upto FROM chats WHERE id = ?',
     chatId
   )
-  return row?.summary && row.summary_upto ? { summary: row.summary, uptoMessageId: row.summary_upto } : null
+  return row?.summary && row.summary_upto ? { summary: chatBox(chatId).open(row.summary), uptoMessageId: row.summary_upto } : null
 }
 
 /** How much context a conversation was last measured — or, straight after a compaction, estimated — to fill. */
@@ -328,12 +458,14 @@ export function mostRecentAgentSession(): ChatSummary | null {
  * about the session since, as JSON. See agent/prompt-state.
  */
 export function getPromptState(chatId: string): string | null {
-  return get<{ prompt_state: string | null }>('SELECT prompt_state FROM chats WHERE id = ?', chatId)?.prompt_state ?? null
+  return chatBox(chatId).openOrNull(
+    get<{ prompt_state: string | null }>('SELECT prompt_state FROM chats WHERE id = ?', chatId)?.prompt_state ?? null
+  )
 }
 
 /** Null forgets it, so the next turn fixes the prompt and tools of the moment instead. */
 export function setPromptState(chatId: string, state: string | null): void {
-  run('UPDATE chats SET prompt_state = ? WHERE id = ?', state, chatId)
+  run('UPDATE chats SET prompt_state = ? WHERE id = ?', chatBox(chatId).sealOrNull(state), chatId)
 }
 
 export function setChatCwd(chatId: string, cwd: string): void {
@@ -351,16 +483,19 @@ export function setChatModel(chatId: string, modelId: string | null): void {
 
 export function autoTitle(chatId: string): void {
   const row = get<ChatRow>('SELECT * FROM chats WHERE id = ?', chatId)
+  if (!row) return
+  const box = boxOfRow(row)
+  const current = box.open(row.title)
   // Both placeholders: agent sessions start as 'New session', and were never given a title.
-  if (!row || (row.title !== 'New chat' && row.title !== 'New session')) return
+  if (current !== 'New chat' && current !== 'New session') return
   const first = get<MessageRow>(
     "SELECT * FROM messages WHERE chat_id = ? AND role = 'user' ORDER BY created_at, rowid LIMIT 1",
     chatId
   )
   if (!first) return
   // A stand-in until the model names it, so it is not marked as a name the user chose.
-  const title = first.content.replace(/\s+/g, ' ').trim().slice(0, 60)
-  if (title) run('UPDATE chats SET title = ?, updated_at = ? WHERE id = ?', title, Date.now(), chatId)
+  const title = box.open(first.content).replace(/\s+/g, ' ').trim().slice(0, 60)
+  if (title) run('UPDATE chats SET title = ?, updated_at = ? WHERE id = ?', box.seal(title), Date.now(), chatId)
 }
 
 // ---------------------------------------------------------------- attachments
@@ -370,15 +505,18 @@ export interface AttachmentInput {
   kind: 'image' | 'audio' | 'video' | 'doc'
 }
 
-export function recordAttachment(messageId: string, att: AttachmentInput, meta?: unknown): string {
+export function recordAttachment(messageId: string, att: AttachmentInput, meta?: AttachmentMeta): string {
   const id = crypto.randomBytes(6).toString('hex')
+  const box = boxOfMessage(messageId)
+  // A protected conversation's kept copy has a name that says nothing; the name it had goes in the record.
+  const full = box.on ? { ...meta, name: meta?.name ?? path.basename(meta?.original ?? att.path) } : meta
   run(
     'INSERT INTO attachments (id, message_id, kind, path, meta, created_at) VALUES (?, ?, ?, ?, ?, ?)',
     id,
     messageId,
     att.kind,
-    att.path,
-    meta ? JSON.stringify(meta) : null,
+    storedPath(box, att.path),
+    full && Object.keys(full).length ? box.seal(JSON.stringify(full)) : null,
     Date.now()
   )
   return id
@@ -393,17 +531,19 @@ export function recordAttachment(messageId: string, att: AttachmentInput, meta?:
  */
 export function setAttachmentMeta(id: string, meta: AttachmentMeta): void {
   const row = get<{ meta: string | null }>('SELECT meta FROM attachments WHERE id = ?', id)
+  const box = boxOfAttachment(id)
   // Merged, so what preparing the file found does not erase where its kept copy came from.
   const defined = Object.fromEntries(Object.entries(meta ?? {}).filter(([, v]) => v !== undefined))
-  const merged = { ...parseMeta(row?.meta ?? null), ...defined }
-  run('UPDATE attachments SET meta = ? WHERE id = ?', Object.keys(merged).length ? JSON.stringify(merged) : null, id)
+  const merged = { ...parseMeta(box.openOrNull(row?.meta ?? null)), ...defined }
+  run('UPDATE attachments SET meta = ? WHERE id = ?', Object.keys(merged).length ? box.seal(JSON.stringify(merged)) : null, id)
 }
 
 export function attachmentsFor(messageId: string): { id: string; kind: string; path: string }[] {
+  const box = boxOfMessage(messageId)
   return all<{ id: string; kind: string; path: string }>(
     'SELECT id, kind, path FROM attachments WHERE message_id = ?',
     messageId
-  )
+  ).map((r) => ({ ...r, path: box.open(r.path) }))
 }
 
 /** What was stored alongside an attachment when the message was sent. */
@@ -414,6 +554,8 @@ export interface AttachmentMeta {
   note?: string
   /** The user's own file, when the attachment now points at the app's kept copy of it. */
   original?: string
+  /** The name to show, when the kept copy's own name says nothing (a protected conversation's). */
+  name?: string
 }
 
 function parseMeta(raw: string | null): AttachmentMeta {
@@ -434,12 +576,10 @@ function parseMeta(raw: string | null): AttachmentMeta {
 export function attachmentFile(id: string, which: 'source' | 'optimised' = 'source'): string | null {
   const row = get<{ path: string; meta: string | null }>('SELECT path, meta FROM attachments WHERE id = ?', id)
   if (!row) return null
-  if (which === 'source') return row.path
-  try {
-    return (JSON.parse(row.meta ?? '{}') as AttachmentMeta).optimised ?? null
-  } catch {
-    return null
-  }
+  const box = boxOfAttachment(id)
+  if (box.locked) return null
+  if (which === 'source') return box.open(row.path)
+  return parseMeta(box.openOrNull(row.meta)).optimised ?? null
 }
 
 /**
@@ -462,10 +602,11 @@ export function attachmentsByMessage(chatId: string): Map<string, MessageAttachm
     chatId
   )
 
+  const box = chatBox(chatId)
   const byMessage = new Map<string, MessageAttachment[]>()
   for (const r of rows) {
     const list = byMessage.get(r.message_id) ?? []
-    list.push(toMessageAttachment(r))
+    list.push(toMessageAttachment(r, box))
     byMessage.set(r.message_id, list)
   }
   return byMessage
@@ -473,10 +614,11 @@ export function attachmentsByMessage(chatId: string): Map<string, MessageAttachm
 
 /** The attachments on one message, for announcing a turn that has just been sent. */
 export function attachmentsForMessage(messageId: string): MessageAttachment[] {
+  const box = boxOfMessage(messageId)
   return all<{ id: string; kind: string; path: string; meta: string | null }>(
     'SELECT id, kind, path, meta FROM attachments WHERE message_id = ? ORDER BY created_at, rowid',
     messageId
-  ).map(toMessageAttachment)
+  ).map((r) => toMessageAttachment(r, box))
 }
 
 /** Every attachment in a conversation, with its path and extras, for keeping its files. */
@@ -487,20 +629,36 @@ export function attachmentRowsForChat(chatId: string): { id: string; kind: strin
        JOIN messages m ON m.id = a.message_id
       WHERE m.chat_id = ?`,
     chatId
-  ).map((r) => ({ id: r.id, kind: r.kind, path: r.path, meta: parseMeta(r.meta) }))
+  ).map((r) => {
+    const box = chatBox(chatId)
+    return { id: r.id, kind: r.kind, path: box.open(r.path), meta: parseMeta(box.openOrNull(r.meta)) }
+  })
 }
 
 /** Point an attachment at the app's kept copy of its file, with its extras. */
 export function setAttachmentStored(id: string, file: string, meta: AttachmentMeta): void {
-  run('UPDATE attachments SET path = ?, meta = ? WHERE id = ?', file, JSON.stringify(meta), id)
+  const box = boxOfAttachment(id)
+  run('UPDATE attachments SET path = ?, meta = ? WHERE id = ?', storedPath(box, file), box.seal(JSON.stringify(meta)), id)
 }
 
 /** Every file any attachment refers to, clips and stills included: what the kept copies must not lose. */
 export function allAttachmentPaths(): string[] {
-  return all<{ path: string; meta: string | null }>('SELECT path, meta FROM attachments').flatMap((r) => {
-    const meta = parseMeta(r.meta)
-    return [r.path, ...(meta.optimised ? [meta.optimised] : []), ...(meta.stills ?? [])]
+  // A locked conversation's records cannot be read; tidying leaves its folder alone (lockedChatIds).
+  const boxes = new Map<string, Box>()
+  return all<{ path: string; meta: string | null; chat_id: string }>(
+    'SELECT a.path, a.meta, m.chat_id FROM attachments a JOIN messages m ON m.id = a.message_id'
+  ).flatMap((r) => {
+    const box = boxes.get(r.chat_id) ?? chatBox(r.chat_id)
+    boxes.set(r.chat_id, box)
+    if (box.locked) return []
+    const meta = parseMeta(box.openOrNull(r.meta))
+    return [box.open(r.path), ...(meta.optimised ? [meta.optimised] : []), ...(meta.stills ?? [])]
   })
+}
+
+/** Protected conversations that are locked: their files are left alone, since what refers to them cannot be read. */
+export function lockedChatIds(): string[] {
+  return protectedIds('chat').filter((id) => isLocked({ kind: 'chat', id }))
 }
 
 /** One message's attachments, with their paths and extras. */
@@ -508,7 +666,10 @@ export function attachmentRowsForMessage(messageId: string): { id: string; kind:
   return all<{ id: string; kind: string; path: string; meta: string | null }>(
     'SELECT id, kind, path, meta FROM attachments WHERE message_id = ? ORDER BY created_at, rowid',
     messageId
-  ).map((r) => ({ id: r.id, kind: r.kind, path: r.path, meta: parseMeta(r.meta) }))
+  ).map((r) => {
+    const box = boxOfMessage(messageId)
+    return { id: r.id, kind: r.kind, path: box.open(r.path), meta: parseMeta(box.openOrNull(r.meta)) }
+  })
 }
 
 /** Record what a message sent the model, as stored-content JSON — see sent-content. */
@@ -518,21 +679,26 @@ export function saveSentContent(chatId: string, messageId: string, content: stri
      ON CONFLICT(message_id) DO UPDATE SET chat_id = excluded.chat_id, content = excluded.content, created_at = excluded.created_at`,
     messageId,
     chatId,
-    content,
+    chatBox(chatId).seal(content),
     Date.now()
   )
 }
 
 /** What a message sent the model, as stored-content JSON, or null when nothing beyond its text was recorded. */
 export function loadSentContent(messageId: string): string | null {
-  return get<{ content: string }>('SELECT content FROM message_content WHERE message_id = ?', messageId)?.content ?? null
+  const row = get<{ content: string; chat_id: string }>('SELECT content, chat_id FROM message_content WHERE message_id = ?', messageId)
+  return row ? chatBox(row.chat_id).open(row.content) : null
 }
 
 /** Every file a sent-content record refers to: what the kept copies must not lose. */
 export function sentContentFiles(): string[] {
-  return all<{ content: string }>('SELECT content FROM message_content').flatMap((r) => {
+  const boxes = new Map<string, Box>()
+  return all<{ content: string; chat_id: string }>('SELECT content, chat_id FROM message_content').flatMap((r) => {
     try {
-      const parts = JSON.parse(r.content) as unknown
+      const box = boxes.get(r.chat_id) ?? chatBox(r.chat_id)
+      boxes.set(r.chat_id, box)
+      if (box.locked) return []
+      const parts = JSON.parse(box.open(r.content)) as unknown
       return Array.isArray(parts)
         ? parts.flatMap((p) => (p && typeof p.file === 'string' ? [p.file as string] : []))
         : []
@@ -547,18 +713,15 @@ export function pruneSentContent(olderThan: number): void {
   run('DELETE FROM message_content WHERE created_at < ? AND message_id NOT IN (SELECT id FROM messages)', olderThan)
 }
 
-function toMessageAttachment(r: { id: string; kind: string; path: string; meta: string | null }): MessageAttachment {
-  let meta: AttachmentMeta = {}
-  try {
-    meta = JSON.parse(r.meta ?? '{}') as AttachmentMeta
-  } catch {
-    // A malformed row should cost the attachment its extras, not its place in the transcript.
-  }
+function toMessageAttachment(r: { id: string; kind: string; path: string; meta: string | null }, box: Box): MessageAttachment {
+  // A malformed row costs the attachment its extras, not its place in the transcript.
+  const meta = parseMeta(box.openOrNull(r.meta))
+  const file = box.open(r.path)
   return {
     id: r.id,
     kind: (r.kind as MessageAttachment['kind']) ?? 'doc',
-    name: path.basename(r.path),
-    bytes: fileBytes(r.path),
+    name: meta.name ?? path.basename(file),
+    bytes: fileBytes(file),
     // Checked rather than trusted: the clip lives in a scratch directory, and offering a toggle
     // that opens a dead player is worse than not offering one.
     optimised: !!meta.optimised && fs.existsSync(meta.optimised),
@@ -605,7 +768,8 @@ export function classifyAttachment(file: string): AttachmentInput['kind'] {
 
 /** Read a media file as a data URL for the OpenAI-style multimodal message format. */
 export async function toDataUrl(file: string): Promise<string> {
-  const buf = await fsp.readFile(file)
+  // A protected conversation's kept copy is decrypted on the way out.
+  const buf = await readOpen(file)
   const ext = path.extname(file).toLowerCase().slice(1)
   const mime =
     ext === 'jpg' ? 'image/jpeg' : ext === 'svg' ? 'image/svg+xml' : `image/${ext}`

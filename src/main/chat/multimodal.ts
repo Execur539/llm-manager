@@ -24,6 +24,7 @@ import { planVideo, chooseTimestamps, type VideoDetail } from './video-plan'
 import { runtimeBinary } from '../runtime/binaries'
 import { TOOL_OUTPUT_DIR } from '../storage/paths'
 import { classifyAttachment, toDataUrl } from './repo'
+import { readOpen } from '../protect/keys'
 import { extractText } from '../rag/index'
 
 /**
@@ -1058,7 +1059,8 @@ export async function buildContent(
         notes.push(`${path.basename(file)} skipped: the loaded model does not accept audio input.`)
         continue
       }
-      const buf = await fsp.readFile(file)
+      // A protected conversation's kept copy is decrypted on the way to the model.
+      const buf = await readOpen(file)
       parts.push({
         type: 'input_audio',
         input_audio: { data: buf.toString('base64'), format: path.extname(file).slice(1) || 'wav' }

@@ -354,6 +354,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (wantsTool) {
+      // A reasoning model thinks first and then goes straight to the call, with no words between.
+      if (marker(messages, 'think')) {
+        for (const token of tokenise(THINKING).slice(0, 24)) {
+          if (aborted) return
+          send(frame({ reasoning_content: token }))
+          await sleep(delay)
+        }
+      }
       const calls = buildToolCalls(body.tools, toolCount, namedTool, forcedArgs)
       // Emit arguments split across frames, the way llama.cpp does, so the client's fragment
       // accumulation is genuinely exercised rather than receiving one tidy object.

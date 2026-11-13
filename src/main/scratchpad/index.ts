@@ -5,13 +5,18 @@
 
 import os from 'node:os'
 import { loadSettings } from '../storage/settings'
+import { recordOf } from '../protect/keys'
 import { logger } from '../log'
 import { Scratchpad, clearOwnedFolder } from './store'
 import { ScratchServer } from './serve'
 
-/** The chosen folder when the setting says to use one, otherwise null: memory. */
-function folder(): string | null {
+/**
+ * The chosen folder when the setting says to use one, otherwise null: memory. A protected
+ * conversation's scratchpad is always in memory, so nothing of it is ever written out plain.
+ */
+function folder(chatId?: string): string | null {
   const s = loadSettings().scratchpad
+  if (chatId && recordOf({ kind: 'chat', id: chatId })) return null
   return s?.location === 'folder' && s.folder ? s.folder : null
 }
 

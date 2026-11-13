@@ -38,6 +38,7 @@ export type IconName =
   | 'resume'
   | 'sidebar'
   | 'sliders'
+  | 'lock'
 
 /** Path data only — the wrapper supplies sizing, colour and stroke. */
 const PATHS: Record<IconName, JSX.Element> = {
@@ -120,6 +121,12 @@ const PATHS: Record<IconName, JSX.Element> = {
     />
   ),
   check: <path d="m5 13 4.5 4.5L19 7" />,
+  lock: (
+    <>
+      <rect x="5" y="10.5" width="14" height="10" rx="2.5" />
+      <path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3" />
+    </>
+  ),
   alert: (
     <>
       <path d="M12 4l9 16H3l9-16Z" />

@@ -274,6 +274,8 @@ export type StreamEvent =
    * model it is frequently the larger half.
    */
   | { type: 'context'; used: number; max: number }
+  /** How fast the reply is being written, as the server measures it, a couple of times a second. */
+  | { type: 'speed'; tokensPerSecond: number; tokens: number }
 
 export interface Timings {
   ttftMs: number | null
@@ -360,6 +362,18 @@ export class LlamaRuntime extends EventEmitter {
   assumeHeld(req: Parameters<typeof shapeOf>[0]): void {
     this.lastShape = shapeOf(req)
     this.lastWasReadAhead = false
+  }
+
+  /**
+   * Make the server let go of the conversation it holds: its slot emptied and nothing recorded as
+   * held. For a conversation that has just been locked, whose words should not stay in the server.
+   */
+  async eraseHeld(): Promise<void> {
+    const loaded = this.current
+    this.lastShape = null
+    this.lastWasReadAhead = false
+    if (!loaded) return
+    await fetch(`http://127.0.0.1:${loaded.port}/slots/0?action=erase`, { method: 'POST' }).catch(() => undefined)
   }
 
   /** Where and under what identity states are saved, when the running server can save them. */
@@ -869,6 +883,8 @@ export class LlamaRuntime extends EventEmitter {
      * this needs no version check — the events simply never arrive and the UI never shows a bar.
      */
     if (stream) body.return_progress = true
+    // The server's own count and speed on every frame, for the live tok/s while a reply is written.
+    if (stream) body.timings_per_token = true
     /*
      * The rest of the sampling parameters, each only when set, so the model's own default applies
      * otherwise. Field names come from the same table the parameters panel is drawn from.
@@ -938,6 +954,7 @@ export class LlamaRuntime extends EventEmitter {
     const maxContext = loaded.plan.contextLength
     let generatedTokens = 0
     let contextSentAt = 0
+    let speedSentAt = 0
     /** At most twice a second: often enough to look live, rarely enough not to flood the bridge. */
     const CONTEXT_INTERVAL_MS = 500
 
@@ -1048,7 +1065,16 @@ export class LlamaRuntime extends EventEmitter {
            * Not for work done in the background, which is not what anyone waits for.
            */
           const t = json.timings
-          if (t && !opts.background && !opts.processOnly && (t.predicted_n ?? 0) >= 32 && (t.predicted_per_second ?? 0) > 0) {
+          /*
+           * Every frame carries the server's timings now. While the reply is being written they are
+           * the live reading; the last frame's (the one that says why it finished) is the record.
+           */
+          if (t && !opts.background && (t.predicted_n ?? 0) >= 4 && (t.predicted_per_second ?? 0) > 0 && Date.now() - speedSentAt >= 400) {
+            speedSentAt = Date.now()
+            yield { type: 'speed', tokensPerSecond: t.predicted_per_second ?? 0, tokens: t.predicted_n ?? 0 }
+          }
+          const lastFrame = !!json.choices?.[0]?.finish_reason
+          if (t && lastFrame && !opts.background && !opts.processOnly && (t.predicted_n ?? 0) >= 32 && (t.predicted_per_second ?? 0) > 0) {
             this.emit('decodeSpeed', {
               tokensPerSecond: t.predicted_per_second,
               tokens: t.predicted_n,

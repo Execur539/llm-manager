@@ -5,7 +5,6 @@ import {
   select,
   setRunning,
   takePending,
-  dropPending,
   useStream,
   clearFor,
   toast,
@@ -33,10 +32,14 @@ import MediaStage from '../components/MediaStage'
 import ContextMeter from '../components/ContextMeter'
 import CompactingNotice from '../components/CompactingNotice'
 import KeepReadyButton from '../components/KeepReadyButton'
+import { LockedPanel, ProtectButton } from '../components/Protect'
+import ConfirmDialog from '../components/ConfirmDialog'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
 import ToolCard from '../components/ToolCard'
+import PendingToolCall from '../components/PendingToolCall'
+import SavedState from '../components/SavedState'
 import ParametersPanel, { ParamsToggle, useParamsPanel } from '../components/ParametersPanel'
 
 interface Collection {
@@ -66,11 +69,18 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   const media = activeId ? (stream.mediaStage[activeId] ?? null) : null
   // The scratchpad tool the model is running right now, if any.
   const toolRunning = activeId ? (stream.chatToolRunning[activeId] ?? null) : null
+  // Scratchpad calls the model is still writing.
+  const writing = activeId ? (stream.pendingCalls[activeId] ?? []) : []
   const ctx = activeId ? (stream.context[activeId] ?? null) : null
   const compacting = activeId ? (stream.compacting[activeId] ?? null) : null
   const summaryUpto = activeId ? (stream.summaryUpto[activeId] ?? null) : null
+  const activeChat = chats.find((c) => c.id === activeId)
+  // Protected with a password and not unlocked: nothing of it can be shown or sent to.
+  const sealed = !!activeChat?.locked
   // Mid-compaction the conversation takes no input, exactly as while a reply is being written.
-  const locked = busy || !!compacting
+  const locked = busy || !!compacting || sealed
+  const [reloadTick, setReloadTick] = useState(0)
+  const [confirmExport, setConfirmExport] = useState(false)
   // Usable before the first message: the choice is held against a draft key and adopted by
   // whatever conversation the message goes on to create.
   const effortId = activeId ?? DRAFT_CHAT
@@ -112,6 +122,17 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   // The model names chats in the background once a reply is in, and renames them later.
   useEffect(() => on('chat:titled', () => void refreshChats()), [])
 
+  // Protected, unlocked or locked: the list says so, and the open conversation is read again.
+  useEffect(
+    () =>
+      on<{ kind: string; id: string }>('protect:changed', (d) => {
+        void refreshChats()
+        if (d.kind === 'chat') setReloadTick((n) => n + 1)
+        if (d.kind === 'collection') void invoke<Collection[]>('rag:collections').then(setCollections).catch(() => undefined)
+      }),
+    []
+  )
+
   // Reload history whenever the selected conversation changes — including on remount, which is
   // what restores the view after navigating away mid-response. The database is authoritative
   // because the main process persists each message before emitting it, so anything buffered
@@ -132,12 +153,20 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
       // So the meter reads correctly on reopening rather than staying blank until the next turn.
       seedContext(activeId, session?.contextUsed, loaded?.plan.contextLength ?? 0)
       seedSummary(activeId, session?.summaryUpto ?? null)
-      dropPending(activeId)
+      // Anything that arrived while this was loading joins it, matched by id, rather than being dropped.
+      const queued = takePending(activeId)
+      if (queued.length) {
+        setMessages((prev) => {
+          const byId = new Map(prev.map((m) => [m.id, m]))
+          for (const m of queued) byId.set(m.id, m)
+          return [...byId.values()]
+        })
+      }
     })()
     return () => {
       cancelled = true
     }
-  }, [activeId, loaded?.plan.contextLength])
+  }, [activeId, loaded?.plan.contextLength, reloadTick])
 
   // Absorb anything that arrived while this view was unmounted. A repeated id replaces the copy
   // already on screen rather than being dropped, so a message that is revised after it was first
@@ -178,9 +207,20 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
     await refreshChats()
   }
 
+  const exportActive = (): void => {
+    if (!activeId) return
+    // Fire-and-forget used to mean the button looked broken: a dialog appeared, then nothing.
+    // Report the written path, or the failure, either way.
+    void invoke<string | null>('chat:export', activeId, 'md')
+      .then((file) => {
+        if (file) toast(`Exported to ${file}`, 'success', file)
+      })
+      .catch((err: unknown) => toast(`Export failed: ${String(err)}`, 'error'))
+  }
+
   const send = async (): Promise<void> => {
     // Not mid-compaction either: a message sent then lands in a history about to be rewritten.
-    if ((!input.trim() && !attachments.items.length) || busy || compacting || !loaded) return
+    if ((!input.trim() && !attachments.items.length) || busy || compacting || sealed || !loaded) return
 
     let chatId = activeId
     if (!chatId) {
@@ -270,16 +310,14 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
             </button>
           )}
           <KeepReadyButton stateKey={activeId ? `chat:${activeId}` : null} />
+          <ProtectButton kind="chat" id={activeId} state={activeChat} disabled={busy || !!compacting} />
           {activeId && (
             <button
+              disabled={sealed}
               onClick={() => {
-                // Fire-and-forget used to mean the button looked broken: a dialog appeared, then
-                // nothing. Report the written path, or the failure, either way.
-                void invoke<string | null>('chat:export', activeId, 'md')
-                  .then((file) => {
-                    if (file) toast(`Exported to ${file}`, 'success', file)
-                  })
-                  .catch((err: unknown) => toast(`Export failed: ${String(err)}`, 'error'))
+                // A protected conversation is exported as plain text, so that is said first.
+                if (activeChat?.protected) setConfirmExport(true)
+                else exportActive()
               }}
               title="Export this conversation"
               data-testid="export-chat"
@@ -303,7 +341,8 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
 
         <div className="messages" data-testid="chat-messages" ref={scrollRef}>
           <div className="messages-content" ref={contentRef}>
-          {!messages.length && !partial && (
+          {sealed && activeId && <LockedPanel kind="chat" id={activeId} password={activeChat?.password !== false} />}
+          {!messages.length && !partial && !sealed && (
             <EmptyState
               icon="chat"
               title={collectionId ? 'Ask about your documents' : 'Start a conversation'}
@@ -352,17 +391,25 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
             </Fragment>
           ))}
 
-          {toolRunning && <ToolCard call={toolRunning} />}
-
+          {/*
+            * In the order it happened: the thinking and words of this round, then the calls the
+            * model is writing, then the call that is running.
+            */}
           {(partial || reasoning || ultra.length > 0) && (
             <MessageRow role="assistant" testId="streaming-message">
               <UltraSamples samples={ultra} synthesising={synthesising} />
-              {reasoning && <ThinkingBlock text={reasoning} streaming answerStarted={!!partial} />}
-              <div className="body streaming">
-                <Markdown source={partial} caret />
-              </div>
+              {reasoning && <ThinkingBlock text={reasoning} streaming answerStarted={!!partial || writing.length > 0} />}
+              {partial && (
+                <div className="body streaming">
+                  <Markdown source={partial} caret={!writing.length} />
+                </div>
+              )}
             </MessageRow>
           )}
+          {writing.map((c) => (
+            <PendingToolCall key={c.index} name={c.name} args={c.args} />
+          ))}
+          {toolRunning && <ToolCard call={toolRunning} />}
           {busy && !compacting && (progress || (!partial && !reasoning && !ultra.length)) && (
             <MessageRow role="assistant">
               {/*
@@ -462,6 +509,13 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
                 onSamplesChange={setUltraSamples}
               />
               <span className="composer-spacer" />
+              {/* Live while the model writes: the server's own measure of how fast. */}
+              {busy && activeId && stream.speed[activeId] ? (
+                <span className="live-speed" data-testid="live-speed" title="How fast the reply is being written, as the server measures it">
+                  {stream.speed[activeId].toFixed(stream.speed[activeId] < 10 ? 1 : 0)} tok/s
+                </span>
+              ) : null}
+              <SavedState stateKey={activeId ? `chat:${activeId}` : null} />
               {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
               <button
                 className={`send-button${busy ? ' stopping' : ''}`}
@@ -479,6 +533,22 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
         </div>
       </div>
       </DropZone>
+      <ConfirmDialog
+        open={confirmExport}
+        title="Export as plain text?"
+        body={
+          <p>
+            This conversation is protected, but the exported file is not encrypted: any program that can read the folder you
+            save it to can read it.
+          </p>
+        }
+        confirmLabel="Export"
+        onConfirm={() => {
+          setConfirmExport(false)
+          exportActive()
+        }}
+        onCancel={() => setConfirmExport(false)}
+      />
       {paramsOpen && (
         <ParametersPanel kind="chat" modelId={loaded?.modelId ?? null} onClose={() => setParamsOpen(false)} />
       )}

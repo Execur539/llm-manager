@@ -2640,6 +2640,40 @@ const scenarios = {
    * call shows in the transcript with the frames it returned, the scratchpad reports what it holds,
    * and deleting the conversation empties it.
    */
+  /**
+   * A step that thinks and then goes straight to a tool call, caught while the call is written.
+   *
+   * The thinking came first, so it sits above the call; and it has ended, so it no longer says
+   * "Thinking…". The call card used to sit above the thinking that led to it, and the thinking
+   * kept saying it was still going until the call had been written out.
+   */
+  async streamOrder() {
+    await withApp('stream-order', async ({ page }) => {
+      await loadModel(page)
+      await goTo(page, 'Agent')
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await page.getByTestId('agent-input').fill('[[mock:think]] [[mock:tool]] [[mock:slow]] look around')
+      await page.getByTestId('agent-send').click()
+      const seen = await page.waitForSelector('[data-testid="pending-tool-call"]', { timeout: 30000 }).then(() => true).catch(() => false)
+      report.check('stream-order', 'a call being written is shown', seen)
+      if (!seen) return
+      const layout = await page.evaluate(() => {
+        const think = document.querySelector('[data-testid="streaming-message"] [data-testid="thinking-block"]')
+        const call = document.querySelector('[data-testid="pending-tool-call"]')
+        return {
+          thinkTop: think ? think.getBoundingClientRect().top : null,
+          callTop: call ? call.getBoundingClientRect().top : null,
+          label: think?.querySelector('.thinking-label')?.textContent ?? null
+        }
+      })
+      report.check('stream-order', 'the thinking sits above the call it led to',
+        layout.thinkTop !== null && layout.callTop !== null && layout.thinkTop < layout.callTop, JSON.stringify(layout))
+      report.check('stream-order', 'and reads as finished once the call has started', layout.label !== null && !/Thinking/.test(layout.label), String(layout.label))
+      await shot(page, 'stream-order')
+    })
+  },
+
   async chatScratchpad() {
     await withApp('chat-scratchpad', async ({ app, page, env }) => {
       const ffmpeg = path.join(ROOT, 'vendor', 'ffmpeg', 'ffmpeg.exe')

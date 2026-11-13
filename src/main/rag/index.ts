@@ -19,6 +19,17 @@ import crypto from 'node:crypto'
 import { spawn, ChildProcess } from 'node:child_process'
 import net from 'node:net'
 import { all, get, run, transaction } from '../storage/db'
+import {
+  LockedError,
+  chatBox,
+  collectionBox,
+  forgetOwner,
+  isLocked,
+  plainBox,
+  primeRecord,
+  statusOf,
+  type Box
+} from '../protect/keys'
 import { childEnv, embeddingModelPath, llamaServerPath } from '../runtime/binaries'
 import type { Backend } from '@shared/types'
 
@@ -375,16 +386,44 @@ export function createCollection(name: string): { id: string; name: string } {
   return { id, name }
 }
 
-export function listCollections(): { id: string; name: string; documents: number }[] {
-  return all<{ id: string; name: string; documents: number }>(
-    `SELECT c.id, c.name, COUNT(d.id) AS documents
+export interface CollectionSummary {
+  id: string
+  name: string
+  documents: number
+  protected?: boolean
+  locked?: boolean
+  password?: boolean
+}
+
+export function listCollections(): CollectionSummary[] {
+  return all<{ id: string; name: string; documents: number; protection: string | null }>(
+    `SELECT c.id, c.name, c.protection, COUNT(d.id) AS documents
      FROM collections c LEFT JOIN documents d ON d.collection_id = c.id
-     GROUP BY c.id ORDER BY c.name`
+     GROUP BY c.id`
   )
+    .map((r) => {
+      const owner = { kind: 'collection' as const, id: r.id }
+      primeRecord(owner, r.protection)
+      const status = statusOf(owner)
+      if (!status.protected) return { id: r.id, name: r.name, documents: r.documents }
+      // A locked collection shows only that it is there.
+      return status.locked
+        ? { id: r.id, name: 'Locked collection', documents: 0, protected: true, locked: true, password: status.password }
+        : { id: r.id, name: collectionBox(r.id).open(r.name), documents: r.documents, protected: true, locked: false, password: status.password }
+    })
+    .sort((a, b) => a.name.localeCompare(b.name))
 }
 
 export function deleteCollection(id: string): void {
   run('DELETE FROM collections WHERE id = ?', id)
+  forgetOwner({ kind: 'collection', id })
+}
+
+/** How a document's text is stored: under its collection's key, or its conversation's, when that is protected. */
+function boxOfDocument(collectionId: string | null | undefined, chatId: string | null | undefined): Box {
+  if (collectionId) return collectionBox(collectionId)
+  if (chatId) return chatBox(chatId)
+  return plainBox()
 }
 
 /** Ingest one file: extract, chunk, embed, store. */
@@ -395,6 +434,9 @@ export async function ingestDocument(
   embeddingModelOverride?: string,
   onProgress?: (done: number, total: number) => void
 ): Promise<DocumentRecord> {
+  // Checked before the work of reading and embedding it, which could not be stored at the end.
+  const box = boxOfDocument(target.collectionId, target.chatId)
+  if (box.locked) throw new LockedError(target.collectionId ? 'collection' : 'chat')
   const st = await fsp.stat(file)
   const text = await extractText(file)
   const chunks = chunkText(text)
@@ -409,22 +451,24 @@ export async function ingestDocument(
   const docId = crypto.randomBytes(8).toString('hex')
   const dim = vectors[0]?.length ?? 0
 
+  // Asked again as it is stored: the collection may have been protected while this was being read.
+  const store = boxOfDocument(target.collectionId, target.chatId)
   transaction(() => {
     run(
       'INSERT INTO documents (id, collection_id, chat_id, filename, path, mime, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       docId,
       target.collectionId ?? null,
       target.chatId ?? null,
-      path.basename(file),
-      file,
+      store.seal(path.basename(file)),
+      store.seal(file),
       null,
       st.size,
       Date.now()
     )
     chunks.forEach((chunkText, i) => {
       const chunkId = `${docId}-${i}`
-      run('INSERT INTO chunks (id, document_id, ord, text, tokens) VALUES (?, ?, ?, ?, ?)', chunkId, docId, i, chunkText, Math.ceil(chunkText.length / 4))
-      run('INSERT INTO embeddings (chunk_id, dim, vector, embed_model) VALUES (?, ?, ?, ?)', chunkId, dim, toBlob(vectors[i]), 'bundled')
+      run('INSERT INTO chunks (id, document_id, ord, text, tokens) VALUES (?, ?, ?, ?, ?)', chunkId, docId, i, store.seal(chunkText), Math.ceil(chunkText.length / 4))
+      run('INSERT INTO embeddings (chunk_id, dim, vector, embed_model) VALUES (?, ?, ?, ?)', chunkId, dim, store.sealBlob(toBlob(vectors[i])), 'bundled')
     })
   })
 
@@ -455,16 +499,23 @@ export function listDocuments(filter: { collectionId?: string; chatId?: string }
           'SELECT * FROM documents ORDER BY created_at DESC'
         )
 
-  return rows.map((r) => ({
-    id: r.id,
-    collectionId: r.collection_id,
-    chatId: r.chat_id,
-    filename: r.filename,
-    path: r.path,
-    mime: r.mime,
-    bytes: r.bytes,
-    chunks: get<{ n: number }>('SELECT COUNT(*) AS n FROM chunks WHERE document_id = ?', r.id)?.n ?? 0
-  }))
+  return rows.flatMap((r) => {
+    // A locked collection's or conversation's documents are not listed until it is unlocked.
+    const box = boxOfDocument(r.collection_id, r.chat_id)
+    if (box.locked) return []
+    return [
+      {
+        id: r.id,
+        collectionId: r.collection_id,
+        chatId: r.chat_id,
+        filename: box.open(r.filename),
+        path: box.open(r.path),
+        mime: r.mime,
+        bytes: r.bytes,
+        chunks: get<{ n: number }>('SELECT COUNT(*) AS n FROM chunks WHERE document_id = ?', r.id)?.n ?? 0
+      }
+    ]
+  })
 }
 
 export function deleteDocument(id: string): void {
@@ -493,6 +544,8 @@ export async function retrieve(
   k = 6,
   embeddingModelOverride?: string
 ): Promise<RetrievedChunk[]> {
+  // Asked of a locked collection: said plainly rather than answered from nothing.
+  if (scope.collectionId && isLocked({ kind: 'collection', id: scope.collectionId })) throw new LockedError('collection')
   const [queryVector] = await embeddings.embed([query], backend, embeddingModelOverride)
   if (!queryVector) return []
 
@@ -519,13 +572,15 @@ export async function retrieve(
 
   const rows = all<{
     document_id: string
+    collection_id: string | null
+    chat_id: string | null
     filename: string
     ord: number
     text: string
     dim: number
     vector: Uint8Array
   }>(
-    `SELECT c.document_id, d.filename, c.ord, c.text, e.dim, e.vector
+    `SELECT c.document_id, d.collection_id, d.chat_id, d.filename, c.ord, c.text, e.dim, e.vector
      FROM chunks c
      JOIN embeddings e ON e.chunk_id = c.id
      JOIN documents d ON d.id = c.document_id
@@ -534,14 +589,23 @@ export async function retrieve(
   )
 
   const q = new Float32Array(queryVector)
+  const boxes = new Map<string, Box>()
   return rows
-    .map((r) => ({
-      documentId: r.document_id,
-      filename: r.filename,
-      ord: r.ord,
-      text: r.text,
-      score: cosine(q, fromBlob(r.vector, r.dim))
-    }))
+    .flatMap((r) => {
+      const ref = `${r.collection_id ?? ''}/${r.chat_id ?? ''}`
+      const box = boxes.get(ref) ?? boxOfDocument(r.collection_id, r.chat_id)
+      boxes.set(ref, box)
+      if (box.locked) return []
+      return [
+        {
+          documentId: r.document_id,
+          filename: box.open(r.filename),
+          ord: r.ord,
+          text: box.open(r.text),
+          score: cosine(q, fromBlob(box.openBlob(r.vector), r.dim))
+        }
+      ]
+    })
     .sort((a, b) => b.score - a.score)
     .slice(0, k)
 }

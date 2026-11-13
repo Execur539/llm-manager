@@ -1188,6 +1188,9 @@ export class Agent extends EventEmitter {
           if (ev.type === 'context') {
             this.emit('contextUsed', { used: ev.used, max: ev.max })
           }
+          if (ev.type === 'speed') {
+            this.emit('speed', { tokensPerSecond: ev.tokensPerSecond, tokens: ev.tokens })
+          }
           /*
            * Forwarded as it is written, so the transcript can show what is being composed.
            *

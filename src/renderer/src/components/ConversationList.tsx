@@ -12,6 +12,11 @@ export interface ChatSummary {
   cwd?: string | null
   updatedAt: number
   messageCount: number
+  /** Stored encrypted. */
+  protected?: boolean
+  /** Protected by a password and not unlocked: only that it exists and when it was used are shown. */
+  locked?: boolean
+  password?: boolean
 }
 
 /**
@@ -130,11 +135,17 @@ export default function ConversationList({
             ) : (
               <>
                 <div className="side-item-row">
+                  {item.protected && (
+                    <span className={`side-lock${item.locked ? ' locked' : ''}`} title={item.locked ? 'Locked' : 'Protected'} data-testid="conversation-lock">
+                      <Icon name="lock" size={12} />
+                    </span>
+                  )}
                   <span className="truncate">{item.title}</span>
                   {runningIds[item.id] && <span className="dot-pulse" title="Response in progress" />}
                 </div>
                 <div className="faint side-item-meta">
-                  {item.messageCount} {item.messageCount === 1 ? 'message' : 'messages'} · {fmtRelative(item.updatedAt)}
+                  {item.locked ? 'Locked' : `${item.messageCount} ${item.messageCount === 1 ? 'message' : 'messages'}`} ·{' '}
+                  {fmtRelative(item.updatedAt)}
                 </div>
               </>
             )}
@@ -182,6 +193,7 @@ export default function ConversationList({
                   </>
                 ) : (
                   <>
+                    {!item.locked && (
                     <button
                       className="row-action"
                       title="Rename"
@@ -195,6 +207,7 @@ export default function ConversationList({
                     >
                       <Icon name="pencil" size={13} />
                     </button>
+                    )}
                     <button
                       className="row-action danger"
                       title="Delete"

@@ -56,19 +56,13 @@ html.desktop .brand .badge {
   -webkit-app-region: no-drag;
 }
 
+/* The mark itself, no tile: the same speech bubble the exe and the tray wear. */
 .brand-mark {
-  display: grid;
-  place-items: center;
+  display: block;
   flex-shrink: 0;
-  width: 24px;
-  height: 24px;
-  border-radius: 7px;
-  color: #fff;
-  background: linear-gradient(165deg, #45a2ff 0%, #0a74ec 55%, #075ccc 100%);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.28),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.18),
-    0 1px 3px rgba(0, 0, 0, 0.45);
+  width: 22px;
+  height: 22px;
+  user-select: none;
 }
 
 .brand-name {
@@ -1085,4 +1079,121 @@ html.desktop .titlebar .reasoning {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+}
+
+/* ---------------------------------------------------------------- protected conversations */
+
+/* Before the title: protected, and dimmer still when it is locked. */
+.side-lock {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-faint);
+}
+
+.side-item.active .side-lock {
+  color: rgba(214, 232, 255, 0.72);
+}
+
+.protect-field {
+  display: block;
+  margin-top: 12px;
+}
+
+.protect-field span {
+  display: block;
+  margin-bottom: 6px;
+  font-size: var(--fs-xs);
+}
+
+.protect-field input {
+  width: 100%;
+}
+
+.protect-error {
+  margin-top: 12px;
+  color: var(--bad);
+  font-size: var(--fs-sm);
+}
+
+.protect-actions {
+  justify-content: flex-start;
+}
+
+.protect-actions .primary {
+  margin-left: auto;
+}
+
+.recovery-key {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: var(--r-lg);
+  background: var(--surface-1);
+  box-shadow: 0 0 0 1px var(--hairline);
+}
+
+.recovery-key code {
+  font-size: 15px;
+  letter-spacing: 0.06em;
+  color: var(--text);
+  user-select: all;
+}
+
+.protect-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+}
+
+/* In place of a locked conversation's transcript. */
+.locked-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+  padding: 48px 24px 72px;
+  text-align: center;
+  animation: fade-in var(--dur-slow) var(--ease);
+}
+
+.locked-icon {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  margin-bottom: 16px;
+  border-radius: 15px;
+  background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
+  box-shadow: var(--lift), 0 0 0 1px var(--hairline);
+  color: var(--text-dim);
+}
+
+.locked-panel h2 {
+  margin: 0;
+  font-family: var(--display);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.locked-panel p {
+  margin: 6px 0 18px;
+}
+
+.locked-panel form {
+  display: flex;
+  gap: 8px;
+  width: min(360px, 100%);
+}
+
+.locked-panel input {
+  flex: 1;
+  min-width: 0;
 }

@@ -10,6 +10,7 @@ import type { Tool } from './base'
 import { schema, str, bool } from './base'
 import { addMemory, allMemory, deleteMemory, searchMemory, updateMemory } from '../memory'
 import { all, run } from '../../storage/db'
+import { chatBox } from '../../protect/keys'
 
 export interface AgentToolDeps {
   spawnSubAgent: (prompt: string, cwd?: string) => Promise<string>
@@ -71,12 +72,14 @@ export function makeAgentTools(deps: AgentToolDeps): Tool[] {
       const tasks = (args.tasks as string[]) ?? []
       const sessionId = String(args.session_id)
       const existing = all<TaskRow>('SELECT * FROM tasks WHERE chat_id = ?', sessionId).length
+      // Encrypted with the rest of the conversation when it is protected.
+      const box = chatBox(sessionId)
       tasks.forEach((t, i) => {
         run(
           'INSERT INTO tasks (id, chat_id, text, done, ord) VALUES (?, ?, ?, 0, ?)',
           crypto.randomBytes(6).toString('hex'),
           sessionId,
-          t,
+          box.seal(t),
           existing + i
         )
       })
@@ -92,10 +95,14 @@ export function makeAgentTools(deps: AgentToolDeps): Tool[] {
     async run(args) {
       const sessionId = String(args.session_id)
       const needle = String(args.task)
-      run('UPDATE tasks SET done = 1 WHERE chat_id = ? AND (id = ? OR text = ?)', sessionId, needle, needle)
+      // Matched here rather than in SQL: a protected conversation's task text is stored encrypted.
+      const box = chatBox(sessionId)
+      for (const t of all<TaskRow>('SELECT * FROM tasks WHERE chat_id = ?', sessionId)) {
+        if (t.id === needle || box.open(t.text) === needle) run('UPDATE tasks SET done = 1 WHERE id = ?', t.id)
+      }
       const remaining = all<TaskRow>('SELECT * FROM tasks WHERE chat_id = ? AND done = 0', sessionId)
       return remaining.length
-        ? `Done. Remaining:\n${remaining.map((t) => `- ${t.text}`).join('\n')}`
+        ? `Done. Remaining:\n${remaining.map((t) => `- ${box.open(t.text)}`).join('\n')}`
         : 'Done. All tasks complete.'
     }
   }
@@ -108,7 +115,8 @@ export function makeAgentTools(deps: AgentToolDeps): Tool[] {
     async run(args) {
       const tasks = all<TaskRow>('SELECT * FROM tasks WHERE chat_id = ? ORDER BY ord', String(args.session_id))
       if (!tasks.length) return 'No tasks recorded.'
-      return tasks.map((t) => `[${t.done ? 'x' : ' '}] ${t.text}`).join('\n')
+      const box = chatBox(String(args.session_id))
+      return tasks.map((t) => `[${t.done ? 'x' : ' '}] ${box.open(t.text)}`).join('\n')
     }
   }
 

@@ -590,6 +590,8 @@ export interface AgentMessage {
 export interface AgentSessionState {
   id: string
   title: string
+  /** Protected by a password and not unlocked: nothing else here is filled in. */
+  locked?: boolean
   cwd: string
   planMode: boolean
   messages: AgentMessage[]

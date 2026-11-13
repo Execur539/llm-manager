@@ -25,20 +25,25 @@ export default function ThinkingBlock({
   /** The answer has begun, so the thinking is no longer the main event. */
   answerStarted?: boolean
 }): JSX.Element | null {
-  const [open, setOpen] = useState(streaming)
+  /*
+   * Still thinking: reasoning is arriving and nothing else has started. A reply, or a tool call
+   * the model went straight to, ends the thinking, even while that reply is still being written.
+   */
+  const live = streaming && !answerStarted
+  const [open, setOpen] = useState(live)
   // Once the reader has expressed a preference, stop overriding it.
   const touched = useRef(false)
   const bodyRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (touched.current) return
-    setOpen(streaming && !answerStarted)
-  }, [streaming, answerStarted])
+    setOpen(live)
+  }, [live])
 
   // Follow the thinking as it arrives, but only while it is the thing being watched.
   useEffect(() => {
-    if (open && streaming) bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight })
-  }, [text, open, streaming])
+    if (open && live) bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight })
+  }, [text, open, live])
 
   if (!text.trim()) return null
 
@@ -54,14 +59,14 @@ export default function ThinkingBlock({
         data-testid="thinking-toggle"
       >
         <Icon name="chevron" size={13} className="thinking-chevron" />
-        <span className={`thinking-label${streaming ? ' live' : ''}`}>{streaming ? 'Thinking…' : 'Thought process'}</span>
-        {!streaming && <span className="thinking-size">{approxWords(text)} words</span>}
+        <span className={`thinking-label${live ? ' live' : ''}`}>{live ? 'Thinking…' : 'Thought process'}</span>
+        {!live && <span className="thinking-size">{approxWords(text)} words</span>}
       </button>
 
       {open && (
         <div className="thinking-body" ref={bodyRef} data-testid="thinking-body">
           {text}
-          {streaming && <span className="cursor" />}
+          {live && <span className="cursor" />}
         </div>
       )}
     </div>

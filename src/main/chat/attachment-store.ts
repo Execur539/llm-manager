@@ -19,16 +19,18 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { nativeImage } from 'electron'
-import { ATTACHMENTS_DIR } from '../storage/paths'
+import { ATTACHMENTS_DIR, TOOL_OUTPUT_DIR } from '../storage/paths'
 import { logger } from '../log'
 import {
   allAttachmentPaths,
   attachmentRowsForChat,
   classifyAttachment,
+  lockedChatIds,
   pruneSentContent,
   sentContentFiles,
   setAttachmentStored
 } from './repo'
+import { bytesFor, chatBox, keyOf, readOpen } from '../protect/keys'
 import type { BlobStore } from './sent-content'
 
 /** Media a message sent that is not one of its kept attachments, one folder per conversation, named by content. */
@@ -50,17 +52,22 @@ async function newSlot(chatId: string): Promise<string> {
   return dir
 }
 
-/** Writes a reduced copy when the image needs one; false when a plain copy will do. */
-async function writeReducedImage(file: string, dest: string): Promise<boolean> {
+/** A reduced copy's bytes when the image needs one; null when it is kept as it came. */
+function reducedImage(file: string): Buffer | null {
   const image = nativeImage.createFromPath(file)
   // Empty for a format Electron cannot decode, which is then kept exactly as it came.
-  if (image.isEmpty()) return false
+  if (image.isEmpty()) return null
   const { width, height } = image.getSize()
   const plan = planImageCopy({ width, height, ext: path.extname(file) })
-  if (plan.action === 'copy') return false
+  if (plan.action === 'copy') return null
   const reduced = image.resize({ width: plan.width, height: plan.height, quality: 'best' })
-  await fsp.writeFile(dest, plan.format === 'jpeg' ? reduced.toJPEG(90) : reduced.toPNG())
-  return true
+  return plan.format === 'jpeg' ? reduced.toJPEG(90) : reduced.toPNG()
+}
+
+/** A file the app staged itself (a paste, a remote upload), which nothing needs once it is kept. */
+function isStaged(file: string): boolean {
+  const rel = path.relative(TOOL_OUTPUT_DIR, path.resolve(file))
+  return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel)
 }
 
 /**
@@ -73,9 +80,22 @@ export async function storeAttachment(chatId: string, file: string): Promise<str
   const kind = classifyAttachment(file)
   if ((kind !== 'image' && kind !== 'audio') || isStoredCopy(file)) return file
   try {
-    const dest = path.join(await newSlot(chatId), path.basename(file))
-    if (kind === 'image' && (await writeReducedImage(file, dest))) return dest
-    await fsp.copyFile(file, dest)
+    const slot = await newSlot(chatId)
+    const reduced = kind === 'image' ? reducedImage(file) : null
+    if (chatBox(chatId).on) {
+      /*
+       * A protected conversation's copy is encrypted, under a name that says nothing (the name it
+       * had goes in the encrypted record). A paste or upload the app staged is removed once kept,
+       * so no plain copy of it waits a week to be swept.
+       */
+      const dest = path.join(slot, crypto.randomBytes(8).toString('hex') + path.extname(file).toLowerCase())
+      await fsp.writeFile(dest, bytesFor(chatId, reduced ?? (await fsp.readFile(file))))
+      if (isStaged(file)) await fsp.rm(file, { force: true }).catch(() => undefined)
+      return dest
+    }
+    const dest = path.join(slot, path.basename(file))
+    if (reduced) await fsp.writeFile(dest, reduced)
+    else await fsp.copyFile(file, dest)
     return dest
   } catch (err) {
     logger.warn('attachments', `could not keep a copy of ${file}; the original is referenced instead`, err)
@@ -160,7 +180,10 @@ export async function adoptAttachments(chatId: string): Promise<void> {
  * instead, so an attached image is never stored twice.
  */
 export function sentBlobs(chatId: string, known: string[]): BlobStore {
-  const hash = (bytes: Buffer): string => crypto.createHash('sha256').update(bytes).digest('hex')
+  // Keyed for a protected conversation, so a file's name cannot be matched against a known image.
+  const key = chatBox(chatId).on ? keyOf({ kind: 'chat', id: chatId }) : null
+  const hash = (bytes: Buffer): string =>
+    (key ? crypto.createHmac('sha256', key) : crypto.createHash('sha256')).update(bytes).digest('hex')
   let byHash: Map<string, string> | null = null
   return {
     async put(bytes, ext) {
@@ -168,7 +191,7 @@ export function sentBlobs(chatId: string, known: string[]): BlobStore {
       if (!byHash) {
         byHash = new Map()
         for (const file of known) {
-          const content = await fsp.readFile(file).catch(() => null)
+          const content = await readOpen(file).catch(() => null)
           if (content) byHash.set(hash(content), file)
         }
       }
@@ -177,11 +200,11 @@ export function sentBlobs(chatId: string, known: string[]): BlobStore {
       const dir = path.join(ATTACHMENTS_DIR, segment(chatId), SENT_DIR)
       await fsp.mkdir(dir, { recursive: true })
       const file = path.join(dir, `${digest}.${ext.replace(/[^A-Za-z0-9]/g, '') || 'bin'}`)
-      if (!fs.existsSync(file)) await fsp.writeFile(file, bytes)
+      if (!fs.existsSync(file)) await fsp.writeFile(file, bytesFor(chatId, bytes))
       byHash.set(digest, file)
       return file
     },
-    get: (file) => fsp.readFile(file).catch(() => null)
+    get: (file) => readOpen(file).catch(() => null)
   }
 }
 
@@ -212,8 +235,10 @@ export async function pruneOrphanAttachments(): Promise<void> {
     if (chat && slot) slots.add(path.join(ATTACHMENTS_DIR, chat, slot))
   }
 
+  // What a locked conversation refers to cannot be read, so nothing of its is judged unused.
+  const locked = new Set(lockedChatIds().map(segment))
   for (const chat of await fsp.readdir(ATTACHMENTS_DIR, { withFileTypes: true }).catch(() => [])) {
-    if (!chat.isDirectory()) continue
+    if (!chat.isDirectory() || locked.has(chat.name)) continue
     const chatDir = path.join(ATTACHMENTS_DIR, chat.name)
     for (const entry of await fsp.readdir(chatDir, { withFileTypes: true }).catch(() => [])) {
       const target = path.join(chatDir, entry.name)

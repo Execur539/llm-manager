@@ -28,6 +28,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import type { ToolDefinition } from '@shared/types'
 import type { ChatMessage } from './llama'
+import { isSealedFile, openFile, sealFile } from '../protect/cipher'
 
 /** What decides how a conversation renders: its messages and everything else the template sees. */
 export interface StateRequest {
@@ -174,7 +175,7 @@ export function readMeta(dir: string, key: string): StateMeta | null {
 }
 
 export function removeState(dir: string, key: string): void {
-  for (const ext of ['.bin', '.json', '.next.bin']) fs.rmSync(path.join(dir, fileStem(key) + ext), { force: true })
+  for (const ext of ['.bin', '.json', '.next.bin', '.next.lk', '.open.bin']) fs.rmSync(path.join(dir, fileStem(key) + ext), { force: true })
 }
 
 export function listStates(dir: string): StateMeta[] {
@@ -229,6 +230,8 @@ export async function saveState(o: {
   fingerprint: string
   req: StateRequest
   signal?: AbortSignal
+  /** A protected conversation's key: the state is stored encrypted under it. */
+  seal?: Buffer
 }): Promise<StateResult> {
   if (!o.req.messages.length) return { ok: false, why: 'the conversation is empty' }
   if (hasMedia(o.req.messages)) return { ok: false, why: 'the conversation contains images, audio or video' }
@@ -248,8 +251,22 @@ export async function saveState(o: {
     const next = path.join(o.dir, `${stem}.next.bin`)
     fs.rmSync(next, { force: true })
     const saved = await post(o.base, '/slots/0?action=save', { filename: `${stem}.next.bin` }, o.signal)
-    const fileBytes = fs.statSync(next).size
-    fs.renameSync(next, path.join(o.dir, `${stem}.bin`))
+    let written = next
+    if (o.seal) {
+      /*
+       * A protected conversation's state holds its words, as tokens. The server can only write it
+       * plain, so it is encrypted straight away and the plain file removed: it exists for as long
+       * as the save and the encryption take, never once the save is over.
+       */
+      written = path.join(o.dir, `${stem}.next.lk`)
+      try {
+        await sealFile(o.seal, next, written)
+      } finally {
+        fs.rmSync(next, { force: true })
+      }
+    }
+    const fileBytes = fs.statSync(written).size
+    fs.renameSync(written, path.join(o.dir, `${stem}.bin`))
     const meta: StateMeta = {
       key: o.key,
       fingerprint: o.fingerprint,
@@ -268,6 +285,7 @@ export async function saveState(o: {
     return { ok: true, meta }
   } catch (err) {
     fs.rmSync(path.join(o.dir, `${fileStem(o.key)}.next.bin`), { force: true })
+    fs.rmSync(path.join(o.dir, `${fileStem(o.key)}.next.lk`), { force: true })
     return { ok: false, why: err instanceof Error ? err.message : String(err) }
   }
 }
@@ -286,6 +304,8 @@ export async function restoreState(o: {
   fingerprint: string
   req: StateRequest
   signal?: AbortSignal
+  /** A protected conversation's key, when its state is stored encrypted. */
+  seal?: Buffer
 }): Promise<StateResult> {
   const meta = readMeta(o.dir, o.key)
   if (!meta) return { ok: false, why: 'nothing is saved for this conversation' }
@@ -300,7 +320,25 @@ export async function restoreState(o: {
       removeState(o.dir, o.key)
       return { ok: false, why: 'the conversation no longer begins the way it did when it was saved' }
     }
-    const loaded = await post(o.base, '/slots/0?action=restore', { filename: `${fileStem(o.key)}.bin` }, o.signal)
+    const stem = fileStem(o.key)
+    const sealed = await isSealedFile(path.join(o.dir, `${stem}.bin`))
+    if (sealed !== !!o.seal) {
+      // Encrypted with no key to open it, or a protected conversation's state left plain: neither is used.
+      removeState(o.dir, o.key)
+      return { ok: false, why: sealed ? 'it is encrypted and the conversation is not protected' : 'it was saved before the conversation was protected' }
+    }
+    /*
+     * The server reads only plain files, so an encrypted one is opened into a file beside it for
+     * the length of the load and removed the moment it is read.
+     */
+    const file = sealed ? `${stem}.open.bin` : `${stem}.bin`
+    if (sealed && o.seal) await openFile(o.seal, path.join(o.dir, `${stem}.bin`), path.join(o.dir, file))
+    let loaded: Record<string, unknown>
+    try {
+      loaded = await post(o.base, '/slots/0?action=restore', { filename: file }, o.signal)
+    } finally {
+      if (sealed) fs.rmSync(path.join(o.dir, file), { force: true })
+    }
     if (Number(loaded.n_restored ?? -1) !== meta.tokens) {
       // The file and its record disagree, so neither can be trusted again.
       removeState(o.dir, o.key)

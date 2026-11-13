@@ -130,6 +130,10 @@ export interface StreamState {
    * shows the call without its pictures.
    */
   toolFrames: Record<string, string[]>
+  /** Conversations whose state was just saved to disk, by key (chat:<id>, agent:<id>). */
+  savedStates: Record<string, { tokens: number; savedAt: number }>
+  /** How fast the reply in flight is being written, by conversation; gone between requests. */
+  speed: Record<string, number>
   /**
    * Ultra's independent attempts for the turn in flight, keyed by conversation.
    *
@@ -230,6 +234,8 @@ const state: StreamState = {
   pendingCalls: {},
   chatToolRunning: {},
   toolFrames: {},
+  savedStates: {},
+  speed: {},
   ultra: {},
   ultraSynthesising: {},
   ultraPlan: {},
@@ -267,6 +273,8 @@ function emitChange(): void {
     pendingCalls: { ...state.pendingCalls },
     chatToolRunning: { ...state.chatToolRunning },
     toolFrames: { ...state.toolFrames },
+    savedStates: { ...state.savedStates },
+    speed: { ...state.speed },
     ultra: { ...state.ultra },
     ultraSynthesising: { ...state.ultraSynthesising },
     ultraPlan: { ...state.ultraPlan },
@@ -512,6 +520,7 @@ function wire(): void {
     'chat:prompt-progress',
     (d) => {
       const id = d.chatId || activeId
+      delete state.speed[id]
       state.promptProgress[id] = {
         percent: d.percent,
         processed: d.processed,
@@ -563,7 +572,31 @@ function wire(): void {
   })
 
   on<{ chatId: string; call: ToolCall }>('chat:tool-call', (d) => {
-    state.chatToolRunning[d.chatId || activeId] = d.call
+    const id = d.chatId || activeId
+    state.chatToolRunning[id] = d.call
+    // Written out and running now: the card being written gives way to the real one.
+    state.pendingCalls[id] = []
+    emitChange()
+  })
+
+  on<{ chatId: string; index: number; name: string; args: string }>('chat:tool-call-partial', (d) => {
+    const id = d.chatId || activeId
+    const list = state.pendingCalls[id] ?? []
+    const at = list.findIndex((c) => c.index === d.index)
+    const next = { index: d.index, name: d.name, args: d.args }
+    state.pendingCalls[id] = at === -1 ? [...list, next] : list.map((c, i) => (i === at ? next : c))
+    emitChange()
+  })
+
+  for (const channel of ['chat:speed', 'agent:speed']) {
+    on<{ chatId?: string; sessionId?: string; tokensPerSecond: number }>(channel, (d) => {
+      state.speed[d.chatId || d.sessionId || activeId] = d.tokensPerSecond
+      emitChange()
+    })
+  }
+
+  on<{ key: string; tokens: number; savedAt: number }>('state:saved', (d) => {
+    state.savedStates[d.key] = { tokens: d.tokens, savedAt: d.savedAt }
     emitChange()
   })
 
@@ -576,6 +609,7 @@ function wire(): void {
     const id = d.chatId || activeId
     // A tool's result, or the answer, means no call is running any more.
     state.chatToolRunning[id] = null
+    if (d.message.role === 'assistant') state.pendingCalls[id] = []
     state.partial[id] = ''
     delete state.promptProgress[id]
     // The finished message carries its own reasoning; the streamed copy has served its purpose.
@@ -693,6 +727,7 @@ function wire(): void {
     'agent:prompt-progress',
     (d) => {
       const id = d.sessionId || activeId
+      delete state.speed[id]
       state.promptProgress[id] = {
         percent: d.percent,
         processed: d.processed,

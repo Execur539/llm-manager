@@ -19,6 +19,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { attachmentFile } from './repo'
+import { isSealedSync, readOpenSync } from '../protect/keys'
 
 /** Which of the two files an attachment can have. */
 export type MediaVariant = 'source' | 'optimised'
@@ -53,6 +54,8 @@ export interface MediaHit {
   mime: string
   /** Present when the client asked for a byte range and it was satisfiable. */
   range?: { start: number; end: number }
+  /** A protected conversation's kept file, decrypted: served from memory, never written out plain. */
+  bytes?: Buffer
 }
 
 /**
@@ -71,12 +74,18 @@ export function resolveMedia(id: string, variant: MediaVariant, rangeHeader?: st
   if (!file) return null
 
   let size: number
+  let bytes: Buffer | undefined
   try {
     const stat = fs.statSync(file)
     if (!stat.isFile()) return null
     size = stat.size
+    if (isSealedSync(file)) {
+      bytes = readOpenSync(file)
+      size = bytes.length
+    }
   } catch {
-    // Attached from a USB stick that has since been unplugged, or a temp file that was cleaned up.
+    // Attached from a USB stick that has since been unplugged, a temp file that was cleaned up, or
+    // a protected conversation's file while it is locked.
     return null
   }
 
@@ -85,7 +94,7 @@ export function resolveMedia(id: string, variant: MediaVariant, rangeHeader?: st
   // An unsatisfiable range is not the same as no range: answering it with the whole file would
   // leave the player waiting for bytes at an offset it never receives.
   if (range === 'invalid') return null
-  return range ? { file, size, mime, range } : { file, size, mime }
+  return { file, size, mime, ...(range ? { range } : {}), ...(bytes ? { bytes } : {}) }
 }
 
 /**
@@ -132,7 +141,10 @@ export function mediaHeaders(hit: MediaHit): Record<string, string> {
   return headers
 }
 
-export function mediaStream(hit: MediaHit): fs.ReadStream {
+export function mediaStream(hit: MediaHit): Readable {
+  if (hit.bytes) {
+    return Readable.from([hit.range ? hit.bytes.subarray(hit.range.start, hit.range.end + 1) : hit.bytes])
+  }
   return hit.range
     ? fs.createReadStream(hit.file, { start: hit.range.start, end: hit.range.end })
     : fs.createReadStream(hit.file)

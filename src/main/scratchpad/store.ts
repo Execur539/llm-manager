@@ -83,7 +83,7 @@ function folderFor(chatId: string): string {
 
 export interface ScratchpadOptions {
   /** Where files go when they are not kept in memory; null keeps them in memory. Read on every add. */
-  folder: () => string | null
+  folder: (chatId?: string) => string | null
   /** The most a new file may take in memory, given what the system has free; past it, adding refuses. */
   memoryLimit: () => number
   now?: () => number
@@ -124,8 +124,8 @@ export class Scratchpad {
     }
   }
 
-  private ownedRoot(): string | null {
-    const folder = this.opts.folder()
+  private ownedRoot(chatId?: string): string | null {
+    const folder = this.opts.folder(chatId)
     return folder ? path.join(folder, OWNED_FOLDER) : null
   }
 
@@ -137,7 +137,7 @@ export class Scratchpad {
    */
   async add(chatId: string, wanted: string, source: Readable, kind: ScratchKind, expectedBytes?: number): Promise<ScratchItem> {
     const name = this.freeName(chatId, wanted)
-    const root = this.ownedRoot()
+    const root = this.ownedRoot(chatId)
     const at = this.now()
     const entry: Entry = { id: crypto.randomBytes(16).toString('hex'), chatId, name, kind, bytes: 0, createdAt: at, usedAt: at }
 

@@ -544,26 +544,25 @@
   word-break: break-word;
 }
 
-/* A call the model is still writing. */
-.tool-card.pending {
-  border-style: dashed;
-  background: transparent;
-}
-
+/*
+ * A call the model is still writing: the same card it becomes, with its dot still running, so
+ * nothing moves or changes shape when the call completes and the real card takes its place.
+ */
 .pending-row {
   display: flex;
   align-items: center;
   gap: 9px;
+  min-width: 0;
   min-height: 36px;
-  padding: 0 12px;
+  padding: 0 10px 0 12px;
 }
 
 .pending-caret {
   width: 2px;
-  height: 14px;
-  margin-left: auto;
+  height: 13px;
+  margin: 0 6px 0 auto;
   border-radius: 1px;
-  background: var(--warn);
+  background: var(--text-faint);
   animation: blink 1.05s step-end infinite;
 }
 
@@ -974,6 +973,11 @@ h6.md-heading {
 
 .jump-latest:hover:not(:disabled) {
   background: var(--surface-3);
+}
+
+/* Pressed, it shrinks where it stands: the shared button press would replace the centring and slide it right. */
+.jump-latest.show:active:not(:disabled) {
+  transform: translateX(-50%) scale(0.97);
 }
 
 /* Summarising older turns, above the composer. */
@@ -1411,4 +1415,35 @@ h6.md-heading {
   border-radius: var(--r-sm);
   background: var(--bg-inset);
   box-shadow: inset 0 0 0 1px var(--hairline);
+}
+
+/* ---------------------------------------------------------------- the conversation is saved */
+
+/* Beside the context ring: a tick when the conversation is on disk, "Saved" for a moment as a save lands. */
+.saved-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px;
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+  transition: color var(--dur) var(--ease);
+}
+
+.saved-state.fresh {
+  color: #6fe08f;
+}
+
+.saved-state .icon {
+  flex-shrink: 0;
+}
+
+/* The reply's speed while it is being written, beside the saved tick and the context ring. */
+.live-speed {
+  padding: 0 4px;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }

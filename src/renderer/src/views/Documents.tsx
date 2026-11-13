@@ -4,11 +4,15 @@ import ConfirmDialog from '../components/ConfirmDialog'
 import EmptyState from '../components/EmptyState'
 import Icon from '../components/Icon'
 import { Toolbar } from '../lib/shell'
+import { LockedPanel, ProtectButton } from '../components/Protect'
 
 interface Collection {
   id: string
   name: string
   documents: number
+  protected?: boolean
+  locked?: boolean
+  password?: boolean
 }
 
 interface DocumentRecord {
@@ -51,8 +55,23 @@ export default function Documents(): JSX.Element {
 
   const loadDocs = async (collectionId: string): Promise<void> => {
     setActiveId(collectionId)
+    setHits([])
     setDocuments(await invoke<DocumentRecord[]>('rag:documents', { collectionId }))
   }
+
+  // Protected, unlocked or locked: the list says so, and the open collection is read again.
+  useEffect(
+    () =>
+      on<{ kind: string; id: string }>('protect:changed', (d) => {
+        if (d.kind !== 'collection') return
+        void refresh()
+        if (d.id === activeId) void loadDocs(d.id)
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeId]
+  )
+
+  const active = collections.find((c) => c.id === activeId)
 
   const create = async (): Promise<void> => {
     if (!newName.trim()) return
@@ -131,8 +150,15 @@ export default function Documents(): JSX.Element {
               data-testid="collection-item"
               data-id={c.id}
             >
-              <div className="truncate">{c.name}</div>
-              <div className="faint" style={{ fontSize: 10 }}>{c.documents} documents</div>
+              <div className="side-item-row">
+                {c.protected && (
+                  <span className={`side-lock${c.locked ? ' locked' : ''}`} title={c.locked ? 'Locked' : 'Protected'}>
+                    <Icon name="lock" size={12} />
+                  </span>
+                )}
+                <span className="truncate">{c.name}</span>
+              </div>
+              <div className="faint" style={{ fontSize: 10 }}>{c.locked ? 'Locked' : `${c.documents} documents`}</div>
             </div>
           ))}
           {!collections.length && <div className="empty" style={{ fontSize: 12 }}>No collections yet.</div>}
@@ -147,10 +173,13 @@ export default function Documents(): JSX.Element {
             />
           )}
 
-          {activeId && (
+          {activeId && active?.locked && <LockedPanel kind="collection" id={activeId} password={active.password !== false} />}
+
+          {activeId && !active?.locked && (
             <>
               <div className="row" style={{ marginBottom: 12 }}>
                 <button className="primary" onClick={() => void addFiles()}>Add documents…</button>
+                <ProtectButton kind="collection" id={activeId} state={active} disabled={!!progress} />
                 <button className="danger" onClick={() => setConfirmDeleteCollection(true)} data-testid="delete-collection">
                   Delete collection
                 </button>

@@ -1,24 +1,13 @@
+import mark from '../assets/brand-mark.svg'
+
 /**
- * The app's mark: a stack of layers, which is what a model is and what this app arranges across
- * your cards. A small tile in the accent, lit from above, like an app icon rather than a swatch.
+ * The app's mark: a speech bubble cut into three layers, the same one the exe, the launcher and the
+ * tray wear. Talking to a model is what the app is for; the slices are the model's layers in the
+ * colours the load sheet gives a card's memory (weights, KV cache, working memory).
  *
- * It replaces a pair of sparkles that made the app look like a chat product's sibling.
+ * Drawn by scripts/make-icon.mjs, which writes the SVG this shows, so the sidebar and the icon can
+ * never drift apart. It replaced a stock "layers" glyph on a blue tile.
  */
 export default function BrandMark(): JSX.Element {
-  return (
-    <span className="brand-mark" aria-hidden="true">
-      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" focusable="false">
-        <path d="M12 3.6 20.2 8 12 12.4 3.8 8 12 3.6Z" fill="currentColor" />
-        <path d="m3.8 12 8.2 4.4 8.2-4.4" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
-        <path
-          d="m3.8 16 8.2 4.4 8.2-4.4"
-          stroke="currentColor"
-          strokeWidth="1.9"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          opacity="0.55"
-        />
-      </svg>
-    </span>
-  )
+  return <img className="brand-mark" src={mark} alt="" aria-hidden="true" width={22} height={22} draggable={false} />
 }

@@ -10,9 +10,7 @@
 
 import { DatabaseSync, type StatementSync } from 'node:sqlite'
 import fs from 'node:fs'
-import path from 'node:path'
 import { APPDATA_DIR, DB_FILE } from './paths'
-import { exportFilename, uniquePath } from './filenames'
 
 let db: DatabaseSync | null = null
 
@@ -384,6 +382,16 @@ export const MIGRATIONS: { id: number; sql: string }[] = [
     );
     CREATE INDEX IF NOT EXISTS idx_plan_speeds_model ON plan_speeds(model_id, created_at);
     `
+  },
+  {
+    id: 14,
+    sql: `
+    -- Conversations and collections the user protected: how their key is wrapped (by the Windows
+    -- account, or by a password and a recovery key), as JSON. Null for everything else. What they
+    -- hold is stored encrypted under that key; see protect/.
+    ALTER TABLE chats ADD COLUMN protection TEXT;
+    ALTER TABLE collections ADD COLUMN protection TEXT;
+    `
   }
 ]
 
@@ -456,65 +464,4 @@ export function transaction<T>(fn: () => T): T {
     d.exec('ROLLBACK')
     throw err
   }
-}
-
-/** Export a chat to markdown or JSON. */
-export function exportChat(chatId: string, format: 'md' | 'json'): string {
-  const chat = get<{ id: string; title: string; created_at: number; model_id: string | null }>(
-    'SELECT * FROM chats WHERE id = ?',
-    chatId
-  )
-  if (!chat) throw new Error(`No chat ${chatId}`)
-
-  const messages = all<{
-    role: string
-    content: string
-    created_at: number
-    reasoning: string | null
-    tool_calls: string | null
-    tool_result: string | null
-  }>(
-    // rowid breaks ties on created_at, which is a millisecond stamp — an assistant turn and the
-    // tool result it produced routinely share one, and without the tiebreak the export could
-    // print the answer before the question it answered.
-    'SELECT role, content, created_at, reasoning, tool_calls, tool_result FROM messages WHERE chat_id = ? ORDER BY created_at, rowid',
-    chatId
-  )
-
-  if (format === 'json') {
-    return JSON.stringify({ chat, messages }, null, 2)
-  }
-
-  const lines = [`# ${chat.title}`, '', `_${new Date(chat.created_at).toISOString()}_`, '']
-  for (const m of messages) {
-    if (m.role === 'tool' && m.tool_calls) {
-      const call = JSON.parse(m.tool_calls)[0] as { name: string; args: Record<string, unknown> }
-      lines.push(`### tool: ${call.name}`, '', '```json', JSON.stringify(call.args, null, 2), '```', '', '```', m.content, '```', '')
-    } else {
-      lines.push(`### ${m.role}`, '')
-      // Reasoning is stored alongside the answer; an export that drops it loses the part of a
-      // thinking model's transcript the user most often wanted to keep.
-      if (m.reasoning) lines.push('<details><summary>Reasoning</summary>', '', m.reasoning, '', '</details>', '')
-      lines.push(m.content, '')
-    }
-  }
-  return lines.join('\n')
-}
-
-export function writeExport(chatId: string, format: 'md' | 'json', dirOrFile: string): string {
-  const content = exportChat(chatId, format)
-
-  // A save dialog hands back a full path; a directory picker hands back a folder.
-  let file: string
-  if (path.extname(dirOrFile).toLowerCase() === `.${format}`) {
-    file = dirOrFile
-  } else {
-    const chat = get<{ title: string }>('SELECT title FROM chats WHERE id = ?', chatId)
-    const base = exportFilename(chat?.title ?? '', `chat-${chatId.slice(0, 8)}`)
-    file = uniquePath(dirOrFile, base, format, (p) => fs.existsSync(p))
-  }
-
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  fs.writeFileSync(file, content, 'utf8')
-  return file
 }

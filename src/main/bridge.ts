@@ -102,7 +102,10 @@ import { buildContent, type VideoContext, type PreparedMedia } from './chat/mult
 import { classifyAttachment, recordAttachment, toDataUrl, IMAGE_EXT, AUDIO_EXT, VIDEO_EXT, TEXT_EXT } from './chat/repo'
 import { historicalStats, liveStats, requestLog, recordGeneration, clearStats, setContextUsed } from './stats'
 import { buildDiagnostics, logger } from './log'
-import { exportChat, writeExport, all, run, get } from './storage/db'
+import { all, run, get } from './storage/db'
+import { exportChat, writeExport } from './chat/export'
+import * as protection from './protect/convert'
+import { keyOf, osKeyStoreAvailable, readOpen, recordOf, statusOf, type Owner, type OwnerKind } from './protect/keys'
 import { exportFilename, uniquePath } from './storage/filenames'
 import { reasoningRequestFields, isUltra, sendableChoice, type ReasoningChoice } from './models/reasoning'
 import { ultraSamples, sampleTemperatures, planSynthesisMessages, planPreamble } from './ultra'
@@ -318,6 +321,8 @@ const lastEffort = new Map<string, ReasoningChoice | null>()
 /** The request a conversation's next turn starts from, for a key such as chat:<id> or agent:<id>. */
 async function conversationRequest(key: string): Promise<CompletionOptions | null> {
   const effort = effortFields(lastEffort.get(key))
+  // A locked conversation cannot be read, so there is nothing to bring back or keep.
+  if (stateSeal(key) === 'locked') return null
   if (key.startsWith('chat:')) {
     const id = key.slice('chat:'.length)
     const history = chats.loadMessages(id)
@@ -334,6 +339,18 @@ async function conversationRequest(key: string): Promise<CompletionOptions | nul
     return { messages: a.buildHistory(session), tools: a.toolsFor(session), cacheKey: key, ...effort }
   }
   return null
+}
+
+/**
+ * How a conversation's saved state is kept: under its key when it is protected, plain when it is
+ * not, and not at all ('locked') while it is locked and nothing of it can be read or written.
+ */
+function stateSeal(key: string): Buffer | undefined | 'locked' {
+  const m = /^(?:chat|agent):(.+)$/.exec(key)
+  if (!m) return undefined
+  const owner: Owner = { kind: 'chat', id: m[1] }
+  if (!recordOf(owner)) return undefined
+  return keyOf(owner) ?? 'locked'
 }
 
 /** Conversations whose saved state is never removed to make room. */
@@ -360,6 +377,8 @@ async function parkHeld(nextKey: string | null, signal?: AbortSignal): Promise<v
   // A conversation in the middle of a reply is not parked; its turn leaves the server holding it again.
   if (held.startsWith('agent:') && agentTurnAbort) return
   if (held.startsWith('chat:') && inFlightChats.has(held.slice('chat:'.length))) return
+  const seal = stateSeal(held)
+  if (seal === 'locked') return
   try {
     const req = await conversationRequest(held)
     // Only what the server is still holding: bringing it there first would mean reading it all.
@@ -367,13 +386,15 @@ async function parkHeld(nextKey: string | null, signal?: AbortSignal): Promise<v
     // Already on disk exactly as it is: a quiet moment's save made it, and rewriting it would change nothing.
     const shape = stateShape(req)
     if (savedShapes.get(held) === shape && readMeta(store.dir, held)) return
-    const result = await saveState({ ...store, key: held, req, signal })
+    const result = await saveState({ ...store, key: held, req, signal, seal })
     if (!result.ok) {
       logger.info('prompt', `${held} was not saved to disk: ${result.why}`)
       return
     }
     savedShapes.set(held, shape)
     llama.assumeHeld(req)
+    // Said where the conversation is, so it is visible that coming back to it will not mean waiting.
+    emit('state:saved', { key: held, tokens: result.meta.tokens, savedAt: result.meta.savedAt })
     const budget = Math.max(1, loadSettings().runtime.stateCache.budgetGb) * 1024 ** 3
     const pins = statePins(store.dir)
     for (const s of listStates(store.dir)) if (s.key.startsWith(INSTRUCTIONS_PREFIX)) pins.add(s.key)
@@ -383,6 +404,56 @@ async function parkHeld(nextKey: string | null, signal?: AbortSignal): Promise<v
     logger.warn('prompt', `could not save ${held} to disk`, err)
   }
 }
+
+function ownerOf(kind: OwnerKind, id: string): Owner {
+  if ((kind !== 'chat' && kind !== 'collection') || typeof id !== 'string' || !id) throw new Error('Nothing to protect')
+  return { kind, id }
+}
+
+/** Refuse to change a conversation that a reply is being written to. */
+function refuseWhileBusy(owner: Owner): void {
+  if (owner.kind !== 'chat') return
+  if (inFlightChats.has(owner.id) || liveAgentSessions.has(owner.id)) {
+    throw new Error('Wait for the reply to finish, or stop it, first.')
+  }
+}
+
+function dropSavedStates(owner: Owner): void {
+  if (owner.kind !== 'chat') return
+  const dir = llama.stateStore?.dir ?? stateCacheFolder()
+  for (const key of [`chat:${owner.id}`, `agent:${owner.id}`]) {
+    savedShapes.delete(key)
+    if (dir) removeState(dir, key)
+  }
+}
+
+function protectChanged(owner: Owner): void {
+  emit('protect:changed', { kind: owner.kind, id: owner.id })
+}
+
+/**
+ * Before a conversation is locked: nothing of it left readable in the app or the server. What the
+ * server holds is saved, encrypted, while the key is still here, and then the server's copy is
+ * erased; its scratchpad and the frames it was shown go too.
+ */
+async function letGoOf(id: string): Promise<void> {
+  for (const key of [`chat:${id}`, `agent:${id}`]) {
+    clearTimeout(checkpointTimers.get(key))
+    checkpointTimers.delete(key)
+  }
+  const held = llama.heldKey
+  if (held === `chat:${id}` || held === `agent:${id}`) {
+    await llama.preemptIdle().catch(() => undefined)
+    await parkHeld(null, AbortSignal.timeout(120_000))
+    await llama.eraseHeld()
+  }
+  await scratchpad.clearChat(id)
+  chatHeldMedia.delete(id)
+  scratchpadChanged()
+}
+
+/** Agent sessions with a turn running, as the turn has them: stored only when it ends. */
+const liveAgentSessions = new Map<string, AgentSessionState>()
 
 /** What a conversation's saved state was made from, by key: nothing is saved twice over. */
 const savedShapes = new Map<string, string>()
@@ -444,8 +515,10 @@ async function restoreSaved(req: CompletionOptions, signal?: AbortSignal): Promi
   const store = llama.stateStore
   const key = req.cacheKey
   if (!store || !key || !conversationStates() || !readMeta(store.dir, key)) return false
+  const seal = stateSeal(key)
+  if (seal === 'locked') return false
   try {
-    const result = await restoreState({ ...store, key, req, signal })
+    const result = await restoreState({ ...store, key, req, signal, seal })
     if (!result.ok) {
       logger.info('prompt', `${key} was not restored from disk: ${result.why}`)
       return false
@@ -623,7 +696,8 @@ async function retitleChat(chatId: string, reasoning: ReasoningChoice | null, si
     if (signal.aborted) return
     const applied = chats.setModelTitle(chatId, answer)
     if (applied) {
-      logger.info('chat', `the model named ${chatId}`, { title: applied })
+      // A protected conversation's title is not written to the log in the clear.
+      logger.info('chat', `the model named ${chatId}`, recordOf({ kind: 'chat', id: chatId }) ? {} : { title: applied })
       emit('chat:titled', { chatId, title: applied })
     }
   } catch (err) {
@@ -899,6 +973,7 @@ function getAgent(): Agent {
       emit('agent:message', { sessionId: sid(), message })
     })
     agent.on('toolCall', (c) => emit('agent:tool-call', { sessionId: sid(), call: c }))
+    agent.on('speed', (p: { tokensPerSecond: number; tokens: number }) => emit('agent:speed', { sessionId: sid(), ...p }))
     agent.on('toolCallPartial', (p: { index: number; name: string; args: string }) =>
       emit('agent:tool-call-partial', { sessionId: sid(), ...p })
     )
@@ -1278,7 +1353,7 @@ async function reconstructSent(message: AgentMessage): Promise<ContentPart[] | n
     if (!clip && !stills.length) continue
     if (!caps.vision || video.visionUnavailable) return undefined
     if (clip && video.serverTakesVideo) {
-      parts.push({ type: 'input_video', input_video: { data: (await fsp.readFile(clip)).toString('base64') } })
+      parts.push({ type: 'input_video', input_video: { data: (await readOpen(clip)).toString('base64') } })
     }
     for (const still of stills) parts.push({ type: 'image_url', image_url: { url: await toDataUrl(still) } })
   }
@@ -2182,9 +2257,32 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   'chat:list': (kind?: 'chat' | 'agent') => chats.listChats(kind),
   'chat:create': (opts: Parameters<typeof chats.createChat>[0]) => chats.createChat(opts ?? {}),
   'chat:load': async (id: string) => {
+    // Locked: what it is called and that it is locked, nothing more, until it is unlocked.
+    if (chats.chatLocked(id)) {
+      const locked: AgentSessionState = {
+        id,
+        title: chats.chatTitle(id) ?? 'Locked chat',
+        cwd: '',
+        planMode: false,
+        messages: [],
+        taskList: [],
+        createdAt: 0,
+        updatedAt: 0,
+        locked: true
+      }
+      return locked
+    }
     // Attachments from before copies were kept are brought in the first time a conversation opens.
     await adoptAttachments(id).catch(() => undefined)
-    return chats.loadSession(id)
+    const stored = chats.loadSession(id)
+    /*
+     * An agent turn in progress is stored when it ends, so mid-turn the database is missing
+     * everything the turn has said so far. Opening the conversation then (coming back from
+     * another view, say) showed the tool calls, which come from elsewhere, but not the thinking
+     * and words between them, until the turn finished. The live session has them.
+     */
+    const live = liveAgentSessions.get(id)
+    return stored && live ? { ...stored, messages: [...live.messages] } : stored
   },
   'chat:rename': (id: string, title: string) => {
     chats.renameChat(id, title)
@@ -2215,7 +2313,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
    * rather than appearing to do nothing.
    */
   'chat:export': async (id: string, format: 'md' | 'json') => {
-    const title = get<{ title: string }>('SELECT title FROM chats WHERE id = ?', id)?.title ?? ''
+    const title = chats.chatTitle(id) ?? ''
     const result = await dialog.showSaveDialog({
       title: 'Export conversation',
       defaultPath: `${exportFilename(title, `chat-${id.slice(0, 8)}`)}.${format}`,
@@ -2225,6 +2323,63 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     return offerReveal(writeExport(id, format, result.filePath))
   },
   'chat:export-text': (id: string, format: 'md' | 'json') => exportChat(id, format),
+
+  /*
+   * Protection, for conversations (chat and agent alike) and document collections; see protect/.
+   *
+   * A conversation is changed only while nothing is using it. Turning protection on or off removes
+   * its saved state, written the old way, to be saved again the new way at the next quiet moment.
+   * Locking it also makes the server let go of it, saving it encrypted first.
+   */
+  'protect:status': (kind: OwnerKind, id: string) => statusOf(ownerOf(kind, id)),
+  'protect:available': () => osKeyStoreAvailable(),
+  'protect:on': async (kind: OwnerKind, id: string, password?: string) => {
+    const owner = ownerOf(kind, id)
+    refuseWhileBusy(owner)
+    const result = await protection.protect(owner, password || undefined)
+    dropSavedStates(owner)
+    protectChanged(owner)
+    return result
+  },
+  'protect:off': async (kind: OwnerKind, id: string) => {
+    const owner = ownerOf(kind, id)
+    refuseWhileBusy(owner)
+    await protection.unprotect(owner)
+    dropSavedStates(owner)
+    protectChanged(owner)
+    return true
+  },
+  'protect:set-password': async (kind: OwnerKind, id: string, password: string) => {
+    const owner = ownerOf(kind, id)
+    // A first password re-encrypts everything under a new key, so nothing may be writing to it.
+    refuseWhileBusy(owner)
+    const result = await protection.setPassword(owner, String(password ?? ''))
+    // Saved under the key it had; saved again under the new one at the next quiet moment.
+    dropSavedStates(owner)
+    protectChanged(owner)
+    return result
+  },
+  'protect:remove-password': (kind: OwnerKind, id: string) => {
+    const owner = ownerOf(kind, id)
+    protection.removePassword(owner)
+    protectChanged(owner)
+    return true
+  },
+  'protect:unlock': async (kind: OwnerKind, id: string, secret: string) => {
+    const owner = ownerOf(kind, id)
+    const ok = await protection.unlock(owner, String(secret ?? ''))
+    if (ok) protectChanged(owner)
+    return ok
+  },
+  'protect:lock': async (kind: OwnerKind, id: string) => {
+    const owner = ownerOf(kind, id)
+    if (!recordOf(owner)?.pw) throw new Error('Only a conversation with a password can be locked.')
+    refuseWhileBusy(owner)
+    if (owner.kind === 'chat') await letGoOf(owner.id)
+    protection.lock(owner)
+    protectChanged(owner)
+    return true
+  },
 
   /** Plain chat turn (no tools), streaming deltas to the UI. */
   'chat:send': async (
@@ -2549,6 +2704,10 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
             thinking += ev.text
             emit('chat:reasoning', { chatId, text: ev.text })
           }
+          if (ev.type === 'tool_call_partial') {
+            emit('chat:tool-call-partial', { chatId, index: ev.index, name: ev.name, args: ev.args })
+          }
+          if (ev.type === 'speed') emit('chat:speed', { chatId, tokensPerSecond: ev.tokensPerSecond, tokens: ev.tokens })
           if (ev.type === 'tool_call') {
             calls.push({
               id: ev.call.id,
@@ -2731,6 +2890,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     await llama.preemptIdle()
     const session = chats.loadSession(sessionId)
     if (!session) throw new Error(`No session ${sessionId}`)
+    liveAgentSessions.set(sessionId, session)
 
     /*
      * Text goes into the prompt, media goes to the model as content parts.
@@ -2947,6 +3107,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
         })
       }
       for (const m of session.messages.slice(before)) chats.appendMessage(sessionId, m)
+      if (liveAgentSessions.get(sessionId) === session) liveAgentSessions.delete(sessionId)
       persistPermissionRules()
       if (agentTurnAbort === turnAbort) agentTurnAbort = null
     }
@@ -3071,6 +3232,15 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     }
   },
   /** Keep a conversation's saved state whatever the budget says, or stop keeping it. */
+  /** What is saved of one conversation, if it would load into the model running now. */
+  'state:meta': (key: string) => {
+    const store = llama.stateStore
+    const dir = store?.dir ?? stateCacheFolder()
+    if (!dir || !key) return null
+    const meta = readMeta(dir, key)
+    if (!meta || (store && meta.fingerprint !== store.fingerprint)) return null
+    return { tokens: meta.tokens, savedAt: meta.savedAt }
+  },
   'state:pin': (key: string, on: boolean) => {
     const dir = llama.stateStore?.dir ?? stateCacheFolder()
     if (!dir || !/^(chat|agent):[\w-]+$/.test(key)) return []

@@ -6,7 +6,6 @@ import {
   select,
   setRunning,
   takePending,
-  dropPending,
   useStream,
   clearFor,
   clearNotice,
@@ -37,8 +36,10 @@ import MediaStage from '../components/MediaStage'
 import ContextMeter from '../components/ContextMeter'
 import CompactingNotice from '../components/CompactingNotice'
 import KeepReadyButton from '../components/KeepReadyButton'
+import { LockedPanel, ProtectButton } from '../components/Protect'
 import PendingToolCall from '../components/PendingToolCall'
 import ToolCard from '../components/ToolCard'
+import SavedState from '../components/SavedState'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
@@ -55,12 +56,15 @@ function ContinuingMessage({
   message,
   partial,
   reasoning,
-  progress
+  progress,
+  writingCall = false
 }: {
   message: AgentMessage
   partial: string
   reasoning: string
   progress: Parameters<typeof PromptProgress>[0] | null
+  /** The continuation went on to a tool call, which ends the thinking. */
+  writingCall?: boolean
 }): JSX.Element {
   const grown = continuedMessage(message, partial, reasoning)
   const insideThinking = !message.content && !!message.reasoning
@@ -70,7 +74,7 @@ function ContinuingMessage({
         <ThinkingBlock
           text={grown.reasoning}
           streaming={insideThinking || !!reasoning}
-          answerStarted={!!grown.content}
+          answerStarted={!!grown.content || writingCall}
         />
       )}
       <div className="continuing" data-testid="continuing-message">
@@ -113,7 +117,11 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
    * after turns it was meant to follow. Treated exactly like a turn in flight, because from the
    * composer's point of view that is what it is: the session is busy and not accepting input.
    */
-  const busy = running || !!compacting
+  const activeSession = sessions.find((c) => c.id === activeId)
+  // Protected with a password and not unlocked: nothing of it can be shown or sent to.
+  const sealed = !!activeSession?.locked
+  const busy = running || !!compacting || sealed
+  const [reloadTick, setReloadTick] = useState(0)
 
   // Keyed on the session, so switching to another one opens at its latest message.
   const { scrollRef, contentRef, detached, jumpToLatest } = useStickToBottom(activeId)
@@ -174,6 +182,17 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   // The agent names its session with set_title, mid-turn, and renames it as the task moves on.
   useEffect(() => on('chat:titled', () => void refreshSessions()), [])
 
+  // Protected, unlocked or locked: the list says so, and the open session is read again.
+  useEffect(
+    () =>
+      on<{ kind: string; id: string }>('protect:changed', (d) => {
+        if (d.kind !== 'chat') return
+        void refreshSessions()
+        setReloadTick((n) => n + 1)
+      }),
+    []
+  )
+
   useEffect(() => {
     void refreshSessions()
     void invoke<typeof tools>('agent:tools')
@@ -203,13 +222,21 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
       setEditing(null)
       // So the meter reads correctly on reopening rather than staying blank until the next turn.
       seedContext(activeId, session?.contextUsed, loaded?.plan.contextLength ?? 0)
-      dropPending(activeId)
+      // Anything that arrived while this was loading joins it, matched by id, rather than being dropped.
+      const queued = takePending(activeId)
+      if (queued.length) {
+        setMessages((prev) => {
+          const byId = new Map(prev.map((m) => [m.id, m]))
+          for (const m of queued) byId.set(m.id, m)
+          return [...byId.values()]
+        })
+      }
     })()
     return () => {
       cancelled = true
     }
     // Re-seeded when a model loads, since the window's size comes from the model, not the session.
-  }, [activeId, loaded?.plan.contextLength])
+  }, [activeId, loaded?.plan.contextLength, reloadTick])
 
   /*
    * Absorb anything that streamed in while this view was unmounted.
@@ -506,6 +533,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             Compact
           </button>
           <KeepReadyButton stateKey={activeId ? `agent:${activeId}` : null} />
+          <ProtectButton kind="chat" id={activeId} state={activeSession} agent disabled={running || !!compacting} />
           {running && (
             <button className="danger" onClick={() => {
                 // The main process settles any outstanding question when the turn is drained;
@@ -589,7 +617,8 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
 
         <div className="messages" data-testid="agent-messages" ref={scrollRef}>
           <div className="messages-content" ref={contentRef}>
-          {!messages.length && !partial && !unsavedCalls.length && (
+          {sealed && activeId && <LockedPanel kind="chat" id={activeId} agent password={activeSession?.password !== false} />}
+          {!messages.length && !partial && !unsavedCalls.length && !sealed && (
             <EmptyState
               icon="agent"
               title="Put the model to work"
@@ -648,7 +677,13 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                   }
                 />
               ) : m.role === 'assistant' && m.id === extendingId ? (
-                <ContinuingMessage message={m} partial={partial} reasoning={reasoning} progress={progress} />
+                <ContinuingMessage
+                  message={m}
+                  partial={partial}
+                  reasoning={reasoning}
+                  progress={progress}
+                  writingCall={pendingCalls.length > 0}
+                />
               ) : m.role === 'assistant' ? (
                 <>
                   {m.reasoning && <ThinkingBlock text={m.reasoning} />}
@@ -705,26 +740,28 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             <ToolCard key={entry.call.id} call={entry.call} result={entry.result} />
           ))}
 
-          {/*
-            * Calls still being written, in the position their finished cards will take.
-            *
-            * After the completed ones, because that is the order they happened in — the model
-            * finishes one call before starting the next, and this is the one it is on now.
-            */}
-          {pendingCalls.map((c) => (
-            <PendingToolCall key={c.index} name={c.name} args={c.args} />
-          ))}
-
           {!extendingId && (partial || reasoning || ultra.length > 0) && (
             <MessageRow role="assistant" testId="streaming-message">
               {/* Plans, while they are being weighed — above whatever the run then does. */}
               <UltraSamples samples={ultra} synthesising={synthesising} plan={ultraPlan} />
-              {reasoning && <ThinkingBlock text={reasoning} streaming answerStarted={!!partial} />}
-              <div className="body streaming">
-                <Markdown source={partial} caret />
-              </div>
+              {/* A tool call the model went straight to ends its thinking as surely as words do. */}
+              {reasoning && <ThinkingBlock text={reasoning} streaming answerStarted={!!partial || pendingCalls.length > 0} />}
+              {partial && (
+                <div className="body streaming">
+                  <Markdown source={partial} caret={!pendingCalls.length} />
+                </div>
+              )}
             </MessageRow>
           )}
+
+          {/*
+            * Calls still being written, where their finished cards will be: after the thinking and
+            * the words that led to them, which the model wrote first. They used to sit above that
+            * text while it streamed, then the text jumped above them when the step finished.
+            */}
+          {pendingCalls.map((c) => (
+            <PendingToolCall key={c.index} name={c.name} args={c.args} />
+          ))}
           {/*
             * Progress wins over the other conditions rather than joining them.
             *
@@ -824,6 +861,13 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                 onSamplesChange={setUltraSamples}
               />
               <span className="composer-spacer" />
+              {/* Live while the model writes: the server's own measure of how fast. */}
+              {running && activeId && stream.speed[activeId] ? (
+                <span className="live-speed" data-testid="live-speed" title="How fast the reply is being written, as the server measures it">
+                  {stream.speed[activeId].toFixed(stream.speed[activeId] < 10 ? 1 : 0)} tok/s
+                </span>
+              ) : null}
+              <SavedState stateKey={activeId ? `agent:${activeId}` : null} />
               {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
               <button
                 className={`send-button${running ? ' stopping' : ''}`}
