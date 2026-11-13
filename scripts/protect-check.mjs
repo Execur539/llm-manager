@@ -166,6 +166,12 @@ try {
   check('with no plain copy left beside it', !onDisk.some((f) => f.endsWith('.next.bin') || f.endsWith('.next.lk')), onDisk.join(','))
   check('nothing of the conversation readable in it', !fs.readFileSync(path.join(states, `${stem}.bin`)).includes('the words of the conversation'))
 
+  const current = await sc.currentState(common)
+  check('a state saved of the conversation as it is counts as up to date', current?.tokens === 123, JSON.stringify(current))
+  const grown = { ...common, req: { messages: [...req.messages, { role: 'user', content: 'and then?' }, { role: 'assistant', content: 'more' }] } }
+  check('once more has been said it does not', (await sc.currentState(grown)) === null)
+  check('nor under another load of the model', (await sc.currentState({ ...common, fingerprint: 'other' })) === null)
+
   const restored = await sc.restoreState({ ...common, seal: key })
   check('it restores with the key', restored.ok, JSON.stringify(restored))
   check('from a file opened just for the load', seen.restored.at(-1) === `${stem}.open.bin` && seen.restoredBytes === STATE)

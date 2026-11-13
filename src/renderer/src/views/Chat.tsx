@@ -515,7 +515,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
                   {stream.speed[activeId].toFixed(stream.speed[activeId] < 10 ? 1 : 0)} tok/s
                 </span>
               ) : null}
-              <SavedState stateKey={activeId ? `chat:${activeId}` : null} />
+              <SavedState stateKey={activeId ? `chat:${activeId}` : null} canSave={!!loaded && !locked && messages.length > 0} />
               {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
               <button
                 className={`send-button${busy ? ' stopping' : ''}`}

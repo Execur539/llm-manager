@@ -132,6 +132,8 @@ export interface StreamState {
   toolFrames: Record<string, string[]>
   /** Conversations whose state was just saved to disk, by key (chat:<id>, agent:<id>). */
   savedStates: Record<string, { tokens: number; savedAt: number }>
+  /** Saves asked for and in progress, by conversation key. */
+  savingStates: Record<string, { phase: 'reading' | 'saving'; done?: number; total?: number }>
   /** How fast the reply in flight is being written, by conversation; gone between requests. */
   speed: Record<string, number>
   /**
@@ -235,6 +237,7 @@ const state: StreamState = {
   chatToolRunning: {},
   toolFrames: {},
   savedStates: {},
+  savingStates: {},
   speed: {},
   ultra: {},
   ultraSynthesising: {},
@@ -274,6 +277,7 @@ function emitChange(): void {
     chatToolRunning: { ...state.chatToolRunning },
     toolFrames: { ...state.toolFrames },
     savedStates: { ...state.savedStates },
+    savingStates: { ...state.savingStates },
     speed: { ...state.speed },
     ultra: { ...state.ultra },
     ultraSynthesising: { ...state.ultraSynthesising },
@@ -597,6 +601,12 @@ function wire(): void {
 
   on<{ key: string; tokens: number; savedAt: number }>('state:saved', (d) => {
     state.savedStates[d.key] = { tokens: d.tokens, savedAt: d.savedAt }
+    emitChange()
+  })
+
+  on<{ key: string; phase: 'reading' | 'saving' | null; done?: number; total?: number }>('state:progress', (d) => {
+    if (d.phase) state.savingStates[d.key] = { phase: d.phase, done: d.done, total: d.total }
+    else delete state.savingStates[d.key]
     emitChange()
   })
 

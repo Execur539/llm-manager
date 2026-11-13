@@ -867,7 +867,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                   {stream.speed[activeId].toFixed(stream.speed[activeId] < 10 ? 1 : 0)} tok/s
                 </span>
               ) : null}
-              <SavedState stateKey={activeId ? `agent:${activeId}` : null} />
+              <SavedState stateKey={activeId ? `agent:${activeId}` : null} canSave={!!loaded && !busy && messages.length > 0} />
               {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
               <button
                 className={`send-button${running ? ' stopping' : ''}`}

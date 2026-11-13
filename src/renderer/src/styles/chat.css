@@ -1420,19 +1420,48 @@ h6.md-heading {
 /* ---------------------------------------------------------------- the conversation is saved */
 
 /* Beside the context ring: a tick when the conversation is on disk, "Saved" for a moment as a save lands. */
+/* A quiet line of text that is also the way to save now: none of a button's weight. */
 .saved-state {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 0 4px;
+  min-height: 22px;
+  padding: 0 6px;
+  border: none;
+  border-radius: var(--r-md);
+  background: transparent;
+  box-shadow: none;
   color: var(--text-faint);
   font-size: var(--fs-xs);
+  font-weight: 400;
   white-space: nowrap;
-  transition: color var(--dur) var(--ease);
+  transition:
+    color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
 }
 
-.saved-state.fresh {
+.saved-state:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--text-dim);
+}
+
+.saved-state:active:not(:disabled) {
+  transform: none;
+  background: var(--surface-3);
+}
+
+/* Disabled only means "not now": the tick still says what is on disk, at full strength. */
+.saved-state:disabled {
+  opacity: 1;
+}
+
+.saved-state.fresh,
+.saved-state.fresh:hover:not(:disabled) {
   color: #6fe08f;
+}
+
+.saved-state .spinner {
+  flex-shrink: 0;
 }
 
 .saved-state .icon {

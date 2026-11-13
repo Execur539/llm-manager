@@ -161,6 +161,24 @@ export async function renderPrefix(base: string, req: StateRequest, signal?: Abo
   return a.slice(0, n)
 }
 
+/**
+ * The saved state, when it holds this conversation exactly as it is now: saved under the same load,
+ * with nothing said since. Null when there is none, or the conversation has moved on from it.
+ */
+export async function currentState(o: {
+  base: string
+  dir: string
+  key: string
+  fingerprint: string
+  req: StateRequest
+  signal?: AbortSignal
+}): Promise<StateMeta | null> {
+  const meta = readMeta(o.dir, o.key)
+  if (!meta || meta.fingerprint !== o.fingerprint || hasMedia(o.req.messages)) return null
+  const prefix = await renderPrefix(o.base, o.req, o.signal)
+  return prefix.length === meta.prefixChars && sha(prefix) === meta.prefixHash ? meta : null
+}
+
 function metaPath(dir: string, key: string): string {
   return path.join(dir, `${fileStem(key)}.json`)
 }
