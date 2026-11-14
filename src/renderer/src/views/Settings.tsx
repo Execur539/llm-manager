@@ -680,20 +680,6 @@ export default function Settings({
                   />
                 </div>
               </div>
-              <div className="setting-row">
-                <div className="setting-text">
-                  <div className="setting-label">Context strategy</div>
-                </div>
-                <div className="setting-control">
-                  <select
-                    value={settings.agent.compaction}
-                    onChange={(e) => void patch({ agent: { ...settings.agent, compaction: e.target.value as 'auto-compact' | 'sliding-window' } })}
-                  >
-                    <option value="auto-compact">Auto-compact (summarise older turns)</option>
-                    <option value="sliding-window">Sliding window (drop oldest)</option>
-                  </select>
-                </div>
-              </div>
               {/*
                 * A small model for compaction, beside the loaded one.
                 *

@@ -69,8 +69,8 @@ import { readMemory } from './memory'
 import * as chats from '../chat/repo'
 import { cleanTitle } from '../chat/title'
 import { APPDATA_DIR } from '../storage/paths'
-import { type CompactionHelper, type TranscriptItem } from './compaction'
-import { summariseTranscript } from './summarise'
+import { keepBudget, keepRecent, type CompactionHelper, type TranscriptItem } from './compaction'
+import { summariseTranscript, COMPACTION_FAILED } from './summarise'
 import { summariseInPlace } from './summarise-in-place'
 // Relative, not `@shared`: the main-process bundle has no such alias, so only type imports can use it.
 import { continuedMessage } from '../../shared/continuation'
@@ -601,86 +601,17 @@ export class Agent extends EventEmitter {
   }
 
   /**
-   * Keep the rolling history inside the model's context window.
+   * Whether the next request still fits the window.
    *
-   * auto-compact summarises the older half and keeps recent turns verbatim; sliding-window
-   * simply drops the oldest. Either way the system prompt and the most recent exchanges
-   * survive, because those carry the task state.
+   * Nothing is summarised unasked: compaction happens when the user presses Compact, and only then.
+   * A window that is full is said so, with what to do, before the server refuses the request with
+   * an error that says less.
    */
-  private async compactIfNeeded(): Promise<void> {
+  private windowFull(): boolean {
     const loaded = llama.loaded
-    if (!loaded) return
-
-    const budget = Math.floor(loaded.plan.contextLength * 0.75)
-    /*
-     * Media is charged a flat rate, not measured as text.
-     *
-     * An image arrives as a base64 data URL, so serialising the parts and counting characters
-     * values a single photo at hundreds of thousands of tokens — enough to blow the budget on
-     * the spot and compact a conversation that had barely started. What the model actually
-     * spends is the projector's patch count, which is on the order of a thousand.
-     */
-    const MEDIA_TOKENS = 1200
-    const cost = (m: ChatMessage): number => {
-      // Reasoning handed back is sent like any other text, so it fills the window like it too.
-      const thought = estimateTokens(m.reasoning_content ?? '')
-      if (typeof m.content === 'string') return estimateTokens(m.content) + thought
-      return m.content.reduce(
-        (a, part) => a + (part.type === 'text' ? estimateTokens(part.text ?? '') : MEDIA_TOKENS),
-        thought
-      )
-    }
-    let total = this.history.reduce((a, m) => a + cost(m), 0)
-    if (total <= budget) return
-
-    const system = this.history[0]
-    const rest = this.history.slice(1)
-    const keepRecent = 6
-    const recent = rest.slice(-keepRecent)
-    const older = rest.slice(0, -keepRecent)
-    if (!older.length) return
-
-    if (this.opts.compaction === 'sliding-window') {
-      this.emit('compacting', { strategy: 'sliding-window', automatic: true })
-      while (total > budget && this.history.length > keepRecent + 1) {
-        const dropped = this.history.splice(1, 1)[0]
-        total -= cost(dropped)
-      }
-      this.emit('compacted', { strategy: 'sliding-window', remaining: this.history.length })
-      return
-    }
-
-    /*
-     * Every older message, as text.
-     *
-     * This kept only the transcript's last 40,000 characters, so on a long session most of what
-     * compaction removed was never shown to the summariser and described nowhere — the fault the
-     * manual path had already been fixed for. Structured content keeps its text rather than
-     * becoming a placeholder.
-     */
-    const items = older.map((m) => ({ role: m.role, text: messageText(m) }))
-
-    /*
-     * Announced before the summarising call, not after it.
-     *
-     * Auto-compaction is a whole model call over the older half of the session — on a long one
-     * that is many seconds during which the app looked as though it had stopped mid-turn, with
-     * nothing to say that work was happening or that it would end. The turn cannot proceed until
-     * it finishes, so the interface needs to know it has started, not merely that it happened.
-     */
-    this.emit('compacting', { strategy: 'auto-compact', automatic: true })
-
-    // Asked of the conversation itself first, which the server is holding and need not read again.
-    // Every pass carries the turn's abort signal, so stop does not have to wait a compaction out.
-    const summary = (await this.summariseHere(this.runningSessionId)) ?? (await this.summariseItems(items))
-
-    // The message that told the model about the session is among those just folded away.
-    this.history = [
-      system,
-      { role: 'user', content: `${factsBlock(this.sessionFacts())}\n\n[Summary of earlier work in this session]\n${summary}` },
-      ...recent
-    ]
-    this.emit('compacted', { strategy: 'auto-compact', summary })
+    if (!loaded) return false
+    // A little under the whole of it: the estimate runs low on code, and a reply needs room too.
+    return this.historyTokens() > loaded.plan.contextLength * 0.97
   }
 
   /** Force a compaction now, regardless of budget. */
@@ -715,30 +646,29 @@ export class Agent extends EventEmitter {
 
     const all = session.messages.filter((m) => m.role !== 'system')
     const cost = (m: AgentMessage): number => estimateTokens(m.content) + estimateTokens(m.reasoning ?? '')
-    const before = all.reduce((a, m) => a + cost(m), 0)
-
     /*
-     * How much recent conversation to leave untouched.
+     * From where the last compaction left off, not from the first message.
      *
-     * A quarter of the window: enough that the model keeps the thread of what it was doing,
-     * while leaving three quarters to reclaim. The floor matters on a small context, where a
-     * quarter could be less than a single tool result and compaction would thrash.
+     * This used to work from every message the session ever had, whether a summary already stood
+     * in for it or not: the saving it reported counted messages the model had not been sent for a
+     * long time, a second compaction could put its boundary before the first one's and bring
+     * summarised messages back in full, and the slow route read the whole session again each time.
      */
+    const upto = this.hasSummary(session) ? all.findIndex((m) => m.id === session.summaryUpto) : -1
+    const prior = upto === -1 ? null : (session.summary ?? null)
+    const live = all.slice(upto + 1)
+    const costs = live.map(cost)
+    // The instructions and the tool list are sent with every request and no compaction shrinks them.
+    const fixed = estimateTokens(messageText(this.history[0] ?? { role: 'system', content: '' })) + estimateTokens(JSON.stringify(this.toolsFor(session)))
+    const before = fixed + (prior ? estimateTokens(prior) : 0) + costs.reduce((a, n) => a + n, 0)
+
     const windowTokens = loaded.plan.contextLength || 8192
-    const keepBudget = Math.max(1500, Math.floor(windowTokens * 0.25))
+    let cut = keepRecent(costs, keepBudget(windowTokens))
+    // A tool's result stays with the call that produced it.
+    while (cut > 0 && cut < live.length && live[cut].role === 'tool') cut--
 
-    let kept = 0
-    let cut = all.length
-    while (cut > 0) {
-      const next = kept + cost(all[cut - 1])
-      // The last two are kept whatever they cost — a session cannot resume from nothing.
-      if (next > keepBudget && all.length - cut >= 2) break
-      kept = next
-      cut--
-    }
-
-    const older = all.slice(0, cut)
-    if (older.length < 2) {
+    const older = live.slice(0, cut)
+    if (older.length < (prior ? 1 : 2)) {
       return {
         ok: false,
         message: 'Nothing to compact yet — the recent messages are all that is in the window.'
@@ -752,21 +682,34 @@ export class Agent extends EventEmitter {
       const inPlace = await this.summariseHere(session.id, opts)
       if (opts.signal?.aborted) return { ok: false, message: 'Compaction was stopped.' }
       if (!inPlace && background) return { ok: false, message: 'Nothing was summarised.' }
-      const summary = inPlace ?? (await this.summarise(older))
+      const summary =
+        inPlace ??
+        (await this.summariseItems([
+          ...(prior ? [{ role: 'summary so far', text: prior }] : []),
+          // What each message sent, where that was more than its text, so attached documents are summarised too.
+          ...older.map((m) => ({ role: m.role, text: this.opts.sentTextFor?.(m.id) ?? m.content }))
+        ]))
+      if (opts.signal?.aborted) return { ok: false, message: 'Compaction was stopped.' }
+      // No pass produced a summary: the session stays as it was, never replaced by a note saying so.
+      if (summary === COMPACTION_FAILED) {
+        return { ok: false, message: 'Compaction failed — no summary came back, so nothing was changed.' }
+      }
       const boundary = older[older.length - 1].id
       // Read before the summary is stored: what the model had been told is judged against the
       // messages that told it, and most of those are about to stand behind the summary.
       const state = this.promptStateFor(session)
       const told = toldFacts(state, new Set(this.liveMessages(session).map((m) => m.id)), this.hasSummary(session))
       chats.setSummary(session.id, summary, boundary)
-      const kept = new Set(all.slice(cut).map((m) => m.id))
+      const kept = new Set(live.slice(cut).map((m) => m.id))
       this.savePromptState(session, afterSummary(state, told ?? this.sessionFacts(), kept))
 
       // Rebuilt from what is now stored, so the running history matches what a resume would give.
-      this.hydrate({ ...session, summary, summaryUpto: boundary })
+      session.summary = summary
+      session.summaryUpto = boundary
+      this.hydrate(session)
 
       stored = true
-      const after = estimateTokens(summary) + all.slice(cut).reduce((a, m) => a + cost(m), 0)
+      const after = fixed + estimateTokens(summary) + costs.slice(cut).reduce((a, n) => a + n, 0)
       return {
         ok: true,
         message: `Summarised ${older.length} messages.`,
@@ -811,19 +754,6 @@ export class Agent extends EventEmitter {
       onProgress: (percent) =>
         opts.background ? undefined : this.emit('compactionProgress', { percent, chunk: 1, chunks: 1, stage: 'merge', helper: null })
     })
-  }
-
-  /**
-   * Summarise a run of messages, in as many passes as their size requires.
-   *
-   * The transcript used to be cut to its last 40,000 characters before being summarised, so on a
-   * long session most of it was never shown to the summariser at all — removed from the model's
-   * history and described nowhere. Anything too big for one pass is summarised in chunks and
-   * those summaries summarised together, so every message is represented by something.
-   */
-  private async summarise(messages: AgentMessage[]): Promise<string> {
-    // What each message sent, where that was more than its text, so attached documents are summarised too.
-    return this.summariseItems(messages.map((m) => ({ role: m.role, text: this.opts.sentTextFor?.(m.id) ?? m.content })))
   }
 
   /**
@@ -1131,7 +1061,10 @@ export class Agent extends EventEmitter {
           return
         }
 
-        await this.compactIfNeeded()
+        if (this.windowFull()) {
+          this.emit('error', 'The context window is full. Press Compact to summarise the older messages, then carry on.')
+          return
+        }
 
         let text = ''
         let thinking = ''

@@ -78,7 +78,7 @@ import { mcpManager } from './agent/mcp'
 import { addMemory, allMemory, deleteMemory, updateMemory } from './agent/memory'
 import { searchModels, listFiles, groupVariants, recommendQuant, findMmprojFor, peekVariantArch } from './downloads/hf'
 import { summarizer, type SummarizerHandle } from './runtime/summarizer'
-import { chooseHelperPlacement, helperContext, helperVramNeed, keepRecent, type TranscriptItem } from './agent/compaction'
+import { chooseHelperPlacement, helperContext, helperVramNeed, keepBudget, keepRecent, type TranscriptItem } from './agent/compaction'
 import { summariseTranscript, COMPACTION_FAILED } from './agent/summarise'
 import { summariseInPlace } from './agent/summarise-in-place'
 import { samplingOptions } from '../shared/sampling'
@@ -810,14 +810,6 @@ function effortFields(choice: ReasoningChoice | null | undefined): ReturnType<ty
   return reasoningRequestFields(support, sendableChoice(support, choice ?? null))
 }
 
-/**
- * How full the window has to be for a conversation to be summarised once its turn is over.
- *
- * Below the point where a turn has to stop and compact, on purpose: done here, while the reply is
- * being read, the summary and the reading of the shortened conversation cost nobody any waiting.
- */
-const TIDY_AT = 0.6
-
 /*
  * Chats are named by the model.
  *
@@ -893,75 +885,12 @@ async function retitleChat(chatId: string, reasoning: ReasoningChoice | null, si
   }
 }
 
-/** After a chat turn: name it if due, and summarise if the window is filling. One background job. */
+/** After a chat turn: name it if due. Nothing is summarised unasked; Compact does that. */
 function afterChatTurn(chatId: string, reasoning: ReasoningChoice | null): void {
   const loaded = llama.loaded
   if (!loaded || agentTurnAbort || inFlightChats.size > 0 || llama.idleBusy) return
-  const retitle = titleDue(chatId)
-  const tidy = canWarm() && (chats.getContextUsed(chatId) ?? 0) >= loaded.plan.contextLength * TIDY_AT
-  if (!retitle && !tidy) return
-  void llama.runIdle(async (signal) => {
-    if (retitle) await retitleChat(chatId, reasoning, signal)
-    if (tidy && !signal.aborted) await tidyChatNow(chatId, reasoning, signal)
-  })
-}
-
-/** Summarise a chat whose window is filling, then read the shorter conversation in. */
-async function tidyChatNow(chatId: string, reasoning: ReasoningChoice | null, signal: AbortSignal): Promise<void> {
-  const history = chats.loadMessages(chatId)
-  await restoreConversationMedia(chatId, history)
-  const preserveReasoning = loadSettings().reasoning.preserve
-  const report = await compactChat(chatId, history, {
-    automatic: true,
-    threshold: TIDY_AT,
-    preserveReasoning,
-    reasoning,
-    signal,
-    background: true
-  })
-  if (!report.ok || signal.aborted) return
-  const tools = chatToolsFor(chatId, history)
-  await readAhead(
-    {
-      messages: chatMessagesFor(chatId, history, preserveReasoning),
-      cacheKey: `chat:${chatId}`,
-      ...(tools ? { tools } : {}),
-      ...effortFields(reasoning)
-    },
-    signal
-  )
-}
-
-/** The same after an agent turn. */
-function tidyAgent(sessionId: string): void {
-  const loaded = llama.loaded
-  if (!loaded || !canWarm() || (chats.getContextUsed(sessionId) ?? 0) < loaded.plan.contextLength * TIDY_AT) return
-  void llama.runIdle(async (signal) => {
-    const session = chats.loadSession(sessionId)
-    if (!session) return
-    const a = getAgent()
-    await restoreConversationMedia(session.id, session.messages)
-    if (signal.aborted || agentTurnAbort) return
-    activeAgentSessionId = sessionId
-    a.hydrate(session)
-    const report = await a.compactNow(session, { signal, background: true })
-    if (!report.ok || signal.aborted || agentTurnAbort) return
-    if (typeof report.afterTokens === 'number') {
-      emit('agent:context', { sessionId, used: report.afterTokens, max: loaded.plan.contextLength })
-      chats.setContextUsed(sessionId, report.afterTokens)
-    }
-    const shorter = chats.loadSession(sessionId)
-    if (!shorter) return
-    await readAhead(
-      {
-        messages: a.buildHistory(shorter),
-        tools: a.toolsFor(shorter),
-        cacheKey: `agent:${sessionId}`,
-        ...effortFields(a.options.reasoningChoice)
-      },
-      signal
-    )
-  })
+  if (!titleDue(chatId)) return
+  void llama.runIdle((signal) => retitleChat(chatId, reasoning, signal))
 }
 
 export function modelsDir(): string {
@@ -1377,8 +1306,8 @@ interface ChatCompactionReport {
 /**
  * Summarise a chat's older messages so the conversation fits its window again.
  *
- * An automatic run only acts once the next prompt would pass three quarters of the window; a manual
- * one acts whenever there is something to fold away. A quarter of the window is kept word for word.
+ * Only ever when the user presses Compact; nothing is summarised unasked. The most recent messages
+ * are kept word for word: a quarter of the window, at most 32,000 tokens (see keepBudget).
  * A summary already stored is summarised again along with the messages after it, so each compaction
  * costs what has built up since the last one rather than the whole conversation.
  *
@@ -1389,16 +1318,10 @@ async function compactChat(
   chatId: string,
   history: AgentMessage[],
   opts: {
-    automatic: boolean
-    pendingTokens?: number
     preserveReasoning: boolean
     signal?: AbortSignal
     /** The effort level the conversation's turns are sent with, so the summary request starts as they do. */
     reasoning?: ReasoningChoice | null
-    /** Share of the window an automatic run waits for; three quarters unless said otherwise. */
-    threshold?: number
-    /** Run unasked after a turn: silent, the cheap route only, and no trace if stopped. */
-    background?: boolean
   }
 ): Promise<ChatCompactionReport> {
   const loaded = llama.loaded
@@ -1419,20 +1342,9 @@ async function compactChat(
   const before = (summary ? estimateTokens(summary.summary) : 0) + costs.reduce((a, n) => a + n, 0)
   const windowTokens = loaded.plan.contextLength || 8192
 
-  if (opts.automatic) {
-    /*
-     * The server's own count from the last turn wins when it is the larger.
-     *
-     * Characters over four undercounts code and anything that is not English prose, and a guess
-     * that is too low here is a request the server refuses, not a compaction a little early.
-     */
-    const measured = chats.getContextUsed(chatId) ?? 0
-    if (Math.max(before, measured) + (opts.pendingTokens ?? 0) <= windowTokens * (opts.threshold ?? 0.75)) {
-      return { ok: false, message: 'There is still room in the context window.' }
-    }
-  }
-
-  const cut = keepRecent(costs, Math.max(1500, Math.floor(windowTokens * 0.25)))
+  let cut = keepRecent(costs, keepBudget(windowTokens))
+  // A tool's result stays with the call that produced it.
+  while (cut > 0 && cut < live.length && live[cut].role === 'tool') cut--
   const older = live.slice(0, cut)
   if (older.length < (summary ? 1 : 2)) {
     return { ok: false, message: 'Nothing to compact yet — the recent messages are all that is in the window.' }
@@ -1445,8 +1357,14 @@ async function compactChat(
   ]
 
   let boundary: string | null = null
-  if (!opts.background) emit('chat:compacting', { chatId, automatic: opts.automatic })
+  emit('chat:compacting', { chatId, automatic: false })
   try {
+    // The requests this conversation's turns send, tools included: anything else starts the prompt
+    // differently and the whole of it is read again just to be summarised.
+    const tools = chatToolsFor(chatId, history)
+    const messages = chatMessagesFor(chatId, history, opts.preserveReasoning)
+    // Loaded from its save first, when the server is not holding it: a file read, not a reading.
+    await resumeSaved({ messages, cacheKey: `chat:${chatId}`, ...(tools ? { tools } : {}), ...effortFields(opts.reasoning) })
     /*
      * Asked of the conversation itself first.
      *
@@ -1455,19 +1373,15 @@ async function compactChat(
      */
     const inPlace = await summariseInPlace({
       kind: 'chat',
-      messages: chatMessagesFor(chatId, history, opts.preserveReasoning),
+      messages,
+      ...(tools ? { tools } : {}),
       cacheKey: `chat:${chatId}`,
       effort: effortFields(opts.reasoning),
       usedTokens: Math.max(before, chats.getContextUsed(chatId) ?? 0),
       signal: opts.signal,
-      background: opts.background,
-      onProgress: (percent) =>
-        opts.background
-          ? undefined
-          : emit('chat:compaction-progress', { chatId, percent, chunk: 1, chunks: 1, stage: 'merge', helper: null })
+      onProgress: (percent) => emit('chat:compaction-progress', { chatId, percent, chunk: 1, chunks: 1, stage: 'merge', helper: null })
     })
     if (opts.signal?.aborted) return { ok: false, message: 'Compaction was stopped.' }
-    if (!inPlace && opts.background) return { ok: false, message: 'Nothing was summarised.' }
     const text =
       inPlace ??
       (await summariseTranscript(items, {
@@ -1487,14 +1401,15 @@ async function compactChat(
     // An estimate until the next turn measures it, and far closer than the figure it replaces.
     chats.setContextUsed(chatId, after)
     emit('chat:context', { chatId, used: after, max: windowTokens })
+    // What was saved of it held the conversation as it was; the edges say so.
+    emit('state:removed', { key: `chat:${chatId}` })
     return { ok: true, message: `Summarised ${older.length} messages.`, beforeTokens: before, afterTokens: after }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     logger.warn('compaction', 'chat compaction failed; the chat goes on with its full history', { chatId, error: message })
     return { ok: false, message: `Compaction failed: ${message}` }
   } finally {
-    // Work done unasked is only announced once it has changed something.
-    if (!opts.background || boundary) emit('chat:compacted', { chatId, uptoMessageId: boundary })
+    emit('chat:compacted', { chatId, uptoMessageId: boundary })
   }
 }
 
@@ -2568,6 +2483,13 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
 
     const history = chats.loadMessages(chatId)
     /*
+     * Nothing is summarised unasked. A window that is already full is said so, with what to do,
+     * before the message is stored, and before the server refuses it with an error that says less.
+     */
+    if ((chats.getContextUsed(chatId) ?? 0) + estimateTokens(text) > loaded.plan.contextLength * 0.97) {
+      throw new Error('The context window is full. Press Compact to summarise the older messages, then send this again.')
+    }
+    /*
      * Rebuilt from storage every turn, so this is the only way past reasoning can come back.
      *
      * With the setting on, each earlier answer carries the thinking that produced it, and
@@ -2790,26 +2712,8 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const abort = new AbortController()
     inFlightChats.set(chatId, abort)
 
-    /*
-     * Room is made before the turn rather than after it fails.
-     *
-     * Chat had no compaction: once a conversation outgrew the window the server refused every
-     * request, and the only way on was a new chat. It is summarised the way an agent session is —
-     * the same passes, helper model and progress — before the prompt is built, and stopping the
-     * turn stops the compaction. The new message is costed but never summarised.
-     */
-    // What earlier messages sent is loaded first, so compaction counts and summarises their attachments too.
+    // What earlier messages sent is loaded first, so the prompt is built with their attachments.
     await restoreConversationMedia(chatId, history)
-    await compactChat(chatId, history, {
-      automatic: true,
-      pendingTokens:
-        estimateTokens(text) +
-        estimateTokens(String(loadSettings().generation.systemPrompt ?? '')) +
-        (attachments?.length ?? 0) * MEDIA_TOKEN_ESTIMATE,
-      preserveReasoning,
-      reasoning: effort,
-      signal: abort.signal
-    })
     const messages = chatMessagesFor(chatId, history, preserveReasoning)
     const generation = loadSettings().generation
     lastEffort.set(`chat:${chatId}`, effort)
@@ -3283,7 +3187,6 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     }
 
     chats.autoTitle(sessionId)
-    if (!turnAbort.signal.aborted) tidyAgent(sessionId)
     return session
   },
   /** Cut a chat turn short. Whatever has been generated so far is kept. */
@@ -3298,16 +3201,17 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
    * can be made cheaper before the next question rather than while that question waits.
    */
   'chat:compact': async (chatId: string): Promise<ChatCompactionReport> => {
-    await llama.preemptIdle()
-    if (inFlightChats.has(chatId)) {
+    // The model holds one conversation at a time; summarising another would turn out the one being answered.
+    if (agentTurnAbort || inFlightChats.size > 0) {
       return { ok: false, message: 'A reply is still being written — stop it or let it finish first.' }
     }
+    await llama.preemptIdle()
     const history = chats.loadMessages(chatId)
     // Loaded first, so the summary covers what attachments said rather than only their names.
     await restoreConversationMedia(chatId, history)
     return compactChat(chatId, history, {
-      automatic: false,
-      preserveReasoning: loadSettings().reasoning.preserve
+      preserveReasoning: loadSettings().reasoning.preserve,
+      reasoning: lastEffort.get(`chat:${chatId}`) ?? null
     })
   },
   'agent:stop': () => {
@@ -3464,6 +3368,10 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     }
   },
   'agent:compact': async (sessionId?: string) => {
+    // The model holds one conversation at a time; summarising another would turn out the one being answered.
+    if (agentTurnAbort || inFlightChats.size > 0) {
+      return { ok: false, message: 'A reply is still being written — stop it or let it finish first.' }
+    }
     await llama.preemptIdle()
     const id = sessionId || activeAgentSessionId
     const session = id ? chats.loadSession(id) : null
@@ -3476,7 +3384,23 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     // The history compaction leaves behind is the one the next turn uses, images included.
     await restoreConversationMedia(session.id, session.messages)
     a.hydrate(session)
-    const report = await a.compactNow(session)
+    // Loaded from its save first, when the server is not holding it: a file read, not a reading.
+    await resumeSaved({
+      messages: a.buildHistory(session),
+      tools: a.toolsFor(session),
+      cacheKey: `agent:${id}`,
+      ...effortFields(lastEffort.get(`agent:${id}`) ?? a.options.reasoningChoice)
+    })
+    let report: Awaited<ReturnType<typeof a.compactNow>>
+    try {
+      report = await a.compactNow(session)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      logger.warn('compaction', 'agent compaction failed; the session goes on with its full history', { sessionId: id, error: message })
+      return { ok: false, message: `Compaction failed: ${message}` }
+    }
+    // What was saved of it held the conversation as it was; the edges say so.
+    if (report.ok) emit('state:removed', { key: `agent:${id}` })
 
     /*
      * Re-measure, rather than leaving the old figure on screen.

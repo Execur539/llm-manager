@@ -548,15 +548,19 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             disabled={!activeId || busy}
             onClick={async () => {
               if (!activeId) return
-              const r = await invoke<{ ok: boolean; message: string; beforeTokens?: number; afterTokens?: number }>(
-                'agent:compact',
-                activeId
-              )
-              const saved =
-                r.ok && r.beforeTokens != null && r.afterTokens != null
-                  ? ` Freed about ${Math.max(0, r.beforeTokens - r.afterTokens).toLocaleString()} tokens.`
-                  : ''
-              toast(`${r.message}${saved}`, r.ok ? 'success' : 'info')
+              try {
+                const r = await invoke<{ ok: boolean; message: string; beforeTokens?: number; afterTokens?: number }>(
+                  'agent:compact',
+                  activeId
+                )
+                const saved =
+                  r.ok && r.beforeTokens != null && r.afterTokens != null
+                    ? ` Freed about ${Math.max(0, r.beforeTokens - r.afterTokens).toLocaleString()} tokens.`
+                    : ''
+                toast(`${r.message}${saved}`, r.ok ? 'success' : 'info')
+              } catch (err) {
+                toast(`Compaction failed: ${err instanceof Error ? err.message : String(err)}`, 'error')
+              }
             }}
             title="Summarise older turns to free context"
             data-testid="compact-session"

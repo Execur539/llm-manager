@@ -254,7 +254,10 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
       await invoke('chat:send', chatId, text, files, collectionId || undefined, effort)
       await refreshChats()
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      const why = err instanceof Error ? err.message : String(err)
+      setError(why)
+      // Refused before it was stored (a full window): the words go back in the box, not into thin air.
+      if (/context window is full/.test(why)) setInput((now) => now || text)
     } finally {
       setRunning(chatId, false)
     }

@@ -108,6 +108,18 @@ export function keepRecent(costs: number[], keepBudget: number, minKeep = 2): nu
   return cut
 }
 
+/** The most recent conversation a compaction ever leaves word for word, whatever the window. */
+export const KEEP_MAX_TOKENS = 32_000
+
+/**
+ * How much recent conversation a compaction leaves untouched: a quarter of the window, never more
+ * than KEEP_MAX_TOKENS. A quarter of a very large window is far more than the model needs to keep
+ * its thread, and all of it is read again after every compaction, since the summary goes in front.
+ */
+export function keepBudget(windowTokens: number): number {
+  return Math.min(KEEP_MAX_TOKENS, Math.max(1500, Math.floor(windowTokens * 0.25)))
+}
+
 /** What compaction needs from a helper model; the runtime's summariser service provides it. */
 export interface CompactionHelper {
   label: string
