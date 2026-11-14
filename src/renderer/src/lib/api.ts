@@ -162,6 +162,13 @@ export function fmtRelative(ts: number): string {
  * plain route. Neither carries a path — the id is looked up against the database at the other
  * end, so a client cannot ask for a file that was never attached.
  */
+/** The `index`th picture a tool result showed the model, served the same two ways as an attachment. */
+export function toolImageUrl(messageId: string, index: number): string {
+  return isDesktop
+    ? `llmm-media://sent/${encodeURIComponent(messageId)}?i=${index}`
+    : `/media?sent=${encodeURIComponent(messageId)}&i=${index}`
+}
+
 export function mediaUrl(id: string, variant: 'source' | 'optimised' = 'source'): string {
   const optimised = variant === 'optimised'
   // The two forms differ in more than their prefix: one already carries a query string, so the

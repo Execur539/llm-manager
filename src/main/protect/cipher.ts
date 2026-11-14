@@ -139,17 +139,24 @@ export function openBuffer(key: Buffer, sealed: Buffer): Buffer {
 }
 
 /** Encrypt `src` into `dst`, a chunk at a time, so a file of several gigabytes never sits in memory. */
-export async function sealFile(key: Buffer, src: string, dst: string): Promise<void> {
+export async function sealFile(
+  key: Buffer,
+  src: string,
+  dst: string,
+  onProgress?: (done: number, total: number) => void
+): Promise<void> {
   const input = await fsp.open(src, 'r')
   const output = await fsp.open(dst, 'w')
   try {
     const prefix = crypto.randomBytes(8)
     await output.write(Buffer.concat([FILE_MAGIC, prefix]))
-    const count = chunksFor((await input.stat()).size)
+    const size = (await input.stat()).size
+    const count = chunksFor(size)
     const buf = Buffer.allocUnsafe(CHUNK)
     for (let i = 0; i < count; i++) {
       const { bytesRead } = await input.read(buf, 0, CHUNK, i * CHUNK)
       await output.write(sealChunk(key, prefix, i, i === count - 1, buf.subarray(0, bytesRead)))
+      onProgress?.(Math.min(size, (i + 1) * CHUNK), size)
     }
   } finally {
     await input.close()

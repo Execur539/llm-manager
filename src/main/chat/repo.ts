@@ -338,7 +338,9 @@ export function loadMessages(chatId: string): AgentMessage[] {
   const box = chatBox(chatId)
   if (box.locked) throw new LockedError('chat')
   const attachments = attachmentsByMessage(chatId)
-  return all<MessageRow>('SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at, rowid', chatId).map((r) => ({
+  const rows = all<MessageRow>('SELECT * FROM messages WHERE chat_id = ? ORDER BY created_at, rowid', chatId)
+  const toolImages = toolImageCounts(chatId, new Set(rows.filter((r) => r.role === 'tool').map((r) => r.id)), box)
+  return rows.map((r) => ({
     id: r.id,
     role: r.role as AgentMessage['role'],
     content: box.open(r.content),
@@ -348,8 +350,49 @@ export function loadMessages(chatId: string): AgentMessage[] {
     toolCalls: r.tool_calls ? JSON.parse(box.open(r.tool_calls)) : undefined,
     toolResult: r.tool_result ? JSON.parse(box.open(r.tool_result)) : undefined,
     followUp: box.openOrNull(r.follow_up) ?? undefined,
+    ...(toolImages.has(r.id) ? { toolImages: toolImages.get(r.id) } : {}),
     createdAt: r.created_at
   }))
+}
+
+/** How many pictures each of these tool results showed the model, from what was recorded as sent. */
+function toolImageCounts(chatId: string, toolIds: Set<string>, box: Box): Map<string, number> {
+  const counts = new Map<string, number>()
+  if (!toolIds.size) return counts
+  for (const c of all<{ message_id: string; content: string }>('SELECT message_id, content FROM message_content WHERE chat_id = ?', chatId)) {
+    if (!toolIds.has(c.message_id)) continue
+    try {
+      const parts = JSON.parse(box.open(c.content)) as unknown
+      const n = Array.isArray(parts) ? parts.filter((p) => p && (p as { type?: string }).type === 'image').length : 0
+      if (n) counts.set(c.message_id, n)
+    } catch {
+      /* a record that cannot be read shows no pictures */
+    }
+  }
+  return counts
+}
+
+/** The file and type of the `index`th picture a message sent, for showing it. Null when there is none. */
+export function sentImage(messageId: string, index: number): { file: string; mime: string } | null {
+  let raw: string | null
+  try {
+    raw = loadSentContent(messageId)
+  } catch {
+    return null
+  }
+  if (!raw) return null
+  try {
+    const parts = JSON.parse(raw) as unknown
+    if (!Array.isArray(parts)) return null
+    const image = parts.filter((p) => p && p.type === 'image' && typeof p.file === 'string')[index] as
+      | { file: string; prefix: string }
+      | undefined
+    if (!image) return null
+    const mime = /^data:([^;,]+)/.exec(image.prefix ?? '')?.[1] ?? 'image/png'
+    return { file: image.file, mime: mime.startsWith('image/') ? mime : 'image/png' }
+  } catch {
+    return null
+  }
 }
 
 /**

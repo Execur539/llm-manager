@@ -303,14 +303,28 @@ function stateFolderPath(): string {
   return s.runtime.stateCache?.folder || path.join(path.dirname(s.modelsDir ?? defaultModelsDir()), 'LLMManagerStates')
 }
 
+/** Where saved states live. Always somewhere: saving is the Save state button's, not a setting's. */
 export function stateCacheFolder(): string | null {
-  return loadSettings().runtime.stateCache?.enabled ? stateFolderPath() : null
+  return stateFolderPath()
 }
 
-/** Where the server may save states: conversations when those are kept, the agent's instructions by default. */
+/** Where the server may save states: conversations, when the user saves one, and the agent's instructions. */
 export function slotSaveFolder(): string | null {
-  const r = loadSettings().runtime
-  return r.stateCache?.enabled || r.keepInstructions !== false ? stateFolderPath() : null
+  return stateFolderPath()
+}
+
+/**
+ * What a save during a turn is given: the request that resumes the reply stopped for it (the
+ * conversation with the reply so far as its final message, which is exactly what the server should
+ * hold when it saves), and that reply, thinking and answer.
+ */
+export interface TurnSaveMoment {
+  resume: CompletionOptions
+  reply: { content: string; reasoning: string }
+}
+
+function textOf(content: ChatMessage['content']): string {
+  return typeof content === 'string' ? content : content.filter((p) => p.type === 'text').map((p) => p.text ?? '').join('')
 }
 
 export class LlamaRuntime extends EventEmitter {
@@ -927,14 +941,132 @@ export class LlamaRuntime extends EventEmitter {
     return body
   }
 
+  /** A save asked for during a conversation's turn, waiting for its moment or running. */
+  private turnSave: {
+    key: string
+    run: (at: TurnSaveMoment) => Promise<void>
+    running: Promise<void> | null
+    settle: (outcome: 'saved' | 'missed', err?: unknown) => void
+  } | null = null
+  /** The reply being streamed for a person right now, and how to stop it for a save. */
+  private liveStream: { key: string; generating: boolean; toolStarted: boolean; pause: () => void } | null = null
+
+  /**
+   * Save conversation `key` in the middle of its turn.
+   *
+   * llama-server will not save a slot while it is generating, so a reply being written is stopped
+   * where it is, `run` saves (given the request that resumes the reply, which is exactly what the
+   * server should hold), and the reply carries on from the same character as a continuation of
+   * itself: whoever is reading the stream sees a pause, not a break. A call being written is never
+   * cut, and nothing can be saved while a tool runs, so then it waits for the model's next words.
+   * Resolves 'saved' once it has run, or 'missed' when the turn ended first (see missTurnSave);
+   * rejects with whatever `run` threw.
+   */
+  saveDuringTurn(key: string, run: (at: TurnSaveMoment) => Promise<void>): Promise<'saved' | 'missed'> {
+    if (this.turnSave) return Promise.reject(new Error('A save is already running.'))
+    return new Promise((resolve, reject) => {
+      this.turnSave = { key, run, running: null, settle: (outcome, err) => (err ? reject(err) : resolve(outcome)) }
+      const live = this.liveStream
+      if (live?.key === key && live.generating && !live.toolStarted) live.pause()
+    })
+  }
+
+  /** The turn for `key` is over: a save still waiting for its moment will not get one here. */
+  missTurnSave(key: string): void {
+    const save = this.turnSave
+    if (!save || save.key !== key || save.running) return
+    this.turnSave = null
+    save.settle('missed')
+  }
+
+  private async runTurnSave(at: TurnSaveMoment): Promise<void> {
+    const save = this.turnSave
+    if (!save || save.running) return
+    const running = save.run(at)
+    save.running = running.catch(() => undefined)
+    try {
+      await running
+      save.settle('saved')
+    } catch (err) {
+      save.settle('saved', err)
+    } finally {
+      if (this.turnSave === save) this.turnSave = null
+    }
+  }
+
   /**
    * Streaming completion yielding typed events.
    *
    * llama.cpp streams tool calls as incremental `delta.tool_calls` fragments, with the
    * arguments arriving as a partial JSON string across many frames — so fragments are
    * accumulated per index and only parsed once the stream ends.
+   *
+   * A person's reply can be stopped part way for a save (see saveDuringTurn) and is then resumed
+   * with `continueFinal`, in the same stream: the server, given the conversation with the reply so
+   * far as its final message, carries on from where it stopped, and only the new text comes back.
    */
   async *streamEvents(opts: CompletionOptions): AsyncGenerator<StreamEvent, void, unknown> {
+    // A save during this turn has the server; the next step waits for it.
+    while (this.turnSave?.running) await this.turnSave.running
+    const key = opts.cacheKey
+    const pausable = !!key && !opts.background && !opts.processOnly
+    // What this reply has written, across any pauses: the final message a resumption continues.
+    let content = ''
+    let reasoning = ''
+    const last = opts.messages.at(-1)
+    const prefill =
+      opts.continueFinal && last?.role === 'assistant'
+        ? { content: textOf(last.content), reasoning: last.reasoning_content ?? '' }
+        : { content: '', reasoning: '' }
+    let current = opts
+    for (;;) {
+      const pauser = new AbortController()
+      let paused = false
+      const live = {
+        key: key ?? '',
+        generating: false,
+        toolStarted: false,
+        pause: () => {
+          paused = true
+          pauser.abort()
+        }
+      }
+      if (pausable) this.liveStream = live
+      try {
+        const signal = opts.signal ? AbortSignal.any([opts.signal, pauser.signal]) : pauser.signal
+        for await (const ev of this.streamOnce({ ...current, signal })) {
+          if (ev.type === 'text') {
+            content += ev.text
+            live.generating = true
+          } else if (ev.type === 'reasoning') {
+            reasoning += ev.text
+            live.generating = true
+          } else if (ev.type === 'tool_call_partial' || ev.type === 'tool_call') {
+            live.toolStarted = true
+          }
+          yield ev
+          // A save asked for before the model had started writing: its first word is the moment.
+          if (pausable && !paused && this.turnSave?.key === key && !this.turnSave.running && live.generating && !live.toolStarted) live.pause()
+        }
+      } catch (err) {
+        if (!paused || opts.signal?.aborted) throw err
+      } finally {
+        if (this.liveStream === live) this.liveStream = null
+      }
+      if (!paused || opts.signal?.aborted) return
+      // Stopped for a save: the request that resumes the reply is what the server should hold.
+      const reply = { content: prefill.content + content, reasoning: prefill.reasoning + reasoning }
+      const messages = [...opts.messages]
+      if (opts.continueFinal && messages.at(-1)?.role === 'assistant') messages.pop()
+      messages.push({ role: 'assistant', content: reply.content, ...(reply.reasoning ? { reasoning_content: reply.reasoning } : {}) })
+      current = { ...opts, messages, continueFinal: true }
+      await this.runTurnSave({ resume: current, reply })
+      if (opts.signal?.aborted) return
+    }
+  }
+
+  /** One request's stream: what streamEvents runs, once, or again after a pause. */
+  private async *streamOnce(opts: CompletionOptions): AsyncGenerator<StreamEvent, void, unknown> {
     const loaded = this.current
     if (!loaded) throw new Error('No model is loaded')
 

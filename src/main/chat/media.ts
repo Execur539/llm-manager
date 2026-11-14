@@ -18,7 +18,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { Readable } from 'node:stream'
-import { attachmentFile } from './repo'
+import { attachmentFile, sentImage } from './repo'
 import { isSealedSync, readOpenSync } from '../protect/keys'
 
 /** Which of the two files an attachment can have. */
@@ -98,6 +98,23 @@ export function resolveMedia(id: string, variant: MediaVariant, rangeHeader?: st
 }
 
 /**
+ * A picture a tool showed the model, by the message it belongs to and its place among that
+ * message's pictures: looked up in what was recorded as sent, never named by path. Served from
+ * memory, decrypted first when the conversation is protected.
+ */
+export function resolveSentImage(messageId: string, index: number): MediaHit | null {
+  if (!messageId || !Number.isInteger(index) || index < 0) return null
+  const image = sentImage(messageId, index)
+  if (!image) return null
+  try {
+    const bytes = readOpenSync(image.file)
+    return { file: image.file, size: bytes.length, mime: image.mime, bytes }
+  } catch {
+    return null
+  }
+}
+
+/**
  * The single open-ended byte range players actually send.
  *
  * Multi-range requests are legal and no media element issues them, so they are declined rather
@@ -165,6 +182,11 @@ export function handleMediaProtocol(request: Request): Response {
   }
 
   const id = url.pathname.replace(/^\/+/, '')
+  if (url.host === 'sent') {
+    const sent = resolveSentImage(decodeURIComponent(id), Number(url.searchParams.get('i') ?? '0'))
+    if (!sent) return new Response(null, { status: 404 })
+    return new Response(Readable.toWeb(mediaStream(sent)) as ReadableStream, { status: 200, headers: mediaHeaders(sent) })
+  }
   const variant: MediaVariant = url.searchParams.get('v') === 'optimised' ? 'optimised' : 'source'
   const hit = id ? resolveMedia(id, variant, request.headers.get('range')) : null
   if (!hit) return new Response(null, { status: 404 })

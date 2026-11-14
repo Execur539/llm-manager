@@ -1487,6 +1487,9 @@ export class Agent extends EventEmitter {
           }
           session.messages.push(toolMsg)
           this.emit('message', toolMsg)
+          // What the model was shown, for the transcript to show the user as well.
+          const pictures = media.flatMap((part) => (part.type === 'image_url' && part.image_url ? [part.image_url.url] : []))
+          if (pictures.length && !this.sampling) this.emit('toolFrames', { messageId: toolMsg.id, frames: pictures })
 
           this.history.push({
             role: 'tool',

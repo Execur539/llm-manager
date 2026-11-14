@@ -30,6 +30,8 @@
  */
 
 import http from 'node:http'
+import fs from 'node:fs'
+import path from 'node:path'
 import { parseArgs } from 'node:util'
 
 const { values } = parseArgs({
@@ -37,12 +39,27 @@ const { values } = parseArgs({
     port: { type: 'string', default: '0' },
     host: { type: 'string', default: '127.0.0.1' },
     model: { type: 'string', default: 'mock-model.gguf' },
-    'ctx-size': { type: 'string', default: '4096' }
+    'ctx-size': { type: 'string', default: '4096' },
+    'slot-save-path': { type: 'string' }
   },
   strict: false
 })
 
 const PORT = Number(values.port)
+/** Where slot saves go, as llama-server's --slot-save-path says. */
+const SLOT_DIR = values['slot-save-path'] ? String(values['slot-save-path']) : null
+/** What the one slot holds, as the text of the prompt it last read: saved and restored with it. */
+let slotText = ''
+
+/** A stand-in chat template: each message on a line, and the assistant's turn opened unless continuing. */
+function renderTemplate(body) {
+  const lines = (body.messages ?? []).map((m) => {
+    const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+    return `<${m.role}>${m.reasoning_content ? `<think>${m.reasoning_content}</think>` : ''}${content}`
+  })
+  if (body.continue_final_message) return lines.join('\n')
+  return `${lines.join('\n')}\n<assistant>`
+}
 const HOST = values.host
 const MODEL = String(values.model).split(/[\\/]/).pop()
 
@@ -413,18 +430,30 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    /*
+     * Continuing the final assistant message (continue_final_message): only what comes after what
+     * it already says, as llama.cpp streams it. The slot holds what was read and written so far.
+     */
+    const last = messages.at(-1)
+    const resuming = body.continue_final_message && last?.role === 'assistant'
+    const wroteThinking = resuming ? (last.reasoning_content ?? '') : ''
+    const wroteAnswer = resuming && typeof last.content === 'string' ? last.content : ''
+    slotText = renderTemplate(body)
+
     // A reasoning model returns its chain of thought in reasoning_content, separately from the
     // answer, which is what llama.cpp does with --reasoning-format deepseek.
-    if (marker(messages, 'think')) {
-      for (const token of tokenise(THINKING)) {
+    if (marker(messages, 'think') && !wroteAnswer && wroteThinking.length < THINKING.length) {
+      for (const token of tokenise(THINKING.slice(wroteThinking.length))) {
         if (aborted) return
         send(frame({ reasoning_content: token }))
+        slotText += token
         await sleep(delay)
       }
     }
-    for (const token of tokenise(reply)) {
+    for (const token of tokenise(reply.slice(wroteAnswer.length))) {
       if (aborted) return
       send(frame({ content: token }))
+      slotText += token
       await sleep(delay)
     }
     send(frame({}, 'stop'))
@@ -433,6 +462,56 @@ const server = http.createServer(async (req, res) => {
     send({ ...frame({}), usage: { prompt_tokens: 100, completion_tokens: tokenise(reply).length } })
     res.write('data: [DONE]\n\n')
     return res.end()
+  }
+
+  if (url.pathname === '/apply-template' && req.method === 'POST') {
+    return json(res, 200, { prompt: renderTemplate(JSON.parse((await readBody(req)) || '{}')) })
+  }
+
+  if (url.pathname === '/completion' && req.method === 'POST') {
+    const body = JSON.parse((await readBody(req)) || '{}')
+    if (typeof body.prompt === 'string') slotText = body.prompt
+    return json(res, 200, { content: '', stop: true })
+  }
+
+  /*
+   * Slot saves, as llama-server does them: the file written to --slot-save-path under the name
+   * given, a little at a time (so a client watching it grow sees it grow), and read back by
+   * restore. The file starts with what the slot held, so a restore can say how many "tokens" it got.
+   */
+  if (url.pathname.startsWith('/slots/') && req.method === 'POST') {
+    const body = JSON.parse((await readBody(req)) || '{}')
+    const action = url.searchParams.get('action')
+    if (!SLOT_DIR || typeof body.filename !== 'string' || /[\\/]/.test(body.filename)) {
+      return json(res, 400, { error: { message: 'mock: no slot save path, or a bad file name' } })
+    }
+    const file = path.join(SLOT_DIR, body.filename)
+    if (action === 'save') {
+      fs.mkdirSync(SLOT_DIR, { recursive: true })
+      const tokens = tokenise(slotText).length
+      const head = Buffer.from(JSON.stringify({ text: slotText }) + '\n')
+      const pad = Buffer.alloc(256 * 1024, 7)
+      fs.writeFileSync(file, head)
+      for (let i = 0; i < 6; i++) {
+        fs.appendFileSync(file, pad)
+        await sleep(120)
+      }
+      return json(res, 200, { id_slot: 0, filename: body.filename, n_saved: tokens, n_written: head.length + pad.length * 6 })
+    }
+    if (action === 'restore') {
+      try {
+        const raw = fs.readFileSync(file)
+        const text = JSON.parse(raw.subarray(0, raw.indexOf(10)).toString()).text
+        slotText = text
+        return json(res, 200, { id_slot: 0, filename: body.filename, n_restored: tokenise(text).length, n_read: raw.length })
+      } catch (err) {
+        return json(res, 400, { error: { message: `mock: could not restore: ${err.message}` } })
+      }
+    }
+    if (action === 'erase') {
+      slotText = ''
+      return json(res, 200, { id_slot: 0, n_erased: 0 })
+    }
   }
 
   json(res, 404, { error: { message: `mock-llama: no route ${url.pathname}` } })

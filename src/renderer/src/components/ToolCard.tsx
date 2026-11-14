@@ -1,6 +1,19 @@
 import type { ToolCall, ToolResult } from '@shared/types'
 import { fmtDuration } from '../lib/api'
+import { useState } from 'react'
+import type { SaveMark } from './SaveState'
 import Icon from './Icon'
+
+/** One picture the model was shown; gone quietly if its file has since gone. */
+function ToolImage({ src, label }: { src: string; label: string }): JSX.Element | null {
+  const [failed, setFailed] = useState(false)
+  if (failed) return null
+  return (
+    <figure className="tool-image">
+      <img src={src} alt={`What the model was shown: ${label}`} loading="lazy" onError={() => setFailed(true)} />
+    </figure>
+  )
+}
 
 /** Seconds as m:ss, the way watch_video labels its frames. */
 function clock(seconds: number): string {
@@ -31,19 +44,27 @@ function detailOf(call: ToolCall): string | null {
  * Shared by the agent and by chat, whose only tools are its scratchpad's. `frames` are the pictures
  * a look at a video returned, shown under the line so the reader sees what the model saw; they are
  * held in memory with the scratchpad, so a reopened conversation shows the line without them.
+ *
+ * `images` are pictures a tool showed the model whole (read_image, a screenshot, the clipboard),
+ * shown at a size worth looking at, so the user sees what the model is looking at as it does.
  */
 export default function ToolCard({
   call,
   result,
-  frames
+  frames,
+  images,
+  save
 }: {
   call: ToolCall
   result?: ToolResult
   frames?: string[]
+  images?: string[]
+  /** Whether the conversation's saved model state holds this call; drawn as its edge. */
+  save?: SaveMark | null
 }): JSX.Element {
   const detail = detailOf(call)
   return (
-    <div className="msg-aside">
+    <div className="msg-aside" data-save={save?.state}>
       <details className="tool-card" data-testid="tool-card">
         <summary>
           {/* A dot carries the state; the word is there for screen readers and on hover. */}
@@ -73,6 +94,13 @@ export default function ToolCard({
           )}
         </div>
       </details>
+      {images && images.length > 0 && (
+        <div className="tool-images" data-testid="tool-images">
+          {images.map((src, i) => (
+            <ToolImage key={src} src={src} label={`${detail ?? call.name}${images.length > 1 ? ` (${i + 1})` : ''}`} />
+          ))}
+        </div>
+      )}
       {frames && frames.length > 0 && (
         <div className="tool-frames" data-testid="tool-frames">
           {frames.map((src, i) => (

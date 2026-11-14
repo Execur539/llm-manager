@@ -15,7 +15,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { app } from 'electron'
 import { loadSettings } from '../storage/settings'
-import { resolveMedia, mediaHeaders, mediaStream } from '../chat/media'
+import { resolveMedia, resolveSentImage, mediaHeaders, mediaStream } from '../chat/media'
 import {
   isLockedOut,
   issueSession,
@@ -393,7 +393,13 @@ export class RemoteWebServer {
     if (url.pathname === '/media') {
       const id = url.searchParams.get('id') ?? ''
       const variant = url.searchParams.get('v') === 'optimised' ? 'optimised' : 'source'
-      const hit = id ? resolveMedia(id, variant, req.headers.range ?? null) : null
+      // A picture a tool showed the model is named by its message and place, like an attachment by its id.
+      const sent = url.searchParams.get('sent')
+      const hit = sent
+        ? resolveSentImage(sent, Number(url.searchParams.get('i') ?? '0'))
+        : id
+          ? resolveMedia(id, variant, req.headers.range ?? null)
+          : null
       if (!hit) {
         res.writeHead(404, baseHeaders)
         res.end()

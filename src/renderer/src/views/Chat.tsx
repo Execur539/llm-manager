@@ -31,7 +31,7 @@ import PromptProgress from '../components/PromptProgress'
 import MediaStage from '../components/MediaStage'
 import ContextMeter from '../components/ContextMeter'
 import CompactingNotice from '../components/CompactingNotice'
-import KeepReadyButton from '../components/KeepReadyButton'
+import { SaveStateButton, saveMarks, useSaveCoverage, withSavePoint } from '../components/SaveState'
 import { LockedPanel, ProtectButton } from '../components/Protect'
 import ConfirmDialog from '../components/ConfirmDialog'
 import JumpToLatest from '../components/JumpToLatest'
@@ -39,7 +39,6 @@ import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
 import ToolCard from '../components/ToolCard'
 import PendingToolCall from '../components/PendingToolCall'
-import SavedState from '../components/SavedState'
 import ParametersPanel, { ParamsToggle, useParamsPanel } from '../components/ParametersPanel'
 
 interface Collection {
@@ -81,6 +80,14 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
   const locked = busy || !!compacting || sealed
   const [reloadTick, setReloadTick] = useState(0)
   const [confirmExport, setConfirmExport] = useState(false)
+  // Which of the conversation the saved model state holds, drawn as an edge on each message.
+  const saveKey = activeId ? `chat:${activeId}` : null
+  const coverage = useSaveCoverage(saveKey, messages)
+  const savingNow = saveKey ? stream.savingStates[saveKey] : undefined
+  const marks = saveMarks(messages, coverage, savingNow, partial || reasoning ? { content: partial, reasoning } : null)
+  const allSaved =
+    !!coverage?.through && !coverage.otherModel && coverage.through === messages.at(-1)?.id && !partial && !reasoning && !busy
+  const live = withSavePoint(marks.streaming, partial, reasoning)
   // Usable before the first message: the choice is held against a draft key and adopted by
   // whatever conversation the message goes on to create.
   const effortId = activeId ?? DRAFT_CHAT
@@ -309,7 +316,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
               Compact
             </button>
           )}
-          <KeepReadyButton stateKey={activeId ? `chat:${activeId}` : null} />
+          <SaveStateButton stateKey={saveKey} canSave={!!loaded && !sealed && !compacting} allSaved={allSaved} hasMessages={messages.length > 0} />
           <ProtectButton kind="chat" id={activeId} state={activeChat} disabled={busy || !!compacting} />
           {activeId && (
             <button
@@ -354,18 +361,21 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
             />
           )}
 
-          {messages.map((m) => (
+          {messages.map((m) => {
+            const mark = marks.byId.get(m.id)
+            const shown = withSavePoint(mark, m.content, m.reasoning)
+            return (
             <Fragment key={m.id}>
               {/* The model using its scratchpad: a line per call, with the frames it looked at. */}
               {m.role === 'tool' && m.toolCalls?.[0] ? (
-                <ToolCard call={m.toolCalls[0]} result={m.toolResult} frames={stream.toolFrames[m.id]} />
+                <ToolCard call={m.toolCalls[0]} result={m.toolResult} frames={stream.toolFrames[m.id]} save={mark} />
               ) : (
-              <MessageRow role={m.role}>
+              <MessageRow role={m.role} save={mark}>
                 {m.role === 'assistant' ? (
                   <>
-                    {m.reasoning && <ThinkingBlock text={m.reasoning} />}
+                    {shown.reasoning && <ThinkingBlock text={shown.reasoning} />}
                     {/* Kept in step with Agent: a reasoning-only turn renders no empty body. */}
-                    {m.content && <Markdown source={m.content} />}
+                    {shown.content && <Markdown source={shown.content} />}
                   </>
                 ) : (
                   <>
@@ -389,19 +399,20 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
                 </div>
               )}
             </Fragment>
-          ))}
+            )
+          })}
 
           {/*
             * In the order it happened: the thinking and words of this round, then the calls the
             * model is writing, then the call that is running.
             */}
           {(partial || reasoning || ultra.length > 0) && (
-            <MessageRow role="assistant" testId="streaming-message">
+            <MessageRow role="assistant" testId="streaming-message" save={marks.streaming}>
               <UltraSamples samples={ultra} synthesising={synthesising} />
-              {reasoning && <ThinkingBlock text={reasoning} streaming answerStarted={!!partial || writing.length > 0} />}
+              {reasoning && <ThinkingBlock text={live.reasoning ?? reasoning} streaming answerStarted={!!partial || writing.length > 0} />}
               {partial && (
                 <div className="body streaming">
-                  <Markdown source={partial} caret={!writing.length} />
+                  <Markdown source={live.content} caret={!writing.length} />
                 </div>
               )}
             </MessageRow>
@@ -515,7 +526,6 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
                   {stream.speed[activeId].toFixed(stream.speed[activeId] < 10 ? 1 : 0)} tok/s
                 </span>
               ) : null}
-              <SavedState stateKey={activeId ? `chat:${activeId}` : null} canSave={!!loaded && !locked && messages.length > 0} />
               {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
               <button
                 className={`send-button${busy ? ' stopping' : ''}`}

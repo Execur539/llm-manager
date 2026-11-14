@@ -577,6 +577,8 @@ export interface AgentMessage {
   plan?: string
   toolCalls?: ToolCall[]
   toolResult?: ToolResult
+  /** How many pictures this tool result showed the model, kept with the conversation and shown under it. */
+  toolImages?: number
   /**
    * An instruction the agent loop sent the model straight after this reply.
    *

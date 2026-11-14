@@ -53,7 +53,64 @@ export interface StateMeta {
   fileBytes?: number
   savedAt: number
   usedAt: number
+  /**
+   * Whether a loaded state can be cut back to an earlier point. A model with recurrent layers
+   * cannot, so for one a conversation changed inside the saved part makes the save useless.
+   */
+  canTrim?: boolean
+  /** The messages the state covers, in order, each with a hash of what of it the model reads. */
+  messages?: StateMark[]
+  /** The message a summary stood in for, up to, when it was saved: a new summary changes everything after it. */
+  summaryUpto?: string | null
+  /**
+   * Saved part way through a reply: how much of it the state holds (characters of its answer and
+   * of its thinking), and a hash of exactly that, to tell later whether the finished reply still
+   * begins that way. The reply is the message after the last of `messages`.
+   */
+  partial?: PartialMark | null
 }
+
+export interface PartialMark {
+  content: number
+  reasoning: number
+  hash: string
+}
+
+/** What a save covers, as given to it. */
+export interface StateCovers {
+  messages: StateMark[]
+  summaryUpto: string | null
+  canTrim: boolean
+  partial?: PartialMark | null
+}
+
+/** A message a save covers: its id, and a hash of what the model reads of it. */
+export interface StateMark {
+  id: string
+  hash: string
+}
+
+/**
+ * How many of the conversation's messages, from the start, the saved state still holds as they are.
+ *
+ * Everything said after a save is simply not covered: it is read again on top of the loaded state,
+ * never lost. A message changed, removed or rewound inside the saved part ends the covered run
+ * there. A model that can cut its state back reuses what comes before; one with recurrent layers
+ * cannot, so for it the save is no use at all (`dropped`).
+ */
+export function coverage(meta: StateMeta, current: StateMark[], summaryUpto: string | null): { count: number; dropped: boolean } {
+  const saved = meta.messages
+  if (!saved?.length) return { count: 0, dropped: false }
+  let k = 0
+  if ((meta.summaryUpto ?? null) === summaryUpto) {
+    while (k < saved.length && k < current.length && saved[k].id === current[k].id && saved[k].hash === current[k].hash) k++
+  }
+  if (k === saved.length) return { count: k, dropped: false }
+  return meta.canTrim ? { count: k, dropped: false } : { count: 0, dropped: true }
+}
+
+/** How a save is going, while it runs: the server writing the file, then (protected) encrypting it. */
+export type SaveProgress = { stage: 'writing' | 'encrypting'; done: number; total: number | null }
 
 /**
  * When a conversation is worth saving again at a quiet moment: what checkpointDue weighs.
@@ -179,6 +236,21 @@ export async function currentState(o: {
   return prefix.length === meta.prefixChars && sha(prefix) === meta.prefixHash ? meta : null
 }
 
+/**
+ * The saved state, of any conversation, that holds the longest start of this one: the instructions
+ * every conversation begins with, or the history a fork shares with the conversation it came from.
+ * Only states saved under the same load, and only those `allow` lets through. Null when none does.
+ */
+export function longestReusable(dir: string, fingerprint: string, prefix: string, allow: (meta: StateMeta) => boolean): StateMeta | null {
+  let best: StateMeta | null = null
+  for (const s of listStates(dir)) {
+    if (s.fingerprint !== fingerprint || s.prefixChars > prefix.length || (best && s.prefixChars <= best.prefixChars)) continue
+    if (!allow(s) || sha(prefix.slice(0, s.prefixChars)) !== s.prefixHash) continue
+    best = s
+  }
+  return best
+}
+
 function metaPath(dir: string, key: string): string {
   return path.join(dir, `${fileStem(key)}.json`)
 }
@@ -250,6 +322,11 @@ export async function saveState(o: {
   signal?: AbortSignal
   /** A protected conversation's key: the state is stored encrypted under it. */
   seal?: Buffer
+  /** What it covers, kept in its record so the window can show which messages are saved. */
+  covers?: StateCovers
+  /** About how large the file will be, from earlier saves, for reporting how far writing it has got. */
+  expectedBytes?: number | null
+  onProgress?: (p: SaveProgress) => void
 }): Promise<StateResult> {
   if (!o.req.messages.length) return { ok: false, why: 'the conversation is empty' }
   if (hasMedia(o.req.messages)) return { ok: false, why: 'the conversation contains images, audio or video' }
@@ -258,6 +335,88 @@ export async function saveState(o: {
     if (!prefix) return { ok: false, why: 'the conversation rendered to nothing' }
     // Leaves the slot holding exactly this text: nothing after it for a later prompt to undo.
     await post(o.base, '/completion', { prompt: prefix, n_predict: 0, cache_prompt: true, stream: false }, o.signal)
+    return await writeState(o, prefix)
+  } catch (err) {
+    clearPartials(o.dir, o.key)
+    return { ok: false, why: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
+ * Save a conversation part way through a reply: `sent` is the request that resumes it, the
+ * conversation with the reply so far as its final message.
+ *
+ * The server is brought to exactly that text first, as an ordinary save brings it to the end of
+ * the conversation. Stopping a stream leaves it holding a token or two the window never received,
+ * and a state holding those would not match the resumed reply, nor the finished one later. The
+ * record vouches for that text, so a later load checks the conversation still begins with it.
+ */
+export async function saveAsIs(o: {
+  base: string
+  dir: string
+  key: string
+  fingerprint: string
+  sent: StateRequest & { continueFinal?: boolean }
+  signal?: AbortSignal
+  seal?: Buffer
+  covers?: StateCovers
+  expectedBytes?: number | null
+  onProgress?: (p: SaveProgress) => void
+}): Promise<StateResult> {
+  if (!o.sent.messages.length) return { ok: false, why: 'the conversation is empty' }
+  if (hasMedia(o.sent.messages)) return { ok: false, why: 'the conversation contains images, audio or video' }
+  try {
+    const prefix = await renderSent(o.base, o.sent, o.signal)
+    if (!prefix) return { ok: false, why: 'the conversation rendered to nothing' }
+    await post(o.base, '/completion', { prompt: prefix, n_predict: 0, cache_prompt: true, stream: false }, o.signal)
+    return await writeState(o, prefix)
+  } catch (err) {
+    clearPartials(o.dir, o.key)
+    return { ok: false, why: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** The prompt a request sent, as the server rendered it. */
+async function renderSent(base: string, req: StateRequest & { continueFinal?: boolean }, signal?: AbortSignal): Promise<string> {
+  const body: Record<string, unknown> = { messages: req.messages }
+  if (req.tools?.length) {
+    body.tools = req.tools.map((t) => ({
+      type: 'function',
+      function: { name: t.name, description: t.description, parameters: t.parameters }
+    }))
+  }
+  if (req.reasoningEffort) body.reasoning_effort = req.reasoningEffort
+  if (req.chatTemplateKwargs && Object.keys(req.chatTemplateKwargs).length) body.chat_template_kwargs = req.chatTemplateKwargs
+  if (req.continueFinal) {
+    body.add_generation_prompt = false
+    body.continue_final_message = true
+  }
+  const out = await post(base, '/apply-template', body, signal)
+  if (typeof out.prompt !== 'string') throw new Error('the server did not return a rendered prompt')
+  return out.prompt
+}
+
+function clearPartials(dir: string, key: string): void {
+  fs.rmSync(path.join(dir, `${fileStem(key)}.next.bin`), { force: true })
+  fs.rmSync(path.join(dir, `${fileStem(key)}.next.lk`), { force: true })
+}
+
+/** Write what the slot holds to the conversation's file and its record, `prefix` being the text it holds. */
+async function writeState(
+  o: {
+    base: string
+    dir: string
+    key: string
+    fingerprint: string
+    signal?: AbortSignal
+    seal?: Buffer
+    covers?: StateCovers
+    expectedBytes?: number | null
+    onProgress?: (p: SaveProgress) => void
+  },
+  prefix: string
+): Promise<StateResult> {
+  {
     const stem = fileStem(o.key)
     /*
      * Written beside the last good state, and only put in its place once it is whole.
@@ -268,7 +427,22 @@ export async function saveState(o: {
      */
     const next = path.join(o.dir, `${stem}.next.bin`)
     fs.rmSync(next, { force: true })
-    const saved = await post(o.base, '/slots/0?action=save', { filename: `${stem}.next.bin` }, o.signal)
+    // The server says nothing until the file is written, so how far it has got is read off the file as it grows.
+    const watch = o.onProgress
+      ? setInterval(() => {
+          try {
+            o.onProgress?.({ stage: 'writing', done: fs.statSync(next).size, total: o.expectedBytes ?? null })
+          } catch {
+            /* not started yet */
+          }
+        }, 250)
+      : null
+    let saved: Record<string, unknown>
+    try {
+      saved = await post(o.base, '/slots/0?action=save', { filename: `${stem}.next.bin` }, o.signal)
+    } finally {
+      if (watch) clearInterval(watch)
+    }
     let written = next
     if (o.seal) {
       /*
@@ -278,7 +452,7 @@ export async function saveState(o: {
        */
       written = path.join(o.dir, `${stem}.next.lk`)
       try {
-        await sealFile(o.seal, next, written)
+        await sealFile(o.seal, next, written, (done, total) => o.onProgress?.({ stage: 'encrypting', done, total }))
       } finally {
         fs.rmSync(next, { force: true })
       }
@@ -294,17 +468,16 @@ export async function saveState(o: {
       bytes: Number(saved.n_written ?? 0),
       fileBytes,
       savedAt: Date.now(),
-      usedAt: Date.now()
+      usedAt: Date.now(),
+      ...(o.covers
+        ? { canTrim: o.covers.canTrim, messages: o.covers.messages, summaryUpto: o.covers.summaryUpto, partial: o.covers.partial ?? null }
+        : {})
     }
     // The record is written last and whole, so a state without one is never taken for a good one.
     const tmp = `${metaPath(o.dir, o.key)}.tmp`
     fs.writeFileSync(tmp, JSON.stringify(meta))
     fs.renameSync(tmp, metaPath(o.dir, o.key))
     return { ok: true, meta }
-  } catch (err) {
-    fs.rmSync(path.join(o.dir, `${fileStem(o.key)}.next.bin`), { force: true })
-    fs.rmSync(path.join(o.dir, `${fileStem(o.key)}.next.lk`), { force: true })
-    return { ok: false, why: err instanceof Error ? err.message : String(err) }
   }
 }
 
@@ -324,24 +497,34 @@ export async function restoreState(o: {
   signal?: AbortSignal
   /** A protected conversation's key, when its state is stored encrypted. */
   seal?: Buffer
+  /**
+   * Another conversation's state, borrowed for the start this one shares with it. Never removed
+   * or changed here, whatever is found: it is not this conversation's to discard.
+   */
+  borrowed?: boolean
 }): Promise<StateResult> {
   const meta = readMeta(o.dir, o.key)
   if (!meta) return { ok: false, why: 'nothing is saved for this conversation' }
-  if (meta.fingerprint !== o.fingerprint) {
-    removeState(o.dir, o.key)
-    return { ok: false, why: 'it was saved under a different model or different load settings' }
-  }
+  // Kept, not removed: the user saved it, and it loads again once that model is back.
+  if (meta.fingerprint !== o.fingerprint) return { ok: false, why: 'it was saved under a different model or different load settings' }
   if (hasMedia(o.req.messages)) return { ok: false, why: 'the conversation contains images, audio or video' }
   try {
     const prefix = await renderPrefix(o.base, o.req, o.signal)
-    if (prefix.length < meta.prefixChars || sha(prefix.slice(0, meta.prefixChars)) !== meta.prefixHash) {
-      removeState(o.dir, o.key)
+    const begins = prefix.length >= meta.prefixChars && sha(prefix.slice(0, meta.prefixChars)) === meta.prefixHash
+    /*
+     * Changed inside the saved part. A model that can cut its state back still gains: the server
+     * keeps what matches the new prompt and reads the rest. One with recurrent layers cannot, and
+     * the save is of no use to it any more.
+     */
+    if (!begins && (o.borrowed || !meta.canTrim)) {
+      if (!o.borrowed) removeState(o.dir, o.key)
       return { ok: false, why: 'the conversation no longer begins the way it did when it was saved' }
     }
     const stem = fileStem(o.key)
     const sealed = await isSealedFile(path.join(o.dir, `${stem}.bin`))
     if (sealed !== !!o.seal) {
       // Encrypted with no key to open it, or a protected conversation's state left plain: neither is used.
+      if (o.borrowed) return { ok: false, why: 'it is encrypted' }
       removeState(o.dir, o.key)
       return { ok: false, why: sealed ? 'it is encrypted and the conversation is not protected' : 'it was saved before the conversation was protected' }
     }
@@ -359,7 +542,7 @@ export async function restoreState(o: {
     }
     if (Number(loaded.n_restored ?? -1) !== meta.tokens) {
       // The file and its record disagree, so neither can be trusted again.
-      removeState(o.dir, o.key)
+      if (!o.borrowed) removeState(o.dir, o.key)
       return { ok: false, why: `the server restored ${String(loaded.n_restored)} tokens where ${meta.tokens} were saved` }
     }
     const used: StateMeta = { ...meta, usedAt: Date.now() }

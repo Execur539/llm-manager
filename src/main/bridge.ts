@@ -43,7 +43,23 @@ import { DEFAULT_CONSTRAINTS, gpuKey, usableDevices } from './autofit/engine'
 import { describeLoad, extrasFromLoad, learnedExtras, planModel, recordSpeed, type ExtrasFeatures } from './autofit/planner'
 import { llama, estimateTokens, type ChatMessage, type ContentPart, type CompletionOptions } from './runtime/llama'
 import type { RereadReport } from './runtime/reuse-meter'
-import { checkpointDue, currentState, hasMedia, listStates, prune, readMeta, removeState, restoreState, saveState } from './runtime/state-cache'
+import {
+  coverage,
+  currentState,
+  hasMedia,
+  listStates,
+  longestReusable,
+  renderPrefix,
+  prune,
+  readMeta,
+  removeState,
+  restoreState,
+  saveAsIs,
+  saveState,
+  type PartialMark,
+  type SaveProgress,
+  type StateMark
+} from './runtime/state-cache'
 import { stateCacheFolder } from './runtime/llama'
 import crypto from 'node:crypto'
 import { missingBinaries, embeddingModelPath, vendorDiagnostics, llamaServerPath } from './runtime/binaries'
@@ -303,12 +319,11 @@ function canWarm(): boolean {
 function warm(req: CompletionOptions): boolean {
   if (!req.messages.length || llama.holds(req)) return false
   void llama.runIdle(async (signal) => {
-    // What the server holds now is about to be replaced; keep it first if states are kept.
-    await parkHeld(req.cacheKey ?? null, signal)
-    if (signal.aborted) return
-    // A kept state is a file read; reading the conversation is the fallback.
-    if (await restoreSaved(req, signal)) return
-    await seedInstructions(req, signal, true)
+    /*
+     * A saved state is a file read; whatever was said after it was saved is read on top of it,
+     * so nothing after a save is lost, only read again. With nothing saved, the whole of it is read.
+     */
+    if (!(await restoreSaved(req, signal)) && !signal.aborted) await seedInstructions(req, signal, true)
     if (signal.aborted) return
     await readAhead(req, signal)
   })
@@ -353,54 +368,7 @@ function stateSeal(key: string): Buffer | undefined | 'locked' {
   return keyOf(owner) ?? 'locked'
 }
 
-/** Conversations whose saved state is never removed to make room. */
-function statePins(dir: string): Set<string> {
-  try {
-    const pins = JSON.parse(fs.readFileSync(path.join(dir, 'pins.json'), 'utf8')) as unknown
-    return new Set(Array.isArray(pins) ? pins.filter((p): p is string => typeof p === 'string') : [])
-  } catch {
-    return new Set()
-  }
-}
 
-/**
- * Save what the server holds before it is lost, when that is a conversation other than `nextKey`.
- *
- * Called at the three moments the server stops holding a conversation: another one is about to
- * be read in, the model is being unloaded, and the app is closing. Never throws; a state that
- * could not be saved costs a reading later, not the turn that is waiting now.
- */
-async function parkHeld(nextKey: string | null, signal?: AbortSignal): Promise<void> {
-  const store = llama.stateStore
-  const held = llama.heldKey
-  if (!store || !held || held === nextKey || !conversationStates()) return
-  // A conversation in the middle of a reply is not parked; its turn leaves the server holding it again.
-  if (held.startsWith('agent:') && agentTurnAbort) return
-  if (held.startsWith('chat:') && inFlightChats.has(held.slice('chat:'.length))) return
-  const seal = stateSeal(held)
-  if (seal === 'locked') return
-  try {
-    const req = await conversationRequest(held)
-    // Only what the server is still holding: bringing it there first would mean reading it all.
-    if (!req || signal?.aborted || !llama.holds(req)) return
-    // Already on disk exactly as it is: a quiet moment's save made it, and rewriting it would change nothing.
-    const shape = stateShape(req)
-    if (savedShapes.get(held) === shape && readMeta(store.dir, held)) return
-    const result = await saveState({ ...store, key: held, req, signal, seal })
-    if (!result.ok) {
-      logger.info('prompt', `${held} was not saved to disk: ${result.why}`)
-      return
-    }
-    savedShapes.set(held, shape)
-    llama.assumeHeld(req)
-    // Said where the conversation is, so it is visible that coming back to it will not mean waiting.
-    emit('state:saved', { key: held, tokens: result.meta.tokens, savedAt: result.meta.savedAt })
-    const removed = pruneStates(store.dir)
-    logger.info('prompt', `saved ${held} to disk`, { tokens: result.meta.tokens, bytes: result.meta.bytes, removed })
-  } catch (err) {
-    logger.warn('prompt', `could not save ${held} to disk`, err)
-  }
-}
 
 function ownerOf(kind: OwnerKind, id: string): Owner {
   if ((kind !== 'chat' && kind !== 'collection') || typeof id !== 'string' || !id) throw new Error('Nothing to protect')
@@ -418,10 +386,7 @@ function refuseWhileBusy(owner: Owner): void {
 function dropSavedStates(owner: Owner): void {
   if (owner.kind !== 'chat') return
   const dir = llama.stateStore?.dir ?? stateCacheFolder()
-  for (const key of [`chat:${owner.id}`, `agent:${owner.id}`]) {
-    savedShapes.delete(key)
-    if (dir) removeState(dir, key)
-  }
+  for (const key of [`chat:${owner.id}`, `agent:${owner.id}`]) if (dir) removeState(dir, key)
 }
 
 function protectChanged(owner: Owner): void {
@@ -429,19 +394,14 @@ function protectChanged(owner: Owner): void {
 }
 
 /**
- * Before a conversation is locked: nothing of it left readable in the app or the server. What the
- * server holds is saved, encrypted, while the key is still here, and then the server's copy is
- * erased; its scratchpad and the frames it was shown go too.
+ * Before a conversation is locked: nothing of it left readable in the app or the server. The
+ * server's copy is erased (what was saved of it stays saved, encrypted); its scratchpad and the
+ * frames it was shown go too.
  */
 async function letGoOf(id: string): Promise<void> {
-  for (const key of [`chat:${id}`, `agent:${id}`]) {
-    clearTimeout(checkpointTimers.get(key))
-    checkpointTimers.delete(key)
-  }
   const held = llama.heldKey
   if (held === `chat:${id}` || held === `agent:${id}`) {
     await llama.preemptIdle().catch(() => undefined)
-    await parkHeld(null, AbortSignal.timeout(120_000))
     await llama.eraseHeld()
   }
   await scratchpad.clearChat(id)
@@ -452,9 +412,126 @@ async function letGoOf(id: string): Promise<void> {
 /** Bring the folder under its budget after a save, never removing a pinned conversation or the agent's instructions. */
 function pruneStates(dir: string): string[] {
   const budget = Math.max(1, loadSettings().runtime.stateCache.budgetGb) * 1024 ** 3
-  const pins = statePins(dir)
-  for (const s of listStates(dir)) if (s.key.startsWith(INSTRUCTIONS_PREFIX)) pins.add(s.key)
-  return prune(dir, budget, pins)
+  const keep = new Set(listStates(dir).filter((s) => s.key.startsWith(INSTRUCTIONS_PREFIX)).map((s) => s.key))
+  return prune(dir, budget, keep)
+}
+
+/** A conversation's messages as they are now, for a key such as chat:<id> or agent:<id>. */
+function conversationMessages(key: string): AgentMessage[] {
+  const id = key.slice(key.indexOf(':') + 1)
+  if (key.startsWith('agent:')) return liveAgentSessions.get(id)?.messages ?? chats.loadSession(id)?.messages ?? []
+  return chats.loadMessages(id)
+}
+
+/**
+ * What a save covers, message by message: each message's id and a hash of what the model reads of
+ * it. Keyed by a protected conversation's own key, so the record beside its encrypted state cannot
+ * be used to test guesses at what was said.
+ */
+function markHash(key: string, value: unknown): string {
+  const seal = stateSeal(key)
+  const keyed = Buffer.isBuffer(seal) ? seal : null
+  return (keyed ? crypto.createHmac('sha256', keyed) : crypto.createHash('sha256')).update(JSON.stringify(value)).digest('hex').slice(0, 24)
+}
+
+function stateMarks(key: string, messages: AgentMessage[]): StateMark[] {
+  return messages.map((m) => ({
+    id: m.id,
+    hash: markHash(key, [m.role, m.content, m.reasoning ?? null, m.plan ?? null, m.toolCalls ?? null, m.toolResult?.content ?? null, m.followUp ?? null])
+  }))
+}
+
+/**
+ * How much of a reply a save stopped part way holds. Measured from the first character that is not
+ * white space, since a stored reply may have lost the line breaks it started with.
+ */
+function partialMark(key: string, reply: { content: string; reasoning: string }): PartialMark {
+  const content = reply.content.trimStart()
+  const reasoning = reply.reasoning.trimStart()
+  return { content: content.length, reasoning: reasoning.length, hash: markHash(key, [reasoning, content]) }
+}
+
+/** Whether a reply, as it stands now, still begins with what a save holds of it. */
+function replyBegins(key: string, m: { content: string; reasoning?: string }, mark: PartialMark): boolean {
+  const content = m.content.trimStart().slice(0, mark.content)
+  const reasoning = (m.reasoning ?? '').trimStart().slice(0, mark.reasoning)
+  return content.length === mark.content && reasoning.length === mark.reasoning && markHash(key, [reasoning, content]) === mark.hash
+}
+
+/** Whether `key`'s own turn is under way. */
+function turnInFlight(key: string): boolean {
+  const id = key.slice(key.indexOf(':') + 1)
+  return key.startsWith('agent:') ? liveAgentSessions.has(id) : inFlightChats.has(id)
+}
+
+/**
+ * Save a conversation while its own turn is under way: the reply is stopped where it is, saved
+ * with everything before it, and carries on (see llama.saveDuringTurn). While a tool runs, or a
+ * call is being written, it waits for the model's next words; a turn that ends first gets an
+ * ordinary save instead.
+ */
+async function saveMidTurn(key: string): Promise<SaveNowResult> {
+  const store = llama.stateStore
+  const loaded = llama.loaded
+  if (!store || !loaded) return { ok: false, why: 'Load a model first: what is saved is what the model has read.' }
+  const seal = stateSeal(key)
+  if (seal === 'locked') return { ok: false, why: 'It is locked.' }
+  const id = key.slice(key.indexOf(':') + 1)
+  let result: SaveNowResult = { ok: false, why: 'Nothing was saved.' }
+  emit('state:progress', { key, stage: 'waiting', percent: null })
+  try {
+    const outcome = await llama.saveDuringTurn(key, async ({ resume, reply }) => {
+      if (hasMedia(resume.messages)) {
+        throw new Error('it has images, audio or video in it, and a saved state can only be checked against text')
+      }
+      const covers = {
+        messages: stateMarks(key, conversationMessages(key)),
+        summaryUpto: chats.getSummary(id)?.uptoMessageId ?? null,
+        canTrim: !((loaded.model.arch?.ssmLayers ?? 0) > 0),
+        partial: partialMark(key, reply)
+      }
+      const earlier = listStates(store.dir).filter((s) => s.fingerprint === store.fingerprint && s.tokens > 0)
+      const perToken = earlier.length ? earlier.reduce((n, s) => n + s.bytes / s.tokens, 0) / earlier.length : null
+      const tokens = chats.getContextUsed(id)
+      const expectedBytes = perToken && tokens ? Math.round(perToken * tokens) : null
+      const weights = { writing: 1, encrypting: seal ? 0.25 : 0 }
+      const total = weights.writing + weights.encrypting
+      emit('state:progress', { key, stage: 'writing', percent: expectedBytes ? 0 : null, bytes: 0 })
+      const saved = await saveAsIs({
+        ...store,
+        key,
+        sent: resume,
+        seal,
+        covers,
+        expectedBytes,
+        onProgress: (p) => {
+          const fraction = p.total ? Math.min(1, p.done / p.total) : null
+          const before = p.stage === 'encrypting' ? weights.writing : 0
+          emit('state:progress', {
+            key,
+            stage: p.stage,
+            percent: fraction === null ? null : Math.round(((before + weights[p.stage] * fraction) / total) * 100),
+            bytes: p.done
+          })
+        }
+      })
+      if (!saved.ok) throw new Error(saved.why)
+      emit('state:saved', { key, tokens: saved.meta.tokens, savedAt: saved.meta.savedAt })
+      const removed = pruneStates(store.dir)
+      for (const gone of removed) emit('state:removed', { key: gone })
+      logger.info('prompt', `saved ${key} to disk part way through a reply`, { tokens: saved.meta.tokens, bytes: saved.meta.bytes, removed })
+      result = { ok: true, tokens: saved.meta.tokens, savedAt: saved.meta.savedAt }
+    })
+    if (outcome === 'missed') {
+      emit('state:progress', { key, stage: null })
+      return await saveNow(key)
+    }
+  } catch (err) {
+    result = { ok: false, why: `Not saved: ${err instanceof Error ? err.message : String(err)}` }
+  } finally {
+    emit('state:progress', { key, stage: null })
+  }
+  return result
 }
 
 type SaveNowResult = { ok: true; tokens: number; savedAt: number; already?: boolean } | { ok: false; why: string }
@@ -463,25 +540,26 @@ type SaveNowResult = { ok: true; tokens: number; savedAt: number; already?: bool
 const savingNow = new Map<string, Promise<SaveNowResult>>()
 
 /**
- * Save a conversation's state now, because the user asked to.
+ * Save a conversation's state, because the user asked to. Nothing else saves one.
  *
- * The app saves on its own, but not a short conversation, not one with little new since it was
- * last saved, and only once a reply has been quiet for a few seconds (see checkpointDue). This is
- * the same save without those conditions. When the server is holding another conversation, that
- * one is kept first and this one read in, so it can take as long as reading it does; how far the
- * reading has got is reported as it goes. It runs as background work, so a message sent meanwhile
+ * When the server is holding another conversation, this one is read in first (what was saved of
+ * it before is loaded, and anything after that read on top), so it can take as long as reading it
+ * does. How far it has got is reported as it goes: reading, the server writing the file, and for a
+ * protected conversation encrypting it. It runs as background work, so a message sent meanwhile
  * goes first and stops it.
+ *
+ * The record says which messages it covers, so the window can mark them, and whether the model can
+ * cut a loaded state back, which decides what an edit inside the saved part costs (see coverage).
  */
 async function saveNow(key: string): Promise<SaveNowResult> {
   if (!/^(chat|agent):[\w-]+$/.test(key)) return { ok: false, why: 'There is no conversation to save.' }
   const store = llama.stateStore
-  if (!llama.loaded) return { ok: false, why: 'Load a model first: what is saved is what the model has read.' }
-  if (!conversationStates()) return { ok: false, why: 'Keeping conversations ready is switched off in Settings.' }
-  if (!store) {
-    return { ok: false, why: 'This model was loaded before keeping conversations ready was switched on. Load it again to save.' }
-  }
-  // The server reads one conversation at a time; a reply being written has it.
-  if (agentTurnAbort || inFlightChats.size > 0) return { ok: false, why: 'Wait for the reply to finish, then save.' }
+  const loaded = llama.loaded
+  if (!loaded) return { ok: false, why: 'Load a model first: what is saved is what the model has read.' }
+  if (!store) return { ok: false, why: 'This model cannot save its state. Load it again to try.' }
+  // Its own reply being written is saved part way; another conversation's has the server.
+  if (turnInFlight(key)) return saveMidTurn(key)
+  if (agentTurnAbort || inFlightChats.size > 0) return { ok: false, why: 'Another conversation is being answered. Save once it has finished.' }
   const seal = stateSeal(key)
   if (seal === 'locked') return { ok: false, why: 'It is locked.' }
   const req = await conversationRequest(key)
@@ -492,50 +570,78 @@ async function saveNow(key: string): Promise<SaveNowResult> {
       why: 'Not saved: it has images, audio or video in it, and a saved state can only be checked against text. A conversation with them is read again instead.'
     }
   }
+  const id = key.slice(key.indexOf(':') + 1)
+  const messages = conversationMessages(key)
+  const covers = {
+    messages: stateMarks(key, messages),
+    summaryUpto: chats.getSummary(id)?.uptoMessageId ?? null,
+    canTrim: !((loaded.model.arch?.ssmLayers ?? 0) > 0)
+  }
   try {
     // Nothing said since the last save: saving again would write the same thing.
     const current = await currentState({ ...store, key, req })
-    if (current) return { ok: true, tokens: current.tokens, savedAt: current.savedAt, already: true }
+    if (current && coverage(current, covers.messages, covers.summaryUpto).count === messages.length) {
+      return { ok: true, tokens: current.tokens, savedAt: current.savedAt, already: true }
+    }
   } catch {
     /* found out by saving */
   }
 
-  let result: SaveNowResult = { ok: false, why: 'A message was sent before it finished. It is saved on its own after the reply.' }
-  const progress = (p: { phase: 'reading' | 'saving' | null; done?: number; total?: number }): void =>
-    emit('state:progress', { key, ...p })
+  // How big the file will be, from earlier saves under this load: for a percentage while it is written.
+  const earlier = listStates(store.dir).filter((s) => s.fingerprint === store.fingerprint && s.tokens > 0)
+  const perToken = earlier.length ? earlier.reduce((n, s) => n + s.bytes / s.tokens, 0) / earlier.length : null
+  const tokens = chats.getContextUsed(id)
+  const expectedBytes = perToken && tokens ? Math.round(perToken * tokens) : null
+
+  const reading = !llama.holds(req)
+  const weights = { reading: reading ? 1 : 0, writing: 1, encrypting: seal ? 0.25 : 0 }
+  const totalWeight = weights.reading + weights.writing + weights.encrypting
+  const report = (stage: 'reading' | SaveProgress['stage'], fraction: number | null, bytes?: number): void => {
+    const before = stage === 'reading' ? 0 : stage === 'writing' ? weights.reading : weights.reading + weights.writing
+    const percent = fraction === null ? null : Math.round(((before + weights[stage] * Math.min(1, fraction)) / totalWeight) * 100)
+    emit('state:progress', { key, stage, percent, bytes })
+  }
+
+  let result: SaveNowResult = { ok: false, why: 'A message was sent before it finished, so nothing was saved.' }
   try {
     await llama.runIdle(async (signal) => {
       try {
-        if (!llama.holds(req)) {
-          // Another conversation is in the server: kept first, as switching to this one would.
-          await parkHeld(key, signal)
-          if (signal.aborted) return
-          // An earlier save of this one leaves less to read.
+        if (reading) {
+          report('reading', 0)
           if (!(await restoreSaved(req, signal)) && !signal.aborted) await seedInstructions(req, signal, true)
           if (signal.aborted) return
-          progress({ phase: 'reading', done: 0, total: 0 })
-          await readAhead(req, signal, (done, total) => progress({ phase: 'reading', done, total }))
+          await readAhead(req, signal, (done, total) => report('reading', total ? done / total : null))
           if (signal.aborted) return
         }
-        progress({ phase: 'saving' })
-        const saved = await saveState({ ...store, key, req, signal, seal })
+        report('writing', expectedBytes ? 0 : null, 0)
+        const saved = await saveState({
+          ...store,
+          key,
+          req,
+          signal,
+          seal,
+          covers,
+          expectedBytes,
+          onProgress: (p) => report(p.stage, p.total ? p.done / p.total : null, p.done)
+        })
         if (signal.aborted) return
         if (!saved.ok) {
           result = { ok: false, why: `Not saved: ${saved.why}.` }
           return
         }
-        savedShapes.set(key, stateShape(req))
         llama.assumeHeld(req)
         emit('state:saved', { key, tokens: saved.meta.tokens, savedAt: saved.meta.savedAt })
         const removed = pruneStates(store.dir)
-        logger.info('prompt', `saved ${key} to disk, as asked`, { tokens: saved.meta.tokens, bytes: saved.meta.bytes, removed })
+        // Saves removed to stay within the disk budget: their messages show as unsaved again.
+        for (const gone of removed) emit('state:removed', { key: gone })
+        logger.info('prompt', `saved ${key} to disk`, { tokens: saved.meta.tokens, bytes: saved.meta.bytes, removed })
         result = { ok: true, tokens: saved.meta.tokens, savedAt: saved.meta.savedAt }
       } catch (err) {
         if (!signal.aborted) result = { ok: false, why: `Not saved: ${err instanceof Error ? err.message : String(err)}` }
       }
     })
   } finally {
-    progress({ phase: null })
+    emit('state:progress', { key, stage: null })
   }
   return result
 }
@@ -543,68 +649,28 @@ async function saveNow(key: string): Promise<SaveNowResult> {
 /** Agent sessions with a turn running, as the turn has them: stored only when it ends. */
 const liveAgentSessions = new Map<string, AgentSessionState>()
 
-/** What a conversation's saved state was made from, by key: nothing is saved twice over. */
-const savedShapes = new Map<string, string>()
-
-function stateShape(req: CompletionOptions): string {
-  return crypto
-    .createHash('sha256')
-    .update(JSON.stringify([req.messages, req.tools?.map((t) => t.name) ?? [], req.reasoningEffort ?? null, req.chatTemplateKwargs ?? null]))
-    .digest('hex')
-}
-
-/** How long a conversation is left alone after a reply before it is saved. */
-const CHECKPOINT_DELAY_MS = 4000
-const checkpointTimers = new Map<string, NodeJS.Timeout>()
 
 /**
- * Save a conversation at a quiet moment, so that a crash, a power cut or Windows restarting costs
- * at most its last few turns, not a reading of the whole thing.
+ * Load a conversation's saved state into the server. False when there is none that fits.
  *
- * Saving used to happen only when the server was about to let go of a conversation: another one
- * read in, the model unloaded, the app closed. Anything that ended the app without warning lost
- * everything since. Now each reply is followed, once the conversation has been quiet for a few
- * seconds, by a save of exactly what the next message will reuse (see checkpointDue for when
- * that is worth the disk). It runs as background work, so a message sent meanwhile stops it.
+ * Its own save first. With none (or none that still fits), the longest start of it that any other
+ * save holds is borrowed: the system message conversations begin with, or the history a fork
+ * shares with the conversation it was forked from. Anything after what was loaded is read on top.
  */
-async function checkpoint(key: string, signal: AbortSignal): Promise<void> {
-  const store = llama.stateStore
-  if (!store || !conversationStates() || llama.heldKey !== key || signal.aborted) return
-  const id = key.slice(key.indexOf(':') + 1)
-  if (!checkpointDue(chats.getContextUsed(id) ?? null, readMeta(store.dir, key), Date.now())) return
-  await parkHeld(null, signal)
-}
-
-/** The same, a few seconds from now, unless the conversation is busy again by then. */
-function checkpointLater(key: string): void {
-  if (!conversationStates()) return
-  clearTimeout(checkpointTimers.get(key))
-  const timer = setTimeout(() => {
-    checkpointTimers.delete(key)
-    // Anyone using the model goes first; that turn's own end schedules the next try.
-    if (!llama.loaded || agentTurnAbort || inFlightChats.size > 0 || llama.idleBusy) return
-    void llama.runIdle((signal) => checkpoint(key, signal))
-  }, CHECKPOINT_DELAY_MS)
-  timer.unref()
-  checkpointTimers.set(key, timer)
-}
-
-/**
- * Before the machine sleeps or Windows ends the session: save what the server holds, if it is not
- * on disk already. Bounded, since the system only waits so long.
- */
-export async function parkBeforeSleep(ms: number): Promise<void> {
-  await llama.preemptIdle().catch(() => undefined)
-  await parkHeld(null, AbortSignal.timeout(ms))
-}
-
-/** Load a conversation's saved state into the server. False when there is none or it no longer fits. */
 async function restoreSaved(req: CompletionOptions, signal?: AbortSignal): Promise<boolean> {
   const store = llama.stateStore
   const key = req.cacheKey
-  if (!store || !key || !conversationStates() || !readMeta(store.dir, key)) return false
+  if (!store || !key) return false
   const seal = stateSeal(key)
   if (seal === 'locked') return false
+  if (readMeta(store.dir, key) && (await restoreOwn(req, key, seal, signal))) return true
+  if (signal?.aborted) return false
+  return restoreBorrowed(req, key, signal)
+}
+
+async function restoreOwn(req: CompletionOptions, key: string, seal: Buffer | undefined, signal?: AbortSignal): Promise<boolean> {
+  const store = llama.stateStore
+  if (!store) return false
   try {
     const result = await restoreState({ ...store, key, req, signal, seal })
     if (!result.ok) {
@@ -621,22 +687,42 @@ async function restoreSaved(req: CompletionOptions, signal?: AbortSignal): Promi
 }
 
 /**
- * Before a turn: keep what the server holds, then bring this conversation back if it was kept.
+ * The longest start of this conversation another conversation's save holds, loaded. A protected
+ * conversation neither lends nor borrows: its saves are its own.
+ */
+async function restoreBorrowed(req: CompletionOptions, key: string, signal?: AbortSignal): Promise<boolean> {
+  const store = llama.stateStore
+  if (!store || hasMedia(req.messages) || stateSeal(key) !== undefined) return false
+  try {
+    const prefix = await renderPrefix(store.base, req, signal)
+    const lender = longestReusable(store.dir, store.fingerprint, prefix, (s) => s.key !== key && stateSeal(s.key) === undefined)
+    if (!lender || signal?.aborted) return false
+    const result = await restoreState({ ...store, key: lender.key, req, signal, borrowed: true })
+    if (!result.ok) {
+      logger.info('prompt', `could not borrow ${lender.key} for ${key}: ${result.why}`)
+      return false
+    }
+    llama.assumeHeld(req)
+    logger.info('prompt', `loaded the start of ${key} from ${lender.key}`, { tokens: result.meta.tokens })
+    return true
+  } catch (err) {
+    logger.warn('prompt', `could not look for a save to borrow for ${key}`, err)
+    return false
+  }
+}
+
+/**
+ * Before a turn: bring this conversation's saved state back, if it has one. Anything said after it
+ * was saved is read by the turn itself, on top of it.
  *
  * The same thing clicking into the message box does ahead of time, for a message sent without
  * that head start.
  */
 async function resumeSaved(req: CompletionOptions): Promise<void> {
   if (!llama.stateStore || !req.messages.length || llama.holds(req)) return
-  await parkHeld(req.cacheKey ?? null)
   if (await restoreSaved(req)) return
   // Someone is waiting: load the instructions if they are on disk, but do not stop to save them.
   await seedInstructions(req, new AbortController().signal, false)
-}
-
-/** Whether conversations are kept on disk; the agent's instructions are kept regardless. */
-function conversationStates(): boolean {
-  return !!loadSettings().runtime.stateCache?.enabled
 }
 
 /*
@@ -804,22 +890,13 @@ async function retitleChat(chatId: string, reasoning: ReasoningChoice | null, si
 /** After a chat turn: name it if due, and summarise if the window is filling. One background job. */
 function afterChatTurn(chatId: string, reasoning: ReasoningChoice | null): void {
   const loaded = llama.loaded
-  const key = `chat:${chatId}`
-  if (!loaded || agentTurnAbort || inFlightChats.size > 0 || llama.idleBusy) {
-    checkpointLater(key)
-    return
-  }
+  if (!loaded || agentTurnAbort || inFlightChats.size > 0 || llama.idleBusy) return
   const retitle = titleDue(chatId)
   const tidy = canWarm() && (chats.getContextUsed(chatId) ?? 0) >= loaded.plan.contextLength * TIDY_AT
-  if (!retitle && !tidy) {
-    checkpointLater(key)
-    return
-  }
+  if (!retitle && !tidy) return
   void llama.runIdle(async (signal) => {
     if (retitle) await retitleChat(chatId, reasoning, signal)
     if (tidy && !signal.aborted) await tidyChatNow(chatId, reasoning, signal)
-    // Saved after the rest, so what is kept is the conversation as tidied.
-    if (!signal.aborted) await checkpoint(key, signal)
   })
 }
 
@@ -852,11 +929,7 @@ async function tidyChatNow(chatId: string, reasoning: ReasoningChoice | null, si
 /** The same after an agent turn. */
 function tidyAgent(sessionId: string): void {
   const loaded = llama.loaded
-  const key = `agent:${sessionId}`
-  if (!loaded || !canWarm() || (chats.getContextUsed(sessionId) ?? 0) < loaded.plan.contextLength * TIDY_AT) {
-    checkpointLater(key)
-    return
-  }
+  if (!loaded || !canWarm() || (chats.getContextUsed(sessionId) ?? 0) < loaded.plan.contextLength * TIDY_AT) return
   void llama.runIdle(async (signal) => {
     const session = chats.loadSession(sessionId)
     if (!session) return
@@ -882,7 +955,6 @@ function tidyAgent(sessionId: string): void {
       },
       signal
     )
-    if (!signal.aborted) await checkpoint(key, signal)
   })
 }
 
@@ -1070,6 +1142,7 @@ function getAgent(): Agent {
       emit('agent:tool-call-partial', { sessionId: sid(), ...p })
     )
     agent.on('toolResult', (r) => emit('agent:tool-result', { sessionId: sid(), result: r }))
+    agent.on('toolFrames', (p: { messageId: string; frames: string[] }) => emit('agent:tool-frames', { sessionId: sid(), ...p }))
     agent.on('title', (t: { sessionId: string; title: string }) => emit('chat:titled', { chatId: t.sessionId, title: t.title }))
     agent.on('subToolCall', (c) => emit('agent:sub-tool-call', { sessionId: sid(), call: c }))
     agent.on('compacting', (info) => emit('agent:compacting', { sessionId: sid(), ...(info as object) }))
@@ -1682,9 +1755,8 @@ async function loadModelById(modelId: string, plan?: FitPlan): Promise<{ port: n
   if (!model) throw new Error(`Model not found: ${modelId}`)
   if (!model.arch) throw new Error(model.error ?? 'Model metadata could not be parsed')
 
-  // Loading replaces whatever is loaded; the conversation it holds is kept first, if states are kept.
+  // Loading replaces whatever is loaded. What the conversation held had of it is kept only if it was saved.
   await llama.preemptIdle()
-  await parkHeld(null)
 
   /*
    * The compaction helper goes before anything is measured.
@@ -2214,8 +2286,6 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
   'model:sampling-defaults': () => llama.samplingDefaults(),
   'model:unload': async () => {
     await llama.preemptIdle()
-    // The conversation the model is holding is kept, if states are kept, before it goes.
-    await parkHeld(null)
     await llama.unload()
     // The helper was placed in what this model left free; it is placed again against the next one.
     await summarizer.stop()
@@ -2940,6 +3010,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
        * with no way to stop it.
        */
       if (inFlightChats.get(chatId) === abort) inFlightChats.delete(chatId)
+      llama.missTurnSave(`chat:${chatId}`)
     }
 
     const assistantMsg = {
@@ -3200,6 +3271,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       }
       for (const m of session.messages.slice(before)) chats.appendMessage(sessionId, m)
       if (liveAgentSessions.get(sessionId) === session) liveAgentSessions.delete(sessionId)
+      llama.missTurnSave(`agent:${sessionId}`)
       persistPermissionRules()
       if (agentTurnAbort === turnAbort) agentTurnAbort = null
     }
@@ -3311,37 +3383,53 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     const dir = llama.stateStore?.dir ?? stateCacheFolder()
     const states = dir ? listStates(dir) : []
     return {
-      enabled: !!settings?.enabled,
-      // Whether the loaded model was started able to save conversations; the setting applies from the next load.
-      active: !!llama.stateStore && !!settings?.enabled,
+      // Saving is always there now, by the Save state button; nothing saves on its own.
+      enabled: true,
+      active: !!llama.stateStore,
       modelLoaded: !!llama.loaded,
       folder: dir ?? '',
       budgetGb: settings?.budgetGb ?? 20,
       usedBytes: states.reduce((n, s) => n + s.bytes, 0),
       count: states.length,
-      saved: states.map((s) => s.key),
-      pinned: dir ? [...statePins(dir)] : []
+      saved: states.map((s) => s.key)
     }
   },
-  /** Keep a conversation's saved state whatever the budget says, or stop keeping it. */
-  /** What is saved of one conversation, if it would load into the model running now. */
-  'state:meta': (key: string) => {
-    const store = llama.stateStore
-    const dir = store?.dir ?? stateCacheFolder()
-    if (!dir || !key) return null
-    const meta = readMeta(dir, key)
-    if (!meta || (store && meta.fingerprint !== store.fingerprint)) return null
-    return { tokens: meta.tokens, savedAt: meta.savedAt }
-  },
-  'state:pin': (key: string, on: boolean) => {
+  /**
+   * Which of a conversation's messages its saved state still holds as they are: the last one it
+   * covers, or null when nothing is saved that would load. A save made under another model is kept
+   * but covers nothing while that model is not the one loaded. A save that an edit inside it has
+   * made useless (a model with recurrent layers cannot be cut back) is removed here.
+   */
+  'state:coverage': (key: string) => {
+    const k = String(key ?? '')
     const dir = llama.stateStore?.dir ?? stateCacheFolder()
-    if (!dir || !/^(chat|agent):[\w-]+$/.test(key)) return []
-    const pins = statePins(dir)
-    if (on) pins.add(key)
-    else pins.delete(key)
-    fs.mkdirSync(dir, { recursive: true })
-    fs.writeFileSync(path.join(dir, 'pins.json'), JSON.stringify([...pins]))
-    return [...pins]
+    if (!dir || !/^(chat|agent):[\w-]+$/.test(k) || stateSeal(k) === 'locked') return null
+    const meta = readMeta(dir, k)
+    if (!meta) return null
+    const store = llama.stateStore
+    if (store && meta.fingerprint !== store.fingerprint) return { through: null, otherModel: true, tokens: meta.tokens, savedAt: meta.savedAt }
+    const messages = conversationMessages(k)
+    const id = k.slice(k.indexOf(':') + 1)
+    const { count, dropped } = coverage(meta, stateMarks(k, messages), chats.getSummary(id)?.uptoMessageId ?? null)
+    let gone = dropped
+    /*
+     * Saved part way through a reply: the reply is the message after the last one covered. Still
+     * being written, it is the reply on screen (no id yet); finished, it must still begin with
+     * what the save holds of it.
+     */
+    let partial: { id: string | null; content: number; reasoning: number } | null = null
+    const mark = meta.partial
+    if (!gone && mark && count === (meta.messages?.length ?? 0)) {
+      const next = messages[count]
+      if (!next) partial = { id: null, content: mark.content, reasoning: mark.reasoning }
+      else if (next.role === 'assistant' && replyBegins(k, next, mark)) partial = { id: next.id, content: mark.content, reasoning: mark.reasoning }
+      else if (!meta.canTrim) gone = true
+    }
+    if (gone) {
+      removeState(dir, k)
+      return null
+    }
+    return { through: count ? messages[count - 1].id : null, partial, tokens: meta.tokens, savedAt: meta.savedAt }
   },
   /** Save a conversation's state now, whatever the app's own timing would have done. */
   'state:save': (key: string) => {
@@ -3939,9 +4027,7 @@ export async function invokeBridge(channel: string, args: unknown[]): Promise<un
 }
 
 export async function shutdown(): Promise<void> {
-  // Bounded: closing the app must not hang on a slow disk, and a state not saved only costs a reading.
   await llama.preemptIdle().catch(() => undefined)
-  await parkHeld(null, AbortSignal.timeout(20_000))
   persistPermissionRules()
   killAllJobs()
   mcpManager.closeAll()

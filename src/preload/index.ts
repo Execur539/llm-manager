@@ -31,10 +31,14 @@ const EVENT_CHANNELS = [
   'chat:speed',
   'agent:speed',
   'chat:tool-frames',
+  // The pictures an agent tool showed the model (read_image, a screenshot), shown under its card.
+  'agent:tool-frames',
   // A conversation's state was saved to disk, so loading it again skips reading it.
   'state:saved',
   // A save asked for: reading the conversation in, then writing it out.
   'state:progress',
+  // Saves removed to stay within the disk budget.
+  'state:removed',
   // What chat's scratchpad holds changed: something added, deleted or cleared for being unused.
   'scratchpad:changed',
   // The model named or renamed a conversation, either kind.

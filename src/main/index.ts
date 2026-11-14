@@ -21,7 +21,7 @@ import { apiServer } from './api/server'
 import { remoteWeb } from './remote/web'
 import { llama } from './runtime/llama'
 import { vendorDiagnostics } from './runtime/binaries'
-import { handlers, invokeBridge, setEmitter, setLibrary, shutdown, modelsDir, libraryFolders, startHardwareRefresh, stopHardwareRefresh, parkBeforeSleep } from './bridge'
+import { handlers, invokeBridge, setEmitter, setLibrary, shutdown, modelsDir, libraryFolders, startHardwareRefresh, stopHardwareRefresh } from './bridge'
 import { handleMediaProtocol } from './chat/media'
 import { installCrashHandlers, logger } from './log'
 import { TRAY_ICON } from './tray-icon'
@@ -383,8 +383,6 @@ app.whenReady().then(async () => {
    * without the goodbye a quit gets. What the model has read of the open conversation is saved
    * first, if a quiet moment has not saved it already.
    */
-  powerMonitor.on('suspend', () => void parkBeforeSleep(10_000))
-  mainWindow?.on('session-end', () => void parkBeforeSleep(5_000))
 
   downloadQueue.setToken(getHfToken())
   downloadQueue.setConnections(loadSettings().downloads.connections)

@@ -8,6 +8,9 @@
  * would tell them apart.
  */
 
+import { useRef } from 'react'
+import { useSaveSplit, type SaveMark } from './SaveState'
+
 const LABELS: Record<string, string> = {
   user: 'You',
   assistant: 'Assistant',
@@ -19,18 +22,23 @@ export default function MessageRow({
   role,
   children,
   actions,
-  testId
+  testId,
+  save
 }: {
   role: string
   children: React.ReactNode
   actions?: React.ReactNode
   testId?: string
+  /** Whether the conversation's saved model state holds this message; drawn as its edge. */
+  save?: SaveMark | null
 }): JSX.Element {
   const label = LABELS[role] ?? role
   const quiet = role === 'user' || role === 'assistant'
+  const ref = useRef<HTMLDivElement>(null)
+  useSaveSplit(ref, save)
 
   return (
-    <div className={`msg from-${role}`} data-testid={testId}>
+    <div ref={ref} className={`msg from-${role}`} data-testid={testId} data-save={save?.state}>
       {actions}
       <div className="msg-main">
         {quiet ? <span className="sr-only">{label}</span> : <div className="who">{label}</div>}

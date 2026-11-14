@@ -96,12 +96,11 @@ export default function Settings({
     usedBytes: number
     count: number
   } | null>(null)
-  const stateCacheOn = !!settings?.runtime.stateCache?.enabled
   useEffect(() => {
     void invoke<typeof stateInfo>('state:info')
       .then(setStateInfo)
       .catch(() => undefined)
-  }, [stateCacheOn])
+  }, [])
   /** What chat's scratchpad holds right now, kept current as files arrive and go. */
   const [scratch, setScratch] = useState<{ files: number; bytes: number } | null>(null)
   useEffect(() => {
@@ -608,36 +607,19 @@ export default function Settings({
               </div>
               <div className="setting-row">
                 <div className="setting-text">
-                  <div className="setting-label">Keep conversations ready on disk</div>
+                  <div className="setting-label">Saved conversations</div>
                   <div className="setting-hint">
-                    Saves what the model has read of a conversation, so coming back to it after another
-                    conversation, a model reload or a restart is a file read. Saved a few seconds after each reply
-                    and before the computer sleeps · text-only conversations
+                    What the model has read of a conversation, saved when you press Save state in it, so coming back
+                    after another conversation, a model reload or a restart is a file read. Anything said after a save
+                    is read again then, never lost · text-only conversations
                   </div>
                 </div>
-                <div className="setting-control">
-                  <input
-                    type="checkbox"
-                    checked={stateCacheOn}
-                    onChange={(e) =>
-                      void patch({
-                        runtime: {
-                          ...settings.runtime,
-                          stateCache: { ...settings.runtime.stateCache, enabled: e.target.checked }
-                        }
-                      })
-                    }
-                    data-testid="state-cache-enabled"
-                  />
-                </div>
               </div>
-              {stateCacheOn && (
-                <>
                   <div className="setting-row">
                     <div className="setting-text">
                       <div className="setting-label">Disk budget</div>
                       <div className="setting-hint">
-                        GB · the least recently used conversations are removed first, pinned ones never
+                        GB · past it, the least recently used saves are removed first
                       </div>
                     </div>
                     <div className="setting-control">
@@ -662,7 +644,6 @@ export default function Settings({
                         {stateInfo
                           ? `${stateInfo.count} conversation${stateInfo.count === 1 ? '' : 's'}, ${fmtBytes(stateInfo.usedBytes)}, in ${stateInfo.folder}`
                           : '…'}
-                        {stateInfo?.modelLoaded && !stateInfo.active ? ' · reload the model to start saving' : ''}
                       </span>
                       {!!stateInfo?.count && (
                         <button
@@ -680,8 +661,6 @@ export default function Settings({
                       )}
                     </div>
                   </div>
-                </>
-              )}
             </div>
           </div>
 

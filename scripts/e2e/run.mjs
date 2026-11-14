@@ -2647,6 +2647,175 @@ const scenarios = {
    * "Thinking…". The call card used to sit above the thinking that led to it, and the thinking
    * kept saying it was still going until the call had been written out.
    */
+  async manualSave() {
+    await withApp('manual-save', async ({ page, env }) => {
+      const states = path.join(env.base, 'LLMManagerStates')
+      const idle = () =>
+        page.waitForFunction(
+          () => {
+            const el = document.querySelector('[data-testid="chat-input"]')
+            return el instanceof HTMLTextAreaElement && !el.disabled
+          },
+          undefined,
+          { timeout: 60000 }
+        )
+      const edges = () =>
+        page.evaluate(() => [...document.querySelectorAll('[data-testid="chat-messages"] [data-save]')].map((e) => e.getAttribute('data-save')))
+      const label = () => page.evaluate(() => document.querySelector('[data-testid="save-state"]')?.textContent ?? '')
+
+      await loadModel(page)
+      await goTo(page, 'Chat')
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      report.check('manual-save', 'the Keep ready toggle is gone', (await page.getByTestId('keep-ready').count()) === 0)
+
+      await page.getByTestId('chat-input').fill('first question')
+      await page.getByTestId('chat-send').click()
+      await idle()
+      await page.waitForTimeout(800)
+      const before = await edges()
+      report.check('manual-save', 'nothing is saved until asked', before.length >= 2 && before.every((s) => s === 'unsaved'), before.join(','))
+
+      await page.getByTestId('save-state').click()
+      const saved = await page
+        .waitForFunction(() => /^Saved$/.test(document.querySelector('[data-testid="save-state"]')?.textContent ?? ''), undefined, { timeout: 30000 })
+        .then(() => true)
+        .catch(() => false)
+      report.check('manual-save', 'Save state saves, and then says so', saved, await label())
+      await page.waitForTimeout(400)
+      const after = await edges()
+      report.check('manual-save', 'every message then shows as saved', after.length >= 2 && after.every((s) => s === 'saved'), after.join(','))
+      const files = fs.existsSync(states) ? fs.readdirSync(states) : []
+      report.check('manual-save', 'and the state is on disk', files.some((f) => f.endsWith('.bin')), files.join(','))
+
+      // Pressed while the reply is still being written.
+      await page.getByTestId('chat-input').fill('[[mock:slow]] second question')
+      await page.getByTestId('chat-send').click()
+      await page.waitForFunction(
+        () => (document.querySelector('[data-testid="streaming-message"] .body')?.textContent?.length ?? 0) > 40,
+        undefined,
+        { timeout: 30000 }
+      )
+      await page.getByTestId('save-state').click()
+      const progress = await page
+        .waitForFunction(() => /Saving|Waiting/.test(document.querySelector('[data-testid="save-state"]')?.textContent ?? ''), undefined, { timeout: 5000 })
+        .then(() => true)
+        .catch(() => false)
+      report.check('manual-save', 'mid-reply, the button shows the save going', progress, await label())
+      const midway = await page
+        .waitForFunction(
+          () => {
+            const row = document.querySelector('[data-testid="streaming-message"]')
+            if (row?.getAttribute('data-save') !== 'partial') return null
+            return { split: parseFloat(getComputedStyle(row).getPropertyValue('--save-split')) || 0, text: row.textContent?.length ?? 0 }
+          },
+          undefined,
+          { timeout: 30000 }
+        )
+        .then((h) => h.jsonValue())
+        .catch(() => null)
+      report.check('manual-save', 'the reply shows saved down to where the save reached', !!midway && midway.split > 0, JSON.stringify(midway))
+      const kept = await page
+        .waitForFunction(
+          (n) => (document.querySelector('[data-testid="streaming-message"]')?.textContent?.length ?? 0) > n + 10,
+          midway?.text ?? 0,
+          { timeout: 30000 }
+        )
+        .then(() => true)
+        .catch(() => false)
+      report.check('manual-save', 'and the reply carries on being written after it', kept)
+      await idle()
+      await page.waitForTimeout(800)
+
+      const [chat] = await page.evaluate(() => window.api.invoke('chat:list', 'chat'))
+      const session = await page.evaluate((id) => window.api.invoke('chat:load', id), chat.id)
+      const reply = session.messages.filter((m) => m.role === 'assistant').at(-1)?.content ?? ''
+      report.check(
+        'manual-save',
+        'the reply comes out whole, nothing lost or doubled at the pause',
+        reply.split('A state-space model').length === 2 && reply.trim().endsWith('interleave the two.'),
+        reply.slice(0, 80)
+      )
+      const finalEdges = await edges()
+      report.check(
+        'manual-save',
+        'everything before the save point shows saved, the reply part way',
+        finalEdges.join(',') === 'saved,saved,saved,partial',
+        finalEdges.join(',')
+      )
+      await shot(page, 'manual-save')
+
+      // Said after the save: not saved, until the next one.
+      await page.getByTestId('chat-input').fill('third question')
+      await page.getByTestId('chat-send').click()
+      await idle()
+      await page.waitForTimeout(800)
+      const later = await edges()
+      report.check('manual-save', 'what is said after a save shows as not saved', later.slice(-2).join(',') === 'unsaved,unsaved', later.join(','))
+    })
+  },
+
+  async toolImages() {
+    await withApp('tool-images', async ({ page, env }) => {
+      const dir = path.join(env.base, 'files')
+      await fsp.mkdir(dir, { recursive: true })
+      const picture = path.join(dir, 'diagram.png').replace(/\\/g, '/')
+      // A 2x2 PNG: small, but a real image the app has to decode, store and serve back.
+      await fsp.writeFile(
+        picture,
+        Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4zwAE/xkgFAAb8gP91pbyKwAAAABJRU5ErkJggg==',
+          'base64'
+        )
+      )
+      await loadModel(page)
+      await goTo(page, 'Agent')
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await page
+        .getByTestId('agent-input')
+        .fill(`[[mock:calltool:read_image]] [[mock:toolonce]] [[mock:toolargs:{"path":"${picture}"}]] what is in this picture?`)
+      await page.getByTestId('agent-send').click()
+      const shown = await page
+        .waitForSelector('[data-testid="tool-images"] img', { timeout: 30000 })
+        .then(() => true)
+        .catch(() => false)
+      report.check('tool-images', 'a picture the model looks at is shown under its tool call', shown)
+      if (!shown) return
+      const live = await page.evaluate(() => {
+        const img = document.querySelector('[data-testid="tool-images"] img')
+        return img instanceof HTMLImageElement ? { src: img.src.slice(0, 22), width: img.naturalWidth } : null
+      })
+      report.check('tool-images', 'as the picture itself, as it arrived', live?.width === 2, JSON.stringify(live))
+      await page.waitForFunction(
+        () => {
+          const el = document.querySelector('[data-testid="agent-input"]')
+          return el instanceof HTMLTextAreaElement && !el.disabled
+        },
+        undefined,
+        { timeout: 60000 }
+      )
+      await shot(page, 'tool-images')
+
+      // Reopened, it comes from what the conversation kept rather than from memory.
+      const [session] = await page.evaluate(() => window.api.invoke('chat:list', 'agent'))
+      const stored = await page.evaluate((id) => window.api.invoke('chat:load', id), session.id)
+      const tool = stored.messages.find((m) => m.role === 'tool')
+      report.check('tool-images', 'the conversation remembers the tool showed a picture', tool?.toolImages === 1, JSON.stringify(tool?.toolImages))
+      const kept = await page.evaluate(
+        (id) =>
+          new Promise((resolve) => {
+            const img = new Image()
+            img.onload = () => resolve(img.naturalWidth)
+            img.onerror = () => resolve(-1)
+            img.src = `llmm-media://sent/${encodeURIComponent(id)}?i=0`
+          }),
+        tool?.id ?? ''
+      )
+      report.check('tool-images', 'and serves it back from where it was kept', kept === 2, String(kept))
+    })
+  },
+
   async streamOrder() {
     await withApp('stream-order', async ({ page }) => {
       await loadModel(page)

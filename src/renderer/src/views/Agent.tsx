@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AgentMessage, ToolCall } from '@shared/types'
 import { continuedMessage } from '@shared/continuation'
-import { invoke, on } from '../lib/api'
+import { invoke, on, toolImageUrl } from '../lib/api'
 import {
   select,
   setRunning,
@@ -35,11 +35,10 @@ import PromptProgress from '../components/PromptProgress'
 import MediaStage from '../components/MediaStage'
 import ContextMeter from '../components/ContextMeter'
 import CompactingNotice from '../components/CompactingNotice'
-import KeepReadyButton from '../components/KeepReadyButton'
+import { SaveStateButton, saveMarks, useSaveCoverage, withSavePoint, type SaveMark } from '../components/SaveState'
 import { LockedPanel, ProtectButton } from '../components/Protect'
 import PendingToolCall from '../components/PendingToolCall'
 import ToolCard from '../components/ToolCard'
-import SavedState from '../components/SavedState'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
@@ -52,6 +51,27 @@ import ParametersPanel, { ParamsToggle, useParamsPanel } from '../components/Par
  * finished copy replaces this one. A message stopped mid-thought resumes inside its thinking block,
  * which stays live until the answer starts.
  */
+/** A finished reply, with the point a save stopped in it marked, when it stopped part way. */
+function SavedReply({
+  mark,
+  content,
+  reasoning
+}: {
+  mark: SaveMark | undefined
+  content: string
+  reasoning?: string
+}): JSX.Element {
+  const shown = withSavePoint(mark, content, reasoning)
+  return (
+    <>
+      {shown.reasoning && <ThinkingBlock text={shown.reasoning} />}
+      {/* A turn can be reasoning only — the model thought, then called a tool
+          without a word of prose. Rendering an empty body leaves a stray gap. */}
+      {shown.content && <Markdown source={shown.content} />}
+    </>
+  )
+}
+
 function ContinuingMessage({
   message,
   partial,
@@ -128,7 +148,18 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
   const error = activeId ? stream.errors[activeId] : null
   const notice = activeId ? stream.notices[activeId] : null
   const liveToolCalls = activeId ? (stream.toolCalls[activeId] ?? []) : []
+  /** What a tool result showed the model: as it arrived, or from what was kept of it. */
+  const toolImagesOf = (m: AgentMessage): string[] | undefined =>
+    stream.toolFrames[m.id] ?? (m.toolImages ? Array.from({ length: m.toolImages }, (_, i) => toolImageUrl(m.id, i)) : undefined)
   const pendingCalls = activeId ? (stream.pendingCalls[activeId] ?? []) : []
+  // Which of the session the saved model state holds, drawn as an edge on each message.
+  const saveKey = activeId ? `agent:${activeId}` : null
+  const coverage = useSaveCoverage(saveKey, messages)
+  const savingNow = saveKey ? stream.savingStates[saveKey] : undefined
+  const marks = saveMarks(messages, coverage, savingNow, partial || reasoning ? { content: partial, reasoning } : null)
+  const allSaved =
+    !!coverage?.through && !coverage.otherModel && coverage.through === messages.at(-1)?.id && !partial && !reasoning && !running
+  const live = withSavePoint(marks.streaming, partial, reasoning)
   // The agent view restores no session on mount, so this is null far more often than in chat —
   // which is what made the control look broken here first.
   const effortId = activeId ?? DRAFT_AGENT
@@ -532,7 +563,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
           >
             Compact
           </button>
-          <KeepReadyButton stateKey={activeId ? `agent:${activeId}` : null} />
+          <SaveStateButton stateKey={saveKey} canSave={!!loaded && !sealed && !compacting} allSaved={allSaved} hasMessages={messages.length > 0} />
           <ProtectButton kind="chat" id={activeId} state={activeSession} agent disabled={running || !!compacting} />
           {running && (
             <button className="danger" onClick={() => {
@@ -629,11 +660,12 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
 
           {messages.map((m) =>
             m.role === 'tool' && m.toolCalls?.[0] ? (
-              <ToolCard key={m.id} call={m.toolCalls[0]} result={m.toolResult} />
+              <ToolCard key={m.id} call={m.toolCalls[0]} result={m.toolResult} images={toolImagesOf(m)} save={marks.byId.get(m.id)} />
             ) : (
               <MessageRow
                 role={m.role}
                 key={m.id}
+                save={marks.byId.get(m.id)}
                 actions={
                   editing === m.id ? undefined : (
                     <MessageActions
@@ -685,12 +717,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                   writingCall={pendingCalls.length > 0}
                 />
               ) : m.role === 'assistant' ? (
-                <>
-                  {m.reasoning && <ThinkingBlock text={m.reasoning} />}
-                  {/* A turn can be reasoning only — the model thought, then called a tool
-                      without a word of prose. Rendering an empty body leaves a stray gap. */}
-                  {m.content && <Markdown source={m.content} />}
-                </>
+                <SavedReply mark={marks.byId.get(m.id)} content={m.content} reasoning={m.reasoning} />
               ) : (
                 <>
                   {/* The names are dropped from the text once the files themselves are shown. */}
@@ -741,14 +768,14 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
           ))}
 
           {!extendingId && (partial || reasoning || ultra.length > 0) && (
-            <MessageRow role="assistant" testId="streaming-message">
+            <MessageRow role="assistant" testId="streaming-message" save={marks.streaming}>
               {/* Plans, while they are being weighed — above whatever the run then does. */}
               <UltraSamples samples={ultra} synthesising={synthesising} plan={ultraPlan} />
               {/* A tool call the model went straight to ends its thinking as surely as words do. */}
-              {reasoning && <ThinkingBlock text={reasoning} streaming answerStarted={!!partial || pendingCalls.length > 0} />}
+              {reasoning && <ThinkingBlock text={live.reasoning ?? reasoning} streaming answerStarted={!!partial || pendingCalls.length > 0} />}
               {partial && (
                 <div className="body streaming">
-                  <Markdown source={partial} caret={!pendingCalls.length} />
+                  <Markdown source={live.content} caret={!pendingCalls.length} />
                 </div>
               )}
             </MessageRow>
@@ -867,7 +894,6 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
                   {stream.speed[activeId].toFixed(stream.speed[activeId] < 10 ? 1 : 0)} tok/s
                 </span>
               ) : null}
-              <SavedState stateKey={activeId ? `agent:${activeId}` : null} canSave={!!loaded && !busy && messages.length > 0} />
               {ctx && <ContextMeter used={ctx.used} max={ctx.max} />}
               <button
                 className={`send-button${running ? ' stopping' : ''}`}

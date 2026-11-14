@@ -10,7 +10,8 @@ function CopyButton({ text }: { text: string }): JSX.Element {
       type="button"
       className="md-copy"
       onClick={() => {
-        void navigator.clipboard?.writeText(text).then(() => {
+        // Without the invisible mark of where a save stopped, should it fall inside this block.
+        void navigator.clipboard?.writeText(text.replace(/\u2064/g, '')).then(() => {
           setCopied(true)
           setTimeout(() => setCopied(false), 1400)
         })

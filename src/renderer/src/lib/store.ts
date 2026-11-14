@@ -132,8 +132,10 @@ export interface StreamState {
   toolFrames: Record<string, string[]>
   /** Conversations whose state was just saved to disk, by key (chat:<id>, agent:<id>). */
   savedStates: Record<string, { tokens: number; savedAt: number }>
-  /** Saves asked for and in progress, by conversation key. */
-  savingStates: Record<string, { phase: 'reading' | 'saving'; done?: number; total?: number }>
+  /** Saves in progress, by conversation key: what stage, how far (null when that is not known), bytes written. */
+  savingStates: Record<string, { stage: 'waiting' | 'reading' | 'writing' | 'encrypting'; percent: number | null; bytes?: number }>
+  /** Bumped whenever a conversation's save lands or is removed, so what it covers is read again. */
+  stateTicks: Record<string, number>
   /** How fast the reply in flight is being written, by conversation; gone between requests. */
   speed: Record<string, number>
   /**
@@ -238,6 +240,7 @@ const state: StreamState = {
   toolFrames: {},
   savedStates: {},
   savingStates: {},
+  stateTicks: {},
   speed: {},
   ultra: {},
   ultraSynthesising: {},
@@ -278,6 +281,7 @@ function emitChange(): void {
     toolFrames: { ...state.toolFrames },
     savedStates: { ...state.savedStates },
     savingStates: { ...state.savingStates },
+    stateTicks: { ...state.stateTicks },
     speed: { ...state.speed },
     ultra: { ...state.ultra },
     ultraSynthesising: { ...state.ultraSynthesising },
@@ -601,12 +605,27 @@ function wire(): void {
 
   on<{ key: string; tokens: number; savedAt: number }>('state:saved', (d) => {
     state.savedStates[d.key] = { tokens: d.tokens, savedAt: d.savedAt }
+    state.stateTicks[d.key] = (state.stateTicks[d.key] ?? 0) + 1
     emitChange()
   })
 
-  on<{ key: string; phase: 'reading' | 'saving' | null; done?: number; total?: number }>('state:progress', (d) => {
-    if (d.phase) state.savingStates[d.key] = { phase: d.phase, done: d.done, total: d.total }
-    else delete state.savingStates[d.key]
+  on<{ key: string }>('state:removed', (d) => {
+    delete state.savedStates[d.key]
+    state.stateTicks[d.key] = (state.stateTicks[d.key] ?? 0) + 1
+    emitChange()
+  })
+
+  on<{ key: string; stage: 'waiting' | 'reading' | 'writing' | 'encrypting' | null; percent?: number | null; bytes?: number }>(
+    'state:progress',
+    (d) => {
+      if (d.stage) state.savingStates[d.key] = { stage: d.stage, percent: d.percent ?? null, bytes: d.bytes }
+      else delete state.savingStates[d.key]
+      emitChange()
+    }
+  )
+
+  on<{ sessionId: string; messageId: string; frames: string[] }>('agent:tool-frames', (d) => {
+    state.toolFrames[d.messageId] = d.frames
     emitChange()
   })
 

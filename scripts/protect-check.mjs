@@ -135,8 +135,8 @@ try {
         res.end(JSON.stringify(o))
       }
       if (req.url === '/apply-template') {
-        const last = json.messages.at(-1).content
-        return reply({ prompt: `<s>${json.messages.slice(0, -1).map((m) => m.content).join('|')}<u>${last}` })
+        // Like a real template: each message wrapped in its role, so a conversation's text begins with any shorter one's.
+        return reply({ prompt: '<s>' + json.messages.map((m) => `<${m.role}>${m.content}</${m.role}>`).join('') })
       }
       if (req.url === '/completion') return reply({ content: '' })
       if (req.url.startsWith('/slots/0?action=save')) {
@@ -180,6 +180,21 @@ try {
   const noKey = await sc.restoreState({ ...common })
   check('an encrypted state is never handed over without its key', !noKey.ok && !seen.restored.slice(1).includes(`${stem}.bin`), JSON.stringify(noKey))
   check('and is removed rather than tried again', !fs.existsSync(path.join(states, `${stem}.bin`)))
+
+  console.log('borrowing another conversation\'s save')
+  const lenderReq = { messages: [{ role: 'system', content: 'You are helpful.' }, { role: 'user', content: 'hello' }, { role: 'assistant', content: 'hi' }] }
+  const lent = await sc.saveState({ base, dir: states, key: 'chat:lender', fingerprint: 'fp', req: lenderReq })
+  const fork = { messages: [...lenderReq.messages, { role: 'user', content: 'and a fork of it' }, { role: 'assistant', content: 'yes' }] }
+  const forkPrefix = await sc.renderPrefix(base, fork)
+  const found = sc.longestReusable(states, 'fp', forkPrefix, (s) => s.key !== 'chat:fork')
+  check('a fork finds the save of the conversation it came from', lent.ok && found?.key === 'chat:lender', JSON.stringify(found?.key))
+  check('but not one saved under another load', sc.longestReusable(states, 'other', forkPrefix, () => true) === null)
+  const unrelated = await sc.renderPrefix(base, { messages: [{ role: 'user', content: 'something else entirely' }, { role: 'assistant', content: 'ok' }] })
+  check('nor one it does not begin with', sc.longestReusable(states, 'fp', unrelated, () => true) === null)
+  const borrowed = await sc.restoreState({ base, dir: states, key: 'chat:lender', fingerprint: 'fp', req: fork, borrowed: true })
+  check('the borrowed save loads for the fork', borrowed.ok, JSON.stringify(borrowed))
+  const mismatch = await sc.restoreState({ base, dir: states, key: 'chat:lender', fingerprint: 'fp', req: { messages: [{ role: 'user', content: 'different' }] }, borrowed: true })
+  check('and a borrowed save that does not fit is left alone, not removed', !mismatch.ok && !!sc.readMeta(states, 'chat:lender'), JSON.stringify(mismatch))
 
   const plain = await sc.saveState({ ...common })
   check('an unprotected conversation still saves plain', plain.ok && !(await c.isSealedFile(path.join(states, `${stem}.bin`))))

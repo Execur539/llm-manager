@@ -1417,58 +1417,129 @@ h6.md-heading {
   box-shadow: inset 0 0 0 1px var(--hairline);
 }
 
-/* ---------------------------------------------------------------- the conversation is saved */
+/* A picture a tool showed the model, under its card at a size worth looking at. */
+.tool-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
 
-/* Beside the context ring: a tick when the conversation is on disk, "Saved" for a moment as a save lands. */
-/* A quiet line of text that is also the way to save now: none of a button's weight. */
-.saved-state {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  min-height: 22px;
-  padding: 0 6px;
-  border: none;
+.tool-image {
+  margin: 0;
+  max-width: 100%;
+}
+
+.tool-image img {
+  display: block;
+  max-width: min(100%, 560px);
+  max-height: 360px;
+  width: auto;
+  height: auto;
   border-radius: var(--r-md);
-  background: transparent;
-  box-shadow: none;
-  color: var(--text-faint);
-  font-size: var(--fs-xs);
-  font-weight: 400;
-  white-space: nowrap;
-  transition:
-    color var(--dur) var(--ease),
-    background var(--dur) var(--ease);
+  background: var(--bg-inset);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+  object-fit: contain;
 }
 
-.saved-state:hover:not(:disabled) {
-  background: var(--surface-2);
-  color: var(--text-dim);
+/* ---------------------------------------------------------------- what the saved state holds */
+
+/*
+ * An edge down the left of every message: green where the conversation's saved model state holds
+ * it, grey where it does not. A reply saved part way is green down to the line the save reached
+ * (--save-split, measured from the message's top). While a save runs the edges not yet reached pulse.
+ */
+.msg[data-save]::before,
+.msg-aside[data-save]::before {
+  content: '';
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: -14px;
+  width: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.1);
+  transition: background var(--dur) var(--ease);
+  pointer-events: none;
 }
 
-.saved-state:active:not(:disabled) {
-  transform: none;
-  background: var(--surface-3);
+.msg-aside[data-save] {
+  position: relative;
 }
 
-/* Disabled only means "not now": the tick still says what is on disk, at full strength. */
-.saved-state:disabled {
-  opacity: 1;
+.msg[data-save='saved']::before,
+.msg-aside[data-save='saved']::before {
+  background: var(--good);
 }
 
-.saved-state.fresh,
-.saved-state.fresh:hover:not(:disabled) {
-  color: #6fe08f;
+.msg[data-save='partial']::before,
+.msg-aside[data-save='partial']::before {
+  background: linear-gradient(
+    to bottom,
+    var(--good) 0,
+    var(--good) var(--save-split, 0px),
+    rgba(255, 255, 255, 0.1) var(--save-split, 0px)
+  );
 }
 
-.saved-state .spinner {
-  flex-shrink: 0;
+.msg[data-save='saving']::before,
+.msg-aside[data-save='saving']::before {
+  background: var(--good);
+  animation: save-pulse 1.1s ease-in-out infinite;
 }
 
-.saved-state .icon {
-  flex-shrink: 0;
+@keyframes save-pulse {
+  0%,
+  100% {
+    opacity: 0.18;
+  }
+  50% {
+    opacity: 0.6;
+  }
 }
 
-/* The reply's speed while it is being written, beside the saved tick and the context ring. */
+@media (prefers-reduced-motion: reduce) {
+  .msg[data-save='saving']::before,
+  .msg-aside[data-save='saving']::before {
+    animation: none;
+    opacity: 0.4;
+  }
+}
+
+/* The toolbar's Save state button, filling with the save's progress while it runs. */
+.save-state-button {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.save-state-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: -1;
+  width: 0;
+  background: var(--good-wash);
+  transition: width 0.25s linear;
+}
+
+.save-state-button.working .save-state-fill {
+  width: var(--save-progress, 100%);
+}
+
+/* How far is not known (the first save under a model): the fill breathes instead of growing. */
+.save-state-button.working:not([style]) .save-state-fill {
+  animation: save-pulse 1.1s ease-in-out infinite;
+}
+
+.save-state-button.done {
+  color: var(--good);
+}
+
+.save-state-label {
+  font-variant-numeric: tabular-nums;
+}
+
+/* The reply's speed while it is being written, beside the context ring. */
 .live-speed {
   padding: 0 4px;
   color: var(--text-dim);
