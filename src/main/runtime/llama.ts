@@ -398,6 +398,11 @@ export class LlamaRuntime extends EventEmitter {
     return { base: `http://127.0.0.1:${loaded.port}`, dir: this.stateDir, fingerprint: this.stateFingerprint }
   }
 
+  /** Whether what the server holds ends in a read-ahead's stand-in for the next message. */
+  get heldIsReadAhead(): boolean {
+    return this.lastWasReadAhead
+  }
+
   /** The conversation the server's cache belongs to, when the last request named one. */
   get heldKey(): string | undefined {
     return this.lastShape?.key

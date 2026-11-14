@@ -49,6 +49,7 @@ import {
   listStates,
   longestReusable,
   renderPrefix,
+  requestText,
   prune,
   readMeta,
   removeState,
@@ -647,22 +648,28 @@ const liveAgentSessions = new Map<string, AgentSessionState>()
  * save holds is borrowed: the system message conversations begin with, or the history a fork
  * shares with the conversation it was forked from. Anything after what was loaded is read on top.
  */
-async function restoreSaved(req: CompletionOptions, signal?: AbortSignal): Promise<boolean> {
+async function restoreSaved(req: CompletionOptions, signal?: AbortSignal, sent = false): Promise<boolean> {
   const store = llama.stateStore
   const key = req.cacheKey
   if (!store || !key) return false
   const seal = stateSeal(key)
   if (seal === 'locked') return false
-  if (readMeta(store.dir, key) && (await restoreOwn(req, key, seal, signal))) return true
+  if (readMeta(store.dir, key) && (await restoreOwn(req, key, seal, signal, sent))) return true
   if (signal?.aborted) return false
-  return restoreBorrowed(req, key, signal)
+  return restoreBorrowed(req, key, signal, sent)
 }
 
-async function restoreOwn(req: CompletionOptions, key: string, seal: Buffer | undefined, signal?: AbortSignal): Promise<boolean> {
+async function restoreOwn(
+  req: CompletionOptions,
+  key: string,
+  seal: Buffer | undefined,
+  signal?: AbortSignal,
+  sent = false
+): Promise<boolean> {
   const store = llama.stateStore
   if (!store) return false
   try {
-    const result = await restoreState({ ...store, key, req, signal, seal })
+    const result = await restoreState({ ...store, key, req, signal, seal, sent })
     if (!result.ok) {
       logger.info('prompt', `${key} was not restored from disk: ${result.why}`)
       return false
@@ -680,14 +687,14 @@ async function restoreOwn(req: CompletionOptions, key: string, seal: Buffer | un
  * The longest start of this conversation another conversation's save holds, loaded. A protected
  * conversation neither lends nor borrows: its saves are its own.
  */
-async function restoreBorrowed(req: CompletionOptions, key: string, signal?: AbortSignal): Promise<boolean> {
+async function restoreBorrowed(req: CompletionOptions, key: string, signal?: AbortSignal, sent = false): Promise<boolean> {
   const store = llama.stateStore
   if (!store || stateSeal(key) !== undefined) return false
   try {
-    const prefix = await renderPrefix(store.base, req, signal)
+    const prefix = sent ? await requestText(store.base, req, signal) : await renderPrefix(store.base, req, signal)
     const lender = longestReusable(store.dir, store.fingerprint, prefix, req.messages, (s) => s.key !== key && stateSeal(s.key) === undefined)
     if (!lender || signal?.aborted) return false
-    const result = await restoreState({ ...store, key: lender.key, req, signal, borrowed: true })
+    const result = await restoreState({ ...store, key: lender.key, req, signal, borrowed: true, sent })
     if (!result.ok) {
       logger.info('prompt', `could not borrow ${lender.key} for ${key}: ${result.why}`)
       return false
@@ -708,9 +715,18 @@ async function restoreBorrowed(req: CompletionOptions, key: string, signal?: Abo
  * The same thing clicking into the message box does ahead of time, for a message sent without
  * that head start.
  */
-async function resumeSaved(req: CompletionOptions): Promise<void> {
-  if (!llama.stateStore || !req.messages.length || llama.holds(req)) return
-  if (await restoreSaved(req)) return
+async function resumeSaved(req: CompletionOptions, sent = false): Promise<void> {
+  if (!llama.stateStore || !req.messages.length) return
+  // A load already under way (clicking into the message box starts one) finishes first, and counts.
+  await llama.preemptIdle()
+  /*
+   * Already held, in a way this request can use. A new message can follow a read-ahead (the server
+   * keeps its place at the start of the stand-in message). Continue, or a rewound message sent
+   * again, cannot: they end before the stand-in, and a model with recurrent layers cannot step
+   * back to them, so after a read-ahead the save is loaded again.
+   */
+  if (llama.holds(req) && !(sent && llama.heldIsReadAhead)) return
+  if (await restoreSaved(req, undefined, sent)) return
   // Someone is waiting: load the instructions if they are on disk, but do not stop to save them.
   await seedInstructions(req, new AbortController().signal, false)
 }
@@ -3603,6 +3619,11 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     agentTurnAbort = turnAbort
     await restoreConversationMedia(session.id, session.messages)
     a.hydrate(session)
+    // Whatever saved state still fits the rewound conversation, checked against the prompt it sends.
+    await resumeSaved(
+      { messages: a.buildHistory(session), tools: a.toolsFor(session), cacheKey: `agent:${sessionId}`, ...effortFields(effort) },
+      true
+    )
     drainPendingPermissions()
 
     const beforeRun = session.messages.length
@@ -3671,6 +3692,11 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     // With the images the earlier messages were sent with — without them the model resumes blind.
     await restoreConversationMedia(session.id, session.messages)
     a.hydrate(session)
+    // What was saved of it, checked against the Continue prompt itself; it used to load nothing.
+    await resumeSaved(
+      { messages: a.buildHistory(session), tools: a.toolsFor(session), cacheKey: `agent:${sessionId}`, continueFinal: true, ...effortFields(effort) },
+      true
+    )
     drainPendingPermissions()
 
     const before = session.messages.length

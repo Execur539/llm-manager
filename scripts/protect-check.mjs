@@ -124,7 +124,7 @@ try {
   const states = path.join(work, 'states')
   fs.mkdirSync(states)
   const STATE = crypto.randomBytes(2 * 1024 * 1024 + 5).toString('base64').slice(0, 2 * 1024 * 1024 + 5) + ' the words of the conversation '
-  const seen = { saved: [], restored: [], restoredBytes: null, plainLeftAfterSave: null, completions: [] }
+  const seen = { saved: [], restored: [], restoredBytes: null, plainLeftAfterSave: null, completions: [], restoreDelay: 0 }
   const server = http.createServer((req, res) => {
     let body = ''
     req.on('data', (d) => (body += d))
@@ -139,7 +139,13 @@ try {
         // Pictures become the pinned marker, as llama-server renders them.
         const text = (content) =>
           typeof content === 'string' ? content : content.map((part) => (part.type === 'text' ? part.text : sc.MEDIA_MARKER)).join('')
-        return reply({ prompt: '<s>' + json.messages.map((m) => `<${m.role}>${text(m.content)}</${m.role}>`).join('') })
+        // Continuing the last message leaves it open; otherwise a generation prompt opens the model's turn.
+        const n = json.messages.length
+        const body = json.messages
+          .map((m, i) => (json.continue_final_message && i === n - 1 ? `<${m.role}>${text(m.content)}` : `<${m.role}>${text(m.content)}</${m.role}>`))
+          .join('')
+        const open = json.continue_final_message || json.add_generation_prompt === false ? '' : '<assistant>'
+        return reply({ prompt: '<s>' + body + open })
       }
       if (req.url === '/completion') {
         seen.completions.push(json.prompt)
@@ -153,7 +159,8 @@ try {
       if (req.url.startsWith('/slots/0?action=restore')) {
         seen.restored.push(json.filename)
         seen.restoredBytes = fs.readFileSync(path.join(states, json.filename), 'utf8')
-        return reply({ n_restored: 123 })
+        // A large state takes a while to load, as a real one does.
+        return void setTimeout(() => reply({ n_restored: 123 }), seen.restoreDelay ?? 0)
       }
       res.writeHead(404)
       res.end('{}')
@@ -186,6 +193,28 @@ try {
   const noKey = await sc.restoreState({ ...common })
   check('an encrypted state is never handed over without its key', !noKey.ok && !seen.restored.slice(1).includes(`${stem}.bin`), JSON.stringify(noKey))
   check('and is removed rather than tried again', !fs.existsSync(path.join(states, `${stem}.bin`)))
+
+  console.log('continuing the last reply')
+  const chatReq = { messages: [{ role: 'user', content: 'hello' }, { role: 'assistant', content: 'hi there' }] }
+  const point = await sc.savePoint(base, chatReq)
+  check('a save ends where both a new message and Continue begin', point === '<s><user>hello</user><assistant>hi there', JSON.stringify(point))
+  const cont = { base, dir: states, key: 'chat:cont', fingerprint: 'fp' }
+  const savedForContinue = await sc.saveState({ ...cont, req: chatReq })
+  check('it saves there', savedForContinue.ok, JSON.stringify(savedForContinue))
+  check('and counts as up to date', (await sc.currentState({ ...cont, req: chatReq }))?.tokens === 123)
+  const continued = await sc.restoreState({ ...cont, req: { ...chatReq, continueFinal: true }, sent: true })
+  check('Continue loads it', continued.ok, JSON.stringify(continued))
+  const newMessage = await sc.restoreState({ ...cont, req: chatReq })
+  check('and so does a new message', newMessage.ok, JSON.stringify(newMessage))
+  const regenerated = await sc.restoreState({ ...cont, req: { messages: [{ role: 'user', content: 'hello, again' }] }, sent: true })
+  check('a request it does not fit loads nothing', !regenerated.ok, JSON.stringify(regenerated))
+  check('but the save is kept, for the next message it does fit', !!sc.readMeta(states, 'chat:cont'))
+  seen.restoreDelay = 400
+  const stopper = new AbortController()
+  setTimeout(() => stopper.abort(), 150)
+  const stoppedHalfway = await sc.restoreState({ ...cont, req: chatReq, signal: stopper.signal })
+  seen.restoreDelay = 0
+  check('a load that is stopped part way finishes rather than being thrown away', stoppedHalfway.ok, JSON.stringify(stoppedHalfway))
 
   console.log('a conversation with a picture in it')
   const png = (seed) => `data:image/png;base64,${Buffer.from(`picture-${seed}`).toString('base64')}`

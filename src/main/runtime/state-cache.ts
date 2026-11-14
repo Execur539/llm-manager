@@ -33,6 +33,8 @@ import { isSealedFile, openFile, sealFile } from '../protect/cipher'
 /** What decides how a conversation renders: its messages and everything else the template sees. */
 export interface StateRequest {
   messages: ChatMessage[]
+  /** Continue the last message (the model's) rather than start a new one; see CompletionOptions. */
+  continueFinal?: boolean
   tools?: ToolDefinition[]
   reasoningEffort?: string
   chatTemplateKwargs?: Record<string, unknown>
@@ -287,9 +289,41 @@ async function render(base: string, req: StateRequest, standIn: string, signal?:
  */
 export async function renderPrefix(base: string, req: StateRequest, signal?: AbortSignal): Promise<string> {
   const [a, b] = await Promise.all([render(base, req, 'AAAAAAAA', signal), render(base, req, 'BBBBBBBB', signal)])
-  let n = 0
-  while (n < a.length && n < b.length && a[n] === b[n]) n++
-  return a.slice(0, n)
+  return commonPrefix([a, b])
+}
+
+function commonPrefix(texts: string[]): string {
+  const [first, ...rest] = texts
+  let n = first.length
+  for (const t of rest) {
+    let i = 0
+    while (i < n && i < t.length && first[i] === t[i]) i++
+    n = i
+  }
+  return first.slice(0, n)
+}
+
+/**
+ * Where a save of the conversation should end: as far as every way it can carry on still begins.
+ *
+ * A new message, and, when the last message is the model's, Continue (the reply resumed where it
+ * stopped). Ending at the start of the next user message, as saves used to, left a state a few
+ * tokens past where a Continue prompt ends, and a model with recurrent layers cannot step back even
+ * that far: Continue read the whole conversation again. Ending where both begin costs a new message
+ * the end of the last reply, read again on top of the save; usually a handful of tokens.
+ */
+export async function savePoint(base: string, req: StateRequest, signal?: AbortSignal): Promise<string> {
+  const renders = [render(base, req, 'AAAAAAAA', signal), render(base, req, 'BBBBBBBB', signal)]
+  if (req.messages.at(-1)?.role === 'assistant') {
+    renders.push(renderSent(base, { ...req, continueFinal: true }, signal).catch(() => ''))
+  }
+  const texts = (await Promise.all(renders)).filter((t, i) => i < 2 || t.length > 0)
+  return commonPrefix(texts)
+}
+
+/** The prompt a request will send, rendered: for checking a save against exactly that. */
+export function requestText(base: string, req: StateRequest & { continueFinal?: boolean }, signal?: AbortSignal): Promise<string> {
+  return renderSent(base, req, signal)
 }
 
 /**
@@ -308,7 +342,7 @@ export async function currentState(o: {
   if (!meta || meta.fingerprint !== o.fingerprint) return null
   const media = mediaOf(o.req.messages)
   if (!media) return null
-  const prefix = await renderPrefix(o.base, o.req, o.signal)
+  const prefix = await savePoint(o.base, o.req, o.signal)
   return prefix.length === meta.prefixChars && stamp(prefix, media) === meta.prefixHash ? meta : null
 }
 
@@ -414,7 +448,7 @@ export async function saveState(o: {
   if (!o.req.messages.length) return { ok: false, why: 'the conversation is empty' }
   try {
     const media = mediaOf(o.req.messages)
-    const prefix = await renderPrefix(o.base, o.req, o.signal)
+    const prefix = await savePoint(o.base, o.req, o.signal)
     if (!prefix) return { ok: false, why: 'the conversation rendered to nothing' }
     const problem = mediaProblem(media, prefix)
     if (problem || !media) return { ok: false, why: problem ?? 'its media could not be read' }
@@ -590,6 +624,12 @@ export async function restoreState(o: {
    * or changed here, whatever is found: it is not this conversation's to discard.
    */
   borrowed?: boolean
+  /**
+   * `req` is exactly the request about to be sent (Continue, or a rewound message sent again)
+   * rather than the conversation a new message will follow. The save is checked against that
+   * prompt, and kept when it does not fit it: it may well fit the next new message.
+   */
+  sent?: boolean
 }): Promise<StateResult> {
   const meta = readMeta(o.dir, o.key)
   if (!meta) return { ok: false, why: 'nothing is saved for this conversation' }
@@ -597,8 +637,9 @@ export async function restoreState(o: {
   if (meta.fingerprint !== o.fingerprint) return { ok: false, why: 'it was saved under a different model or different load settings' }
   try {
     const media = mediaOf(o.req.messages) ?? []
-    const prefix = await renderPrefix(o.base, o.req, o.signal)
+    const prefix = o.sent ? await renderSent(o.base, o.req, o.signal) : await renderPrefix(o.base, o.req, o.signal)
     const begins = prefix.length >= meta.prefixChars && stamp(prefix.slice(0, meta.prefixChars), media) === meta.prefixHash
+    if (!begins && o.sent) return { ok: false, why: 'it does not fit this request' }
     /*
      * Changed inside the saved part. A model that can cut its state back still gains: the server
      * keeps what matches the new prompt and reads the rest. One with recurrent layers cannot, and
@@ -624,7 +665,14 @@ export async function restoreState(o: {
     if (sealed && o.seal) await openFile(o.seal, path.join(o.dir, `${stem}.bin`), path.join(o.dir, file))
     let loaded: Record<string, unknown>
     try {
-      loaded = await post(o.base, '/slots/0?action=restore', { filename: file }, o.signal)
+      /*
+       * Not abandoned once started. A message sent while a large state is loading used to cut the
+       * load off half way (the background work it was part of was stopped for the message), and
+       * the turn then read the whole conversation instead: minutes, where letting the load finish
+       * costs seconds. Whoever stops this waits for it instead.
+       */
+      if (o.signal?.aborted) throw new Error('This operation was aborted')
+      loaded = await post(o.base, '/slots/0?action=restore', { filename: file })
     } finally {
       if (sealed) fs.rmSync(path.join(o.dir, file), { force: true })
     }
