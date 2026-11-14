@@ -124,7 +124,7 @@ try {
   const states = path.join(work, 'states')
   fs.mkdirSync(states)
   const STATE = crypto.randomBytes(2 * 1024 * 1024 + 5).toString('base64').slice(0, 2 * 1024 * 1024 + 5) + ' the words of the conversation '
-  const seen = { saved: [], restored: [], restoredBytes: null, plainLeftAfterSave: null }
+  const seen = { saved: [], restored: [], restoredBytes: null, plainLeftAfterSave: null, completions: [] }
   const server = http.createServer((req, res) => {
     let body = ''
     req.on('data', (d) => (body += d))
@@ -136,9 +136,15 @@ try {
       }
       if (req.url === '/apply-template') {
         // Like a real template: each message wrapped in its role, so a conversation's text begins with any shorter one's.
-        return reply({ prompt: '<s>' + json.messages.map((m) => `<${m.role}>${m.content}</${m.role}>`).join('') })
+        // Pictures become the pinned marker, as llama-server renders them.
+        const text = (content) =>
+          typeof content === 'string' ? content : content.map((part) => (part.type === 'text' ? part.text : sc.MEDIA_MARKER)).join('')
+        return reply({ prompt: '<s>' + json.messages.map((m) => `<${m.role}>${text(m.content)}</${m.role}>`).join('') })
       }
-      if (req.url === '/completion') return reply({ content: '' })
+      if (req.url === '/completion') {
+        seen.completions.push(json.prompt)
+        return reply({ content: '' })
+      }
       if (req.url.startsWith('/slots/0?action=save')) {
         seen.saved.push(json.filename)
         fs.writeFileSync(path.join(states, json.filename), STATE)
@@ -181,16 +187,47 @@ try {
   check('an encrypted state is never handed over without its key', !noKey.ok && !seen.restored.slice(1).includes(`${stem}.bin`), JSON.stringify(noKey))
   check('and is removed rather than tried again', !fs.existsSync(path.join(states, `${stem}.bin`)))
 
+  console.log('a conversation with a picture in it')
+  const png = (seed) => `data:image/png;base64,${Buffer.from(`picture-${seed}`).toString('base64')}`
+  const withPicture = (seed) => ({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'what is this?' }, { type: 'image_url', image_url: { url: png(seed) } }] },
+      { role: 'assistant', content: 'a cat' }
+    ]
+  })
+  const pictured = { base, dir: states, key: 'chat:pictured', fingerprint: 'fp' }
+  seen.completions.length = 0
+  const savedPicture = await sc.saveState({ ...pictured, req: withPicture('one') })
+  check('it saves', savedPicture.ok, JSON.stringify(savedPicture))
+  const sync = seen.completions.at(-1)
+  check(
+    'with the picture sent along when the server is brought to the save point, not its marker as words',
+    !!sync && typeof sync === 'object' && sync.multimodal_data?.[0] === Buffer.from('picture-one').toString('base64') && sync.prompt_string.includes(sc.MEDIA_MARKER),
+    JSON.stringify(sync).slice(0, 120)
+  )
+  check('the same conversation counts as saved', (await sc.currentState({ ...pictured, req: withPicture('one') }))?.tokens === 123)
+  check('the same words with a different picture do not', (await sc.currentState({ ...pictured, req: withPicture('two') })) === null)
+  const pictureBack = await sc.restoreState({ ...pictured, req: withPicture('one') })
+  check('and it loads back', pictureBack.ok, JSON.stringify(pictureBack))
+  const otherPicture = await sc.restoreState({ ...pictured, req: withPicture('two') })
+  check('but not for a conversation whose picture is different', !otherPicture.ok, JSON.stringify(otherPicture))
+  const linked = await sc.saveState({
+    ...pictured,
+    key: 'chat:linked',
+    req: { messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://example.com/a.png' } }] }, { role: 'assistant', content: 'ok' }] }
+  })
+  check('a picture given as a web address is refused, with the reason', !linked.ok && /web address/.test(linked.why), JSON.stringify(linked))
+
   console.log('borrowing another conversation\'s save')
   const lenderReq = { messages: [{ role: 'system', content: 'You are helpful.' }, { role: 'user', content: 'hello' }, { role: 'assistant', content: 'hi' }] }
   const lent = await sc.saveState({ base, dir: states, key: 'chat:lender', fingerprint: 'fp', req: lenderReq })
   const fork = { messages: [...lenderReq.messages, { role: 'user', content: 'and a fork of it' }, { role: 'assistant', content: 'yes' }] }
   const forkPrefix = await sc.renderPrefix(base, fork)
-  const found = sc.longestReusable(states, 'fp', forkPrefix, (s) => s.key !== 'chat:fork')
+  const found = sc.longestReusable(states, 'fp', forkPrefix, fork.messages, (s) => s.key !== 'chat:fork')
   check('a fork finds the save of the conversation it came from', lent.ok && found?.key === 'chat:lender', JSON.stringify(found?.key))
-  check('but not one saved under another load', sc.longestReusable(states, 'other', forkPrefix, () => true) === null)
+  check('but not one saved under another load', sc.longestReusable(states, 'other', forkPrefix, fork.messages, () => true) === null)
   const unrelated = await sc.renderPrefix(base, { messages: [{ role: 'user', content: 'something else entirely' }, { role: 'assistant', content: 'ok' }] })
-  check('nor one it does not begin with', sc.longestReusable(states, 'fp', unrelated, () => true) === null)
+  check('nor one it does not begin with', sc.longestReusable(states, 'fp', unrelated, [], () => true) === null)
   const borrowed = await sc.restoreState({ base, dir: states, key: 'chat:lender', fingerprint: 'fp', req: fork, borrowed: true })
   check('the borrowed save loads for the fork', borrowed.ok, JSON.stringify(borrowed))
   const mismatch = await sc.restoreState({ base, dir: states, key: 'chat:lender', fingerprint: 'fp', req: { messages: [{ role: 'user', content: 'different' }] }, borrowed: true })

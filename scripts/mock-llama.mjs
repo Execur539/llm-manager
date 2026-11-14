@@ -53,8 +53,13 @@ let slotText = ''
 
 /** A stand-in chat template: each message on a line, and the assistant's turn opened unless continuing. */
 function renderTemplate(body) {
+  // Pictures and sounds become the media marker, as llama-server renders them (pinned by LLAMA_MEDIA_MARKER).
+  const marker = process.env.LLAMA_MEDIA_MARKER || '<__media__>'
   const lines = (body.messages ?? []).map((m) => {
-    const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+    const content =
+      typeof m.content === 'string'
+        ? m.content
+        : (m.content ?? []).map((p) => (p.type === 'text' ? (p.text ?? '') : marker)).join('')
     return `<${m.role}>${m.reasoning_content ? `<think>${m.reasoning_content}</think>` : ''}${content}`
   })
   if (body.continue_final_message) return lines.join('\n')
@@ -470,7 +475,9 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === '/completion' && req.method === 'POST') {
     const body = JSON.parse((await readBody(req)) || '{}')
+    // A plain prompt, or one with its pictures sent alongside ({ prompt_string, multimodal_data }).
     if (typeof body.prompt === 'string') slotText = body.prompt
+    else if (typeof body.prompt?.prompt_string === 'string') slotText = body.prompt.prompt_string
     return json(res, 200, { content: '', stop: true })
   }
 

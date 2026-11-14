@@ -32,6 +32,7 @@ import { logger } from '../log'
 // Relative, not `@shared`: the main-process bundle has no such alias for value imports.
 import { DEFAULT_TEMPERATURE, DEFAULT_TOP_P, SAMPLING_FIELDS, type SamplingOptions } from '../../shared/sampling'
 import { draftModuleArgs, SIDECAR_MAX_DRAFT } from '../models/draft-module'
+import { MEDIA_MARKER } from './state-cache'
 
 /**
  * Environment for llama-server from the runtime settings.
@@ -728,7 +729,12 @@ export class LlamaRuntime extends EventEmitter {
     const useMock = process.env.LLMM_MOCK_LLAMA === '1'
     const exe = useMock ? process.execPath : llamaServerPath(backend)
     const spawnArgs = useMock ? [mockServerPath(), ...args] : args
-    const env = useMock ? { ...childEnv(), ELECTRON_RUN_AS_NODE: '1' } : { ...childEnv(), ...runtimeEnv(plan) }
+    /*
+     * The marker for pictures in a rendered prompt, pinned: llama.cpp otherwise picks a random one
+     * each launch, and a conversation with pictures could then never be matched to its save.
+     */
+    const marker = { LLAMA_MEDIA_MARKER: MEDIA_MARKER }
+    const env = useMock ? { ...childEnv(), ELECTRON_RUN_AS_NODE: '1', ...marker } : { ...childEnv(), ...runtimeEnv(plan), ...marker }
 
     const child = spawn(exe, spawnArgs, { windowsHide: true, env })
     this.child = child

@@ -2755,6 +2755,48 @@ const scenarios = {
     })
   },
 
+  async saveWithPicture() {
+    await withApp('save-with-picture', async ({ app, page, env }) => {
+      const dir = path.join(env.base, 'files')
+      await fsp.mkdir(dir, { recursive: true })
+      const picture = path.join(dir, 'photo.png')
+      await fsp.writeFile(
+        picture,
+        Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4zwAE/xkgFAAb8gP91pbyKwAAAABJRU5ErkJggg==', 'base64')
+      )
+      await loadModel(page)
+      await goTo(page, 'Chat')
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await stubDialogs(app, { open: [picture] })
+      await page.getByTestId('attach-button').click()
+      await page.waitForSelector('[data-testid="attachment"]', { timeout: 10000 })
+      await page.getByTestId('chat-input').fill('what is in this picture?')
+      await page.getByTestId('chat-send').click()
+      await page.waitForFunction(
+        () => {
+          const el = document.querySelector('[data-testid="chat-input"]')
+          return el instanceof HTMLTextAreaElement && !el.disabled
+        },
+        undefined,
+        { timeout: 60000 }
+      )
+      await page.waitForTimeout(600)
+      await page.getByTestId('save-state').click()
+      const saved = await page
+        .waitForFunction(() => /^Saved$/.test(document.querySelector('[data-testid="save-state"]')?.textContent ?? ''), undefined, { timeout: 30000 })
+        .then(() => true)
+        .catch(() => false)
+      const toasts = await toastTexts(page)
+      report.check('save-with-picture', 'a conversation with a picture in it saves', saved, toasts.join(' | '))
+      report.check('save-with-picture', 'without the old refusal', !toasts.some((t) => /images, audio or video/.test(t)), toasts.join(' | '))
+      const edges = await page.evaluate(() =>
+        [...document.querySelectorAll('[data-testid="chat-messages"] [data-save]')].map((e) => e.getAttribute('data-save'))
+      )
+      report.check('save-with-picture', 'and shows as saved', edges.length >= 2 && edges.every((s) => s === 'saved'), edges.join(','))
+    })
+  },
+
   async toolImages() {
     await withApp('tool-images', async ({ page, env }) => {
       const dir = path.join(env.base, 'files')

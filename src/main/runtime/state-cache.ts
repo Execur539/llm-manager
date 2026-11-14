@@ -167,9 +167,83 @@ export function fileStem(key: string): string {
   return `state-${sha(key).slice(0, 20)}`
 }
 
-/** Whether anything in the conversation is not text. A raw prompt cannot carry media. */
+/** Whether anything in the conversation is not text. */
 export function hasMedia(messages: ChatMessage[]): boolean {
   return messages.some((m) => typeof m.content !== 'string' && m.content.some((p) => p.type !== 'text'))
+}
+
+/**
+ * How the server marks a picture, sound or video in a rendered prompt.
+ *
+ * Pinned when the server starts (LLAMA_MEDIA_MARKER). Left to itself llama.cpp picks a new random
+ * marker every launch, so a conversation with pictures in it rendered differently after every
+ * restart and could never be matched to its save.
+ */
+export const MEDIA_MARKER = '<__llmm_media__>'
+
+interface MediaItem {
+  /** The bytes, base64, as the server is sent them. */
+  data: string
+  /** Their SHA-256, which is also how the server itself tells one picture from another. */
+  hash: string
+}
+
+/**
+ * The pictures, sounds and videos in a conversation, in the order its prompt meets them. Null when
+ * one is not bytes the app has (a picture given as a web address).
+ */
+function mediaOf(messages: ChatMessage[]): MediaItem[] | null {
+  const out: MediaItem[] = []
+  for (const m of messages) {
+    if (typeof m.content === 'string') continue
+    for (const p of m.content) {
+      let data: string | undefined
+      if (p.type === 'image_url') {
+        const url = p.image_url?.url ?? ''
+        const at = url.indexOf('base64,')
+        if (!url.startsWith('data:') || at < 0) return null
+        data = url.slice(at + 'base64,'.length)
+      } else if (p.type === 'input_audio') {
+        data = p.input_audio?.data
+      } else if (p.type === 'input_video') {
+        data = p.input_video?.data
+      } else {
+        continue
+      }
+      if (!data) return null
+      out.push({ data, hash: crypto.createHash('sha256').update(Buffer.from(data, 'base64')).digest('hex') })
+    }
+  }
+  return out
+}
+
+/** How many pictures, sounds and videos a piece of rendered prompt holds. */
+const markersIn = (text: string): number => text.split(MEDIA_MARKER).length - 1
+
+/**
+ * What identifies the start of a conversation: its rendered text and, since every picture renders
+ * as the same marker, the pictures in it. Just the text, as it always was, when there are none.
+ */
+function stamp(text: string, media: MediaItem[]): string {
+  const n = markersIn(text)
+  return n ? sha(`${text}\u0000${media.slice(0, n).map((m) => m.hash).join(',')}`) : sha(text)
+}
+
+/**
+ * What brings the server to exactly `text`. With pictures in it, they go along with it: sent as
+ * plain text the markers would be read as words, and the server would throw away the pictures it
+ * holds to read them.
+ */
+function promptFor(text: string, media: MediaItem[]): unknown {
+  const n = markersIn(text)
+  return n ? { prompt_string: text, multimodal_data: media.slice(0, n).map((m) => m.data) } : text
+}
+
+/** Why a conversation's media cannot be saved with it, or null when they can. */
+function mediaProblem(media: MediaItem[] | null, prefix: string): string | null {
+  if (!media) return 'a picture in it is a web address rather than a file the app has'
+  if (markersIn(prefix) !== media.length) return 'the server did not mark its pictures the way the app expects; load the model again'
+  return null
 }
 
 async function post(base: string, url: string, body: unknown, signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -231,9 +305,11 @@ export async function currentState(o: {
   signal?: AbortSignal
 }): Promise<StateMeta | null> {
   const meta = readMeta(o.dir, o.key)
-  if (!meta || meta.fingerprint !== o.fingerprint || hasMedia(o.req.messages)) return null
+  if (!meta || meta.fingerprint !== o.fingerprint) return null
+  const media = mediaOf(o.req.messages)
+  if (!media) return null
   const prefix = await renderPrefix(o.base, o.req, o.signal)
-  return prefix.length === meta.prefixChars && sha(prefix) === meta.prefixHash ? meta : null
+  return prefix.length === meta.prefixChars && stamp(prefix, media) === meta.prefixHash ? meta : null
 }
 
 /**
@@ -241,11 +317,18 @@ export async function currentState(o: {
  * every conversation begins with, or the history a fork shares with the conversation it came from.
  * Only states saved under the same load, and only those `allow` lets through. Null when none does.
  */
-export function longestReusable(dir: string, fingerprint: string, prefix: string, allow: (meta: StateMeta) => boolean): StateMeta | null {
+export function longestReusable(
+  dir: string,
+  fingerprint: string,
+  prefix: string,
+  messages: ChatMessage[],
+  allow: (meta: StateMeta) => boolean
+): StateMeta | null {
+  const media = mediaOf(messages) ?? []
   let best: StateMeta | null = null
   for (const s of listStates(dir)) {
     if (s.fingerprint !== fingerprint || s.prefixChars > prefix.length || (best && s.prefixChars <= best.prefixChars)) continue
-    if (!allow(s) || sha(prefix.slice(0, s.prefixChars)) !== s.prefixHash) continue
+    if (!allow(s) || stamp(prefix.slice(0, s.prefixChars), media) !== s.prefixHash) continue
     best = s
   }
   return best
@@ -329,13 +412,15 @@ export async function saveState(o: {
   onProgress?: (p: SaveProgress) => void
 }): Promise<StateResult> {
   if (!o.req.messages.length) return { ok: false, why: 'the conversation is empty' }
-  if (hasMedia(o.req.messages)) return { ok: false, why: 'the conversation contains images, audio or video' }
   try {
+    const media = mediaOf(o.req.messages)
     const prefix = await renderPrefix(o.base, o.req, o.signal)
     if (!prefix) return { ok: false, why: 'the conversation rendered to nothing' }
+    const problem = mediaProblem(media, prefix)
+    if (problem || !media) return { ok: false, why: problem ?? 'its media could not be read' }
     // Leaves the slot holding exactly this text: nothing after it for a later prompt to undo.
-    await post(o.base, '/completion', { prompt: prefix, n_predict: 0, cache_prompt: true, stream: false }, o.signal)
-    return await writeState(o, prefix)
+    await post(o.base, '/completion', { prompt: promptFor(prefix, media), n_predict: 0, cache_prompt: true, stream: false }, o.signal)
+    return await writeState(o, prefix, media)
   } catch (err) {
     clearPartials(o.dir, o.key)
     return { ok: false, why: err instanceof Error ? err.message : String(err) }
@@ -364,12 +449,14 @@ export async function saveAsIs(o: {
   onProgress?: (p: SaveProgress) => void
 }): Promise<StateResult> {
   if (!o.sent.messages.length) return { ok: false, why: 'the conversation is empty' }
-  if (hasMedia(o.sent.messages)) return { ok: false, why: 'the conversation contains images, audio or video' }
   try {
+    const media = mediaOf(o.sent.messages)
     const prefix = await renderSent(o.base, o.sent, o.signal)
     if (!prefix) return { ok: false, why: 'the conversation rendered to nothing' }
-    await post(o.base, '/completion', { prompt: prefix, n_predict: 0, cache_prompt: true, stream: false }, o.signal)
-    return await writeState(o, prefix)
+    const problem = mediaProblem(media, prefix)
+    if (problem || !media) return { ok: false, why: problem ?? 'its media could not be read' }
+    await post(o.base, '/completion', { prompt: promptFor(prefix, media), n_predict: 0, cache_prompt: true, stream: false }, o.signal)
+    return await writeState(o, prefix, media)
   } catch (err) {
     clearPartials(o.dir, o.key)
     return { ok: false, why: err instanceof Error ? err.message : String(err) }
@@ -414,7 +501,8 @@ async function writeState(
     expectedBytes?: number | null
     onProgress?: (p: SaveProgress) => void
   },
-  prefix: string
+  prefix: string,
+  media: MediaItem[]
 ): Promise<StateResult> {
   {
     const stem = fileStem(o.key)
@@ -463,7 +551,7 @@ async function writeState(
       key: o.key,
       fingerprint: o.fingerprint,
       prefixChars: prefix.length,
-      prefixHash: sha(prefix),
+      prefixHash: stamp(prefix, media),
       tokens: Number(saved.n_saved ?? 0),
       bytes: Number(saved.n_written ?? 0),
       fileBytes,
@@ -507,10 +595,10 @@ export async function restoreState(o: {
   if (!meta) return { ok: false, why: 'nothing is saved for this conversation' }
   // Kept, not removed: the user saved it, and it loads again once that model is back.
   if (meta.fingerprint !== o.fingerprint) return { ok: false, why: 'it was saved under a different model or different load settings' }
-  if (hasMedia(o.req.messages)) return { ok: false, why: 'the conversation contains images, audio or video' }
   try {
+    const media = mediaOf(o.req.messages) ?? []
     const prefix = await renderPrefix(o.base, o.req, o.signal)
-    const begins = prefix.length >= meta.prefixChars && sha(prefix.slice(0, meta.prefixChars)) === meta.prefixHash
+    const begins = prefix.length >= meta.prefixChars && stamp(prefix.slice(0, meta.prefixChars), media) === meta.prefixHash
     /*
      * Changed inside the saved part. A model that can cut its state back still gains: the server
      * keeps what matches the new prompt and reads the rest. One with recurrent layers cannot, and

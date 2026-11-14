@@ -46,7 +46,6 @@ import type { RereadReport } from './runtime/reuse-meter'
 import {
   coverage,
   currentState,
-  hasMedia,
   listStates,
   longestReusable,
   renderPrefix,
@@ -481,9 +480,6 @@ async function saveMidTurn(key: string): Promise<SaveNowResult> {
   emit('state:progress', { key, stage: 'waiting', percent: null })
   try {
     const outcome = await llama.saveDuringTurn(key, async ({ resume, reply }) => {
-      if (hasMedia(resume.messages)) {
-        throw new Error('it has images, audio or video in it, and a saved state can only be checked against text')
-      }
       const covers = {
         messages: stateMarks(key, conversationMessages(key)),
         summaryUpto: chats.getSummary(id)?.uptoMessageId ?? null,
@@ -564,12 +560,6 @@ async function saveNow(key: string): Promise<SaveNowResult> {
   if (seal === 'locked') return { ok: false, why: 'It is locked.' }
   const req = await conversationRequest(key)
   if (!req) return { ok: false, why: 'There is nothing in it to save yet.' }
-  if (hasMedia(req.messages)) {
-    return {
-      ok: false,
-      why: 'Not saved: it has images, audio or video in it, and a saved state can only be checked against text. A conversation with them is read again instead.'
-    }
-  }
   const id = key.slice(key.indexOf(':') + 1)
   const messages = conversationMessages(key)
   const covers = {
@@ -692,10 +682,10 @@ async function restoreOwn(req: CompletionOptions, key: string, seal: Buffer | un
  */
 async function restoreBorrowed(req: CompletionOptions, key: string, signal?: AbortSignal): Promise<boolean> {
   const store = llama.stateStore
-  if (!store || hasMedia(req.messages) || stateSeal(key) !== undefined) return false
+  if (!store || stateSeal(key) !== undefined) return false
   try {
     const prefix = await renderPrefix(store.base, req, signal)
-    const lender = longestReusable(store.dir, store.fingerprint, prefix, (s) => s.key !== key && stateSeal(s.key) === undefined)
+    const lender = longestReusable(store.dir, store.fingerprint, prefix, req.messages, (s) => s.key !== key && stateSeal(s.key) === undefined)
     if (!lender || signal?.aborted) return false
     const result = await restoreState({ ...store, key: lender.key, req, signal, borrowed: true })
     if (!result.ok) {
