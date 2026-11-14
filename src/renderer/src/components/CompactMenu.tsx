@@ -9,7 +9,7 @@
  * a list that shows it.
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { invoke } from '../lib/api'
 import { toast } from '../lib/store'
@@ -66,6 +66,21 @@ export default function CompactMenu({
     return () => q.removeEventListener('change', read)
   }, [])
   const shown = down || touch
+  /*
+   * Closing waits a moment. The pointer on its way down to the card crosses a gap, and can get
+   * there before the card has finished sliding; closing at once pulled the card away from it.
+   */
+  const closing = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const open = (): void => {
+    if (closing.current) clearTimeout(closing.current)
+    closing.current = null
+    setDown(true)
+  }
+  const close = (): void => {
+    if (closing.current) clearTimeout(closing.current)
+    closing.current = setTimeout(() => setDown(false), 350)
+  }
+  useEffect(() => () => void (closing.current && clearTimeout(closing.current)), [])
 
   const preview = async (): Promise<void> => {
     if (!stateKey || working) return
@@ -105,11 +120,11 @@ export default function CompactMenu({
   return (
     <span
       className={`compact-menu${shown ? ' down' : ''}`}
-      onMouseEnter={() => setDown(true)}
-      onMouseLeave={() => setDown(false)}
-      onFocus={() => setDown(true)}
+      onMouseEnter={open}
+      onMouseLeave={close}
+      onFocus={open}
       onBlur={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDown(false)
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) close()
       }}
     >
       {children}

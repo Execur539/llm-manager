@@ -2808,7 +2808,14 @@ const scenarios = {
       report.check('quick-compact', 'the preview gives a size for each strength without changing anything', preview.ok && preview.options?.length >= 1 && preview.options.every((o) => o.afterTokens < preview.beforeTokens), JSON.stringify(preview).slice(0, 220))
       const untouched = await page.evaluate((id) => window.api.invoke('chat:load', id), chat.id)
       report.check('quick-compact', 'and has not compacted', !untouched.quick)
-      await page.getByTestId('quick-compact').click()
+      // As a hand does it: from Compact straight down, slowly, across the gap, then the click.
+      const from = await page.getByTestId('compact-chat').boundingBox()
+      await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2)
+      await page.waitForTimeout(100)
+      await page.mouse.move(from.x + from.width / 2, from.y + from.height + 22, { steps: 25 })
+      await page.waitForTimeout(500)
+      report.check('quick-compact', 'moving the pointer down from Compact keeps the card there', (await page.getByTestId('quick-compact').count()) === 1)
+      await page.mouse.click(from.x + from.width / 2, from.y + from.height + 22)
       const asked = await page.waitForSelector('[data-testid="confirm-overlay"]', { timeout: 5000 }).then(() => true).catch(() => false)
       report.check('quick-compact', 'pressing it shows the strengths and their sizes first', asked && (await page.locator('.quick-option').count()) === preview.options.length)
       // Once it has finished fading in.

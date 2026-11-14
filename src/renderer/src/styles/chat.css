@@ -1606,6 +1606,19 @@ h6.md-heading {
   z-index: 30;
 }
 
+/*
+ * While it is down, the space under Compact where the card sits (and the gap above it) belongs to
+ * the pair, whether or not the card has arrived there yet: the pointer moving down stays inside.
+ */
+.compact-menu.down::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: -6px;
+  width: 200px;
+  height: 52px;
+}
+
 .compact-menu.down .compact-drop {
   max-width: 240px;
   overflow: visible;
