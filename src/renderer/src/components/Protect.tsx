@@ -8,6 +8,7 @@
  */
 
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { invoke } from '../lib/api'
 import { toast } from '../lib/store'
 import Icon from './Icon'
@@ -66,7 +67,8 @@ export function ProtectButton({
         <Icon name="lock" size={14} />
         {on ? 'Protected' : 'Protect'}
       </button>
-      {open && <ProtectDialog kind={kind} id={id} state={state ?? {}} agent={agent} onClose={() => setOpen(false)} />}
+      {/* Outside the toolbar: a full-window overlay inside it can be confined to it by the toolbar's own styling. */}
+      {open && createPortal(<ProtectDialog kind={kind} id={id} state={state ?? {}} agent={agent} onClose={() => setOpen(false)} />, document.body)}
     </>
   )
 }

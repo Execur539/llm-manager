@@ -392,6 +392,14 @@ export const MIGRATIONS: { id: number; sql: string }[] = [
     ALTER TABLE chats ADD COLUMN protection TEXT;
     ALTER TABLE collections ADD COLUMN protection TEXT;
     `
+  },
+  {
+    id: 15,
+    sql: `
+    -- A quick compact: where the compacted part of a conversation ends and how hard it was squeezed,
+    -- as JSON. Only how the older messages are sent changes; the messages themselves are untouched.
+    ALTER TABLE chats ADD COLUMN quick_compact TEXT;
+    `
   }
 ]
 

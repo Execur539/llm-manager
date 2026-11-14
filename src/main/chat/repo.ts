@@ -60,7 +60,36 @@ interface ChatRow {
   summary_upto: string | null
   title_by_user: number
   protection: string | null
+  quick_compact: string | null
 }
+
+type QuickSpec = { v: 2; segments: { upto: string; level: number }[] }
+
+function parseQuick(raw: string | null | undefined): QuickSpec | null {
+  try {
+    const q = raw ? (JSON.parse(raw) as { v?: number; upto?: unknown; level?: unknown; segments?: unknown }) : null
+    if (!q) return null
+    // The first form held one stretch.
+    if (q.v === 1 && typeof q.upto === 'string' && typeof q.level === 'number') return { v: 2, segments: [{ upto: q.upto, level: q.level }] }
+    if (q.v !== 2 || !Array.isArray(q.segments)) return null
+    const segments = q.segments.filter(
+      (x): x is { upto: string; level: number } => !!x && typeof (x as { upto?: unknown }).upto === 'string' && typeof (x as { level?: unknown }).level === 'number'
+    )
+    return segments.length ? { v: 2, segments: segments.map((x) => ({ upto: x.upto, level: x.level })) } : null
+  } catch {
+    return null
+  }
+}
+
+/** The quick compacts in force for a conversation, if any. */
+export function getQuick(chatId: string): QuickSpec | null {
+  return parseQuick(get<{ quick_compact: string | null }>('SELECT quick_compact FROM chats WHERE id = ?', chatId)?.quick_compact)
+}
+
+export function setQuick(chatId: string, spec: QuickSpec | null): void {
+  run('UPDATE chats SET quick_compact = ? WHERE id = ?', spec?.segments.length ? JSON.stringify(spec) : null, chatId)
+}
+
 
 const lockedTitle = (kind: string): string => (kind === 'agent' ? 'Locked session' : 'Locked chat')
 
@@ -441,7 +470,8 @@ export function loadSession(chatId: string): AgentSessionState | null {
     updatedAt: row.updated_at,
     contextUsed: row.context_used ?? undefined,
     summary: box.openOrNull(row.summary) ?? undefined,
-    summaryUpto: row.summary_upto ?? undefined
+    summaryUpto: row.summary_upto ?? undefined,
+    quick: parseQuick(row.quick_compact)
   }
 }
 

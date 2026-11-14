@@ -413,7 +413,11 @@ const scenarios = {
        * branch this session lands in, silence is the one outcome that is wrong.
        */
       await page.getByTestId('compact-session').click()
-      await page.waitForTimeout(1500)
+      // Off the button again, so the card under it goes back up.
+      await page.mouse.move(5, 5)
+      // It loads the session's saved state before summarising now, so the word comes a little later.
+      await page.waitForSelector('[data-testid="toast"], .toast', { timeout: 15000 }).catch(() => undefined)
+      await page.waitForTimeout(300)
       const said = (await toastTexts(page)).join(' | ')
       report.check('agent', 'compacting reports what it did rather than failing silently',
         said.trim().length > 0, said || 'no toast at all')
@@ -2752,6 +2756,90 @@ const scenarios = {
       await page.waitForTimeout(800)
       const later = await edges()
       report.check('manual-save', 'what is said after a save shows as not saved', later.slice(-2).join(',') === 'unsaved,unsaved', later.join(','))
+    })
+  },
+
+  async quickCompact() {
+    await withApp('quick-compact', async ({ page }) => {
+      const idle = (input) =>
+        page.waitForFunction(
+          (id) => {
+            const el = document.querySelector(`[data-testid="${id}"]`)
+            return el instanceof HTMLTextAreaElement && !el.disabled
+          },
+          input,
+          { timeout: 60000 }
+        )
+      await loadModel(page)
+      await goTo(page, 'Chat')
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      // Several long answers, so there is a good deal older than the most recent turn.
+      for (const n of [1, 2, 3]) {
+        await page.getByTestId('chat-input').fill(`[[mock:long]] question ${n} about pelicans`)
+        await page.getByTestId('chat-send').click()
+        await idle('chat-input')
+        await page.waitForTimeout(300)
+      }
+      const [chat] = await page.evaluate(() => window.api.invoke('chat:list', 'chat'))
+      const key = `chat:${chat.id}`
+
+      const tucked = await page.evaluate(() => {
+        const drop = document.querySelector('.compact-drop')
+        const main = document.querySelector('[data-testid="compact-chat"]')
+        if (!drop || !main) return null
+        const d = drop.getBoundingClientRect()
+        const m = main.getBoundingClientRect()
+        return { peeks: Math.round(d.bottom - m.bottom), below: d.top >= m.bottom }
+      })
+      report.check('quick-compact', 'at rest the second card peeks out under Compact', !!tucked && tucked.peeks > 0 && tucked.peeks < 12 && !tucked.below, JSON.stringify(tucked))
+      await shot(page, 'quick-compact-rest')
+      await page.getByTestId('compact-chat').hover()
+      await page.waitForTimeout(400)
+      const down = await page.evaluate(() => {
+        const d = document.querySelector('.compact-drop').getBoundingClientRect()
+        const m = document.querySelector('[data-testid="compact-chat"]').getBoundingClientRect()
+        return d.top >= m.bottom
+      })
+      report.check('quick-compact', 'hovering Compact brings Quick compact down under it', down)
+      await shot(page, 'quick-compact-open')
+
+      const preview = await page.evaluate((k) => window.api.invoke('compact:preview', k), key)
+      report.check('quick-compact', 'the preview gives a size for each strength without changing anything', preview.ok && preview.options?.length >= 1 && preview.options.every((o) => o.afterTokens < preview.beforeTokens), JSON.stringify(preview).slice(0, 220))
+      const untouched = await page.evaluate((id) => window.api.invoke('chat:load', id), chat.id)
+      report.check('quick-compact', 'and has not compacted', !untouched.quick)
+      await page.getByTestId('quick-compact').click()
+      const asked = await page.waitForSelector('[data-testid="confirm-overlay"]', { timeout: 5000 }).then(() => true).catch(() => false)
+      report.check('quick-compact', 'pressing it shows the strengths and their sizes first', asked && (await page.locator('.quick-option').count()) === preview.options.length)
+      // Once it has finished fading in.
+      await page.waitForTimeout(700)
+      await shot(page, 'quick-compact-confirm')
+      await page.getByTestId('quick-level-5').click()
+      await page.getByTestId('confirm-accept').click()
+      await page.waitForTimeout(600)
+      const loaded = await page.evaluate((id) => window.api.invoke('chat:load', id), chat.id)
+      report.check('quick-compact', 'the compaction is recorded, and no message is removed', !!loaded.quick?.segments?.length && loaded.messages.length === untouched.messages.length, JSON.stringify(loaded.quick))
+
+      // What the model is sent next is the shortened form; the mock echoes the shape it received.
+      await page.getByTestId('chat-input').fill('[[mock:shape]] and now?')
+      await page.getByTestId('chat-send').click()
+      await idle('chat-input')
+      await page.waitForTimeout(400)
+      const after = await page.evaluate((id) => window.api.invoke('chat:load', id), chat.id)
+      report.check('quick-compact', 'the next turn answers from the compacted conversation', /^SHAPE: (user assistant )+user$/.test(after.messages.at(-1)?.content ?? ''), after.messages.at(-1)?.content)
+
+      // The model looking back, through the real tool, in a session of its own.
+      await goTo(page, 'Agent')
+      await page.getByTestId('new-conversation').click()
+      await page.waitForTimeout(300)
+      await page.getByTestId('agent-input').fill('[[mock:toolonce]] [[mock:calltool:recall_search]] [[mock:toolargs:{"query":"pelicans"}]] look back')
+      await page.getByTestId('agent-send').click()
+      await idle('agent-input')
+      await page.waitForTimeout(500)
+      const [session] = await page.evaluate(() => window.api.invoke('chat:list', 'agent'))
+      const agent = await page.evaluate((id) => window.api.invoke('chat:load', id), session.id)
+      const recall = agent.messages.find((m) => m.role === 'tool' && m.toolCalls?.[0]?.name === 'recall_search')
+      report.check('quick-compact', 'the agent has the recall tool, and it answers', !!recall && /Nothing has been compacted/.test(recall.content), recall?.content?.slice(0, 160))
     })
   },
 

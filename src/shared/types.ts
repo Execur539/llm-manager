@@ -594,6 +594,8 @@ export interface AgentSessionState {
   title: string
   /** Protected by a password and not unlocked: nothing else here is filled in. */
   locked?: boolean
+  /** Quick compacts in force: the stretches of the conversation sent in a shortened form, and how hard each was shortened (1 to 5). */
+  quick?: { v: 2; segments: { upto: string; level: number }[] } | null
   cwd: string
   planMode: boolean
   messages: AgentMessage[]

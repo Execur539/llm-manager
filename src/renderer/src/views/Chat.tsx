@@ -34,6 +34,7 @@ import CompactingNotice from '../components/CompactingNotice'
 import { SaveStateButton, saveMarks, useSaveCoverage, withSavePoint } from '../components/SaveState'
 import { LockedPanel, ProtectButton } from '../components/Protect'
 import ConfirmDialog from '../components/ConfirmDialog'
+import CompactMenu from '../components/CompactMenu'
 import JumpToLatest from '../components/JumpToLatest'
 import { useStickToBottom } from '../lib/useStickToBottom'
 import EmptyState from '../components/EmptyState'
@@ -295,6 +296,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
             </select>
           )}
           {activeId && (
+            <CompactMenu stateKey={saveKey} disabled={!loaded || locked}>
             <button
               disabled={!loaded || locked}
               onClick={() => {
@@ -318,6 +320,7 @@ export default function ChatView({ loaded }: { loaded: LoadedModel | null }): JS
             >
               Compact
             </button>
+            </CompactMenu>
           )}
           <SaveStateButton stateKey={saveKey} canSave={!!loaded && !sealed && !compacting} allSaved={allSaved} hasMessages={messages.length > 0} />
           <ProtectButton kind="chat" id={activeId} state={activeChat} disabled={busy || !!compacting} />

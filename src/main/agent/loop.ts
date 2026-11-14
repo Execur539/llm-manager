@@ -59,6 +59,9 @@ import { systemTools } from './tools/system'
 import { browserTools } from './tools/browser'
 import { dataTools } from './tools/data'
 import { visionTools } from './tools/vision'
+import { recallTools } from './tools/recall'
+import { costOf, quickView, standing, withPreface } from '../chat/quick-compact'
+import { RECALL_TOOLS } from '../chat/recall'
 import { gitTools } from './tools/git'
 import { workflowTools, resetWaitEscalation } from './tools/workflow'
 import { desktopTools } from './tools/desktop'
@@ -243,6 +246,7 @@ export class Agent extends EventEmitter {
       ...browserTools,
       ...dataTools,
       ...visionTools,
+      ...recallTools,
       ...gitTools,
       ...workflowTools,
       ...desktopTools,
@@ -660,7 +664,15 @@ export class Agent extends EventEmitter {
     const costs = live.map(cost)
     // The instructions and the tool list are sent with every request and no compaction shrinks them.
     const fixed = estimateTokens(messageText(this.history[0] ?? { role: 'system', content: '' })) + estimateTokens(JSON.stringify(this.toolsFor(session)))
-    const before = fixed + (prior ? estimateTokens(prior) : 0) + costs.reduce((a, n) => a + n, 0)
+    /*
+     * Sized as it is sent. Part of it may be quick-compacted, and counting those messages at
+     * their full length reported room freed that had not been in use.
+     */
+    const sentSize = (from: number): number => {
+      const view = quickView(all, session.quick, { skip: from })
+      return view.messages.reduce((n, m) => n + costOf(m, (id) => (view.dropSent.has(id) ? undefined : this.opts.sentTextFor?.(id))), 0)
+    }
+    const before = fixed + (prior ? estimateTokens(prior) : 0) + sentSize(upto + 1)
 
     const windowTokens = loaded.plan.contextLength || 8192
     let cut = keepRecent(costs, keepBudget(windowTokens))
@@ -679,7 +691,13 @@ export class Agent extends EventEmitter {
     let stored = false
     if (!background) this.emit('compacting', { strategy: 'manual', automatic: false })
     try {
-      const inPlace = await this.summariseHere(session.id, opts)
+      /*
+       * Not asked of the conversation itself once part of it has been quick-compacted: what the
+       * server holds of that part is the shortened form, and a summary of that would summarise
+       * one-line notes. The passes below read the messages as they were written.
+       */
+      const shortened = standing(all, session.quick, upto + 1).length > 0
+      const inPlace = shortened ? null : await this.summariseHere(session.id, opts)
       if (opts.signal?.aborted) return { ok: false, message: 'Compaction was stopped.' }
       if (!inPlace && background) return { ok: false, message: 'Nothing was summarised.' }
       const summary =
@@ -701,15 +719,21 @@ export class Agent extends EventEmitter {
       const told = toldFacts(state, new Set(this.liveMessages(session).map((m) => m.id)), this.hasSummary(session))
       chats.setSummary(session.id, summary, boundary)
       const kept = new Set(live.slice(cut).map((m) => m.id))
-      this.savePromptState(session, afterSummary(state, told ?? this.sessionFacts(), kept))
+      const next = afterSummary(state, told ?? this.sessionFacts(), kept)
+      // The whole conversation is read again after this anyway, so a session from before the
+      // recall tools gains them now, when there is at last something to recall.
+      if (!next.tools.some((t) => t.name === 'recall_search')) next.tools = [...next.tools, ...RECALL_TOOLS]
+      this.savePromptState(session, next)
 
       // Rebuilt from what is now stored, so the running history matches what a resume would give.
       session.summary = summary
       session.summaryUpto = boundary
+      // Cleared by the store when the summary now stands in front of it.
+      session.quick = chats.getQuick(session.id)
       this.hydrate(session)
 
       stored = true
-      const after = fixed + estimateTokens(summary) + costs.slice(cut).reduce((a, n) => a + n, 0)
+      const after = fixed + estimateTokens(summary) + sentSize(upto + 1 + cut)
       return {
         ok: true,
         message: `Summarised ${older.length} messages.`,
@@ -880,15 +904,25 @@ export class Agent extends EventEmitter {
     if (this.hasSummary(session)) {
       // What the model had been told about the session stood in the messages the summary replaced.
       const facts = state.summaryFacts ? `${factsBlock(state.summaryFacts)}\n\n` : ''
+      // Said only to a model that has the tools for it, so a session from before them is sent as it always was.
+      const kept = state.tools.some((t) => t.name === 'recall_search')
+        ? '\n\n[The messages this summary stands in for are kept in full: recall_search finds anything in them and recall_read shows it.]'
+        : ''
       summarised.push({
         role: 'user',
-        content: `${facts}[Summary of earlier work in this session]\n${session.summary}`
+        content: `${facts}[Summary of earlier work in this session]\n${session.summary}${kept}`
       })
     }
 
-    const rebuilt = rebuildHistory(rest, {
+    // A quick compact changes how the older messages are sent, never the messages themselves.
+    const all = session.messages.filter((m) => m.role !== 'system')
+    const view = quickView(all, session.quick, {
+      skip: all.length - rest.length,
+      recall: state.tools.some((t) => t.name === 'recall_search')
+    })
+    const rebuilt = rebuildHistory(view.messages, {
       preserveReasoning: !!this.opts.preserveReasoning,
-      sentContentFor: this.opts.sentContentFor
+      sentContentFor: (id) => (view.dropSent.has(id) ? undefined : withPreface(view, id, this.opts.sentContentFor?.(id)))
     })
 
     return [{ role: 'system', content: state.system }, ...summarised, ...rebuilt]

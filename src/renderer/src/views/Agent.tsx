@@ -37,6 +37,7 @@ import ContextMeter from '../components/ContextMeter'
 import CompactingNotice from '../components/CompactingNotice'
 import { SaveStateButton, saveMarks, useSaveCoverage, withSavePoint, type SaveMark } from '../components/SaveState'
 import { LockedPanel, ProtectButton } from '../components/Protect'
+import CompactMenu from '../components/CompactMenu'
 import PendingToolCall from '../components/PendingToolCall'
 import ToolCard from '../components/ToolCard'
 import JumpToLatest from '../components/JumpToLatest'
@@ -544,6 +545,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
             * nothing at all — and either way the button looked identical: no message, no change
             * on screen, and no way to tell success from a silent no-op.
             */}
+          <CompactMenu stateKey={saveKey} disabled={!activeId || busy}>
           <button
             disabled={!activeId || busy}
             onClick={async () => {
@@ -567,6 +569,7 @@ export default function AgentView({ loaded }: { loaded: LoadedModel | null }): J
           >
             Compact
           </button>
+          </CompactMenu>
           <SaveStateButton stateKey={saveKey} canSave={!!loaded && !sealed && !compacting} allSaved={allSaved} hasMessages={messages.length > 0} />
           <ProtectButton kind="chat" id={activeId} state={activeSession} agent disabled={running || !!compacting} />
           {running && (

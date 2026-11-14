@@ -81,6 +81,9 @@ import { summarizer, type SummarizerHandle } from './runtime/summarizer'
 import { chooseHelperPlacement, helperContext, helperVramNeed, keepBudget, keepRecent, type TranscriptItem } from './agent/compaction'
 import { summariseTranscript, COMPACTION_FAILED } from './agent/summarise'
 import { summariseInPlace } from './agent/summarise-in-place'
+import { costOf, planQuick, quickView, standing, withPreface, type QuickPlan } from './chat/quick-compact'
+import { RECALL_TOOLS, isRecallTool, recallRead, recallSearch } from './chat/recall'
+import { setRecallSource, type RecallSource } from './agent/tools/recall'
 import { samplingOptions } from '../shared/sampling'
 import { persistSent, restoreSent, sentContentFor, sentTextFor, sentWithText } from './chat/media-cache'
 import {
@@ -406,6 +409,7 @@ async function letGoOf(id: string): Promise<void> {
   }
   await scratchpad.clearChat(id)
   chatHeldMedia.delete(id)
+  for (const key of [`chat:${id}`, `agent:${id}`]) recallVectors.delete(key)
   scratchpadChanged()
 }
 
@@ -483,7 +487,7 @@ async function saveMidTurn(key: string): Promise<SaveNowResult> {
     const outcome = await llama.saveDuringTurn(key, async ({ resume, reply }) => {
       const covers = {
         messages: stateMarks(key, conversationMessages(key)),
-        summaryUpto: chats.getSummary(id)?.uptoMessageId ?? null,
+        summaryUpto: viewKey(id),
         canTrim: !((loaded.model.arch?.ssmLayers ?? 0) > 0),
         partial: partialMark(key, reply)
       }
@@ -565,7 +569,7 @@ async function saveNow(key: string): Promise<SaveNowResult> {
   const messages = conversationMessages(key)
   const covers = {
     messages: stateMarks(key, messages),
-    summaryUpto: chats.getSummary(id)?.uptoMessageId ?? null,
+    summaryUpto: viewKey(id),
     canTrim: !((loaded.model.arch?.ssmLayers ?? 0) > 0)
   }
   try {
@@ -1255,7 +1259,81 @@ function chatToolsFor(chatId: string, history: AgentMessage[], adding = false): 
     adding ||
     scratchpad.list(chatId).length > 0 ||
     history.some((m) => m.role === 'tool' || m.attachments?.some((a) => a.kind === 'video'))
-  return used ? CHAT_TOOLS : undefined
+  // Once part of the conversation is no longer sent in full, the model can look back into it.
+  // A quick compact whose stretches were all rewound away has left nothing to look back into.
+  const compacted = !!chats.getSummary(chatId) || standing(history, chats.getQuick(chatId)).length > 0
+  const tools = [...(used ? CHAT_TOOLS : []), ...(compacted ? RECALL_TOOLS : [])]
+  return tools.length ? tools : undefined
+}
+
+/** Vectors worked out for search by meaning, by conversation: in memory only, gone with the app. */
+const recallVectors = new Map<string, Map<string, Float32Array[]>>()
+
+/** What the recall tools search for a conversation: its transcript, and where the part still sent in full begins. */
+function recallSourceFor(key: string): RecallSource {
+  const id = key.slice(key.indexOf(':') + 1)
+  const messages = conversationMessages(key).filter((m) => m.role !== 'system')
+  const summary = chats.getSummary(id)
+  const skip = summary ? messages.findIndex((m) => m.id === summary.uptoMessageId) + 1 : 0
+  const stretches = standing(messages, chats.getQuick(id), skip)
+  let vectors = recallVectors.get(key)
+  if (!vectors) {
+    vectors = new Map()
+    recallVectors.set(key, vectors)
+  }
+  const caps = llama.loaded?.model.caps
+  return {
+    messages,
+    visibleFrom: stretches.length ? stretches[stretches.length - 1].end + 1 : skip,
+    sentText: (mid) => sentTextFor(mid),
+    sentParts: (mid) => {
+      const sent = sentContentFor(mid, caps)
+      return Array.isArray(sent) ? sent : undefined
+    },
+    embed: async (texts) => rag.embeddings.embed(texts, (await getHardware()).backend),
+    vectors
+  }
+}
+setRecallSource((sessionId) => recallSourceFor(`agent:${sessionId}`))
+
+async function runRecall(key: string, name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<ToolOutput> {
+  const from = recallSourceFor(key)
+  return name === 'recall_search' ? recallSearch(from.messages, args, { ...from, signal }) : recallRead(from.messages, args, from)
+}
+
+/** What stands in for the summary and any quick compact when judging whether a save still fits. */
+function viewKey(id: string): string | null {
+  const summary = chats.getSummary(id)?.uptoMessageId ?? null
+  const quick = chats.getQuick(id)
+  return quick ? `${summary ?? ''}|${JSON.stringify(quick.segments)}` : summary
+}
+
+/** What a quick compact of a conversation would do, without doing it. */
+async function quickPlanFor(key: string): Promise<QuickPlan | { ok: false; message: string }> {
+  const loaded = llama.loaded
+  if (!loaded) return { ok: false, message: 'Load a model first: how much to keep depends on its context window.' }
+  if (!/^(chat|agent):[\w-]+$/.test(key)) return { ok: false, message: 'Open a conversation first.' }
+  const id = key.slice(key.indexOf(':') + 1)
+  if (chats.chatLocked(id)) return { ok: false, message: 'It is locked.' }
+  const all = conversationMessages(key).filter((m) => m.role !== 'system')
+  const summary = chats.getSummary(id)
+  const upto = summary ? all.findIndex((m) => m.id === summary.uptoMessageId) : -1
+  await restoreConversationMedia(id, all)
+  let fixed = upto === -1 ? 0 : estimateTokens(summary?.summary ?? '')
+  if (key.startsWith('agent:')) {
+    const session = chats.loadSession(id)
+    if (!session) return { ok: false, message: 'Open a conversation first.' }
+    const a = getAgent()
+    fixed += estimateTokens(String(a.buildHistory({ ...session, messages: [] })[0]?.content ?? '')) + estimateTokens(JSON.stringify(a.toolsFor(session)))
+  } else {
+    fixed += estimateTokens(String(loadSettings().generation.systemPrompt ?? '')) + estimateTokens(JSON.stringify(chatToolsFor(id, all) ?? []))
+  }
+  return planQuick(all, loaded.plan.contextLength || 8192, fixed, {
+    skip: upto + 1,
+    recall: !!loaded.model.caps.tools,
+    sentText: (mid) => sentTextFor(mid),
+    previous: chats.getQuick(id)
+  })
 }
 
 /** How many rounds of tool calls one chat turn may make before it is made to answer. */
@@ -1269,12 +1347,18 @@ function chatPromptHistory(chatId: string, history: AgentMessage[], preserveReas
    * back as tool use: the calls on the reply that made them, each result after, and any frames it
    * returned after that, the shape the turn first had. The transcript has only the text.
    */
-  const out = rebuildHistory(upto === -1 ? history : history.slice(upto + 1), {
+  // A quick compact changes how the older messages are sent, never the messages themselves.
+  const canRecall = !!llama.loaded?.model.caps.tools
+  const view = quickView(history, chats.getQuick(chatId), { skip: upto + 1, recall: canRecall })
+  const sent = chatSentContent(chatId, history)
+  const out = rebuildHistory(view.messages, {
     preserveReasoning,
-    sentContentFor: chatSentContent(chatId, history)
+    sentContentFor: (id) => (view.dropSent.has(id) ? undefined : withPreface(view, id, sent(id)))
   })
   if (stored && upto !== -1) {
-    const note = `[Summary of the earlier conversation]\n${stored.summary}`
+    const note =
+      `[Summary of the earlier conversation]\n${stored.summary}` +
+      (canRecall ? '\n\n[The messages this summary stands in for are kept in full: recall_search finds anything in them and recall_read shows it.]' : '')
     const first = out[0]
     if (first?.role === 'user' && typeof first.content === 'string') {
       out[0] = { ...first, content: `${note}\n\n[The conversation continues]\n${first.content}` }
@@ -1339,7 +1423,12 @@ async function compactChat(
       estimateTokens(sentTextFor(m.id) ?? m.content) +
       (opts.preserveReasoning && m.role === 'assistant' ? estimateTokens(m.reasoning ?? '') : 0)
   )
-  const before = (summary ? estimateTokens(summary.summary) : 0) + costs.reduce((a, n) => a + n, 0)
+  // Sized as it is sent: part of it may be quick-compacted, and is then far smaller than its messages.
+  const sentSize = (from: number): number => {
+    const view = quickView(history, chats.getQuick(chatId), { skip: from })
+    return view.messages.reduce((n, m) => n + costOf(m, (id) => (view.dropSent.has(id) ? undefined : sentTextFor(id))), 0)
+  }
+  const before = (summary ? estimateTokens(summary.summary) : 0) + sentSize(upto + 1)
   const windowTokens = loaded.plan.contextLength || 8192
 
   let cut = keepRecent(costs, keepBudget(windowTokens))
@@ -1371,7 +1460,10 @@ async function compactChat(
      * The server is holding it, so the summary costs no reading; handing the transcript over as
      * text in a new prompt makes the model read the older half again before it writes anything.
      */
-    const inPlace = await summariseInPlace({
+    // Not asked of the conversation itself once part of it is quick-compacted: the server holds
+    // that part shortened, and a summary of one-line notes is no summary. The passes read the originals.
+    const shortened = standing(history, chats.getQuick(chatId), upto + 1).length > 0
+    const inPlace = shortened ? null : await summariseInPlace({
       kind: 'chat',
       messages,
       ...(tools ? { tools } : {}),
@@ -1397,7 +1489,7 @@ async function compactChat(
     }
     boundary = older[older.length - 1].id
     chats.setSummary(chatId, text, boundary)
-    const after = estimateTokens(text) + costs.slice(cut).reduce((a, n) => a + n, 0)
+    const after = estimateTokens(text) + sentSize(upto + 1 + cut)
     // An estimate until the next turn measures it, and far closer than the figure it replaces.
     chats.setContextUsed(chatId, after)
     emit('chat:context', { chatId, used: after, max: windowTokens })
@@ -2384,6 +2476,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     // And whatever its scratchpad still held, with the frames its model was shown.
     await scratchpad.clearChat(id)
     chatHeldMedia.delete(id)
+    for (const key of [`chat:${id}`, `agent:${id}`]) recallVectors.delete(key)
     scratchpadChanged()
     return true
   },
@@ -2852,7 +2945,9 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
           try {
             out = call.invalid
               ? `The arguments for ${call.name} were not valid JSON, so it was not run: ${call.invalid}. Call it again with well-formed arguments.`
-              : await runChatTool(call.name, call.args, {
+              : isRecallTool(call.name)
+                ? await runRecall(`chat:${chatId}`, call.name, call.args, abort.signal)
+                : await runChatTool(call.name, call.args, {
                   chatId,
                   pad: scratchpad,
                   urlFor: (id) => scratchServer.urlFor(id),
@@ -3214,6 +3309,42 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
       reasoning: lastEffort.get(`chat:${chatId}`) ?? null
     })
   },
+  /** What a quick compact would do to a conversation: sizes before and after, and how. Changes nothing. */
+  'compact:preview': (key: string) => quickPlanFor(String(key ?? '')),
+  /**
+   * Quick compact: the older part of the conversation is sent in a much shorter form from now on,
+   * worked out by rules with no model involved (see chat/quick-compact). Nothing is removed from the
+   * transcript, and the recall tools reach everything it leaves out.
+   */
+  'compact:quick': async (key: string, level?: number) => {
+    const k = String(key ?? '')
+    if (agentTurnAbort || inFlightChats.size > 0) {
+      return { ok: false, message: 'A reply is still being written — stop it or let it finish first.' }
+    }
+    await llama.preemptIdle()
+    const plan = await quickPlanFor(k)
+    if (!plan.ok || !('options' in plan)) return plan
+    const chosen = plan.options.find((o) => o.level === Number(level)) ?? plan.options.find((o) => o.level === plan.recommended)
+    if (!chosen) return { ok: false, message: 'There is no such strength.' }
+    const id = k.slice(k.indexOf(':') + 1)
+    chats.setQuick(id, chosen.spec)
+    const done = { ok: true, message: chosen.name, beforeTokens: plan.beforeTokens, afterTokens: chosen.afterTokens }
+    const max = llama.loaded?.plan.contextLength ?? 0
+    if (k.startsWith('agent:')) {
+      // The instructions and tool list are taken afresh at the next message: the tools now include
+      // recall, and what the model had been told about the session stood in messages now shortened.
+      getAgent().refreshPrompt(id)
+      if (max > 0) emit('agent:context', { sessionId: id, used: done.afterTokens, max })
+      setContextUsed(done.afterTokens)
+    } else if (max > 0) {
+      emit('chat:context', { chatId: id, used: done.afterTokens, max })
+    }
+    chats.setContextUsed(id, done.afterTokens)
+    // What was saved of it held the conversation as it was sent before; the edges say so.
+    emit('state:removed', { key: k })
+    logger.info('compaction', `quick compact of ${k}`, { level: chosen.level, before: plan.beforeTokens, after: done.afterTokens })
+    return done
+  },
   'agent:stop': () => {
     agentTurnAbort?.abort()
     agent?.stop()
@@ -3320,7 +3451,7 @@ export const handlers: Record<string, (...args: never[]) => unknown> = {
     if (store && meta.fingerprint !== store.fingerprint) return { through: null, otherModel: true, tokens: meta.tokens, savedAt: meta.savedAt }
     const messages = conversationMessages(k)
     const id = k.slice(k.indexOf(':') + 1)
-    const { count, dropped } = coverage(meta, stateMarks(k, messages), chats.getSummary(id)?.uptoMessageId ?? null)
+    const { count, dropped } = coverage(meta, stateMarks(k, messages), viewKey(id))
     let gone = dropped
     /*
      * Saved part way through a reply: the reply is the message after the last one covered. Still

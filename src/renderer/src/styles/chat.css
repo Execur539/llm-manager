@@ -1547,3 +1547,189 @@ h6.md-heading {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+
+/* ---------------------------------------------------------------- compact, and its quick form */
+
+/*
+ * Quick compact is a second card stacked under the Compact button. At rest its lower edge shows
+ * beneath the button, which is what says there is something more here; hovering or focusing the
+ * button slides it down into reach.
+ */
+.compact-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.compact-menu > button {
+  position: relative;
+  z-index: 2;
+}
+
+.compact-drop {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  /* The size of the button above it while it is only a shape; its own button's size once down. */
+  min-height: 100%;
+  background: var(--surface-3);
+  min-width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  border-radius: var(--r-md);
+  opacity: 0.75;
+  pointer-events: none;
+  transform: translateY(5px) scale(0.92);
+  transform-origin: 50% 100%;
+  transition:
+    transform var(--dur) var(--ease),
+    opacity var(--dur) var(--ease),
+    max-width var(--dur) var(--ease);
+}
+
+/* Covers the gap between the two once it is down, so crossing it does not close it. */
+.compact-drop::before {
+  content: '';
+  position: absolute;
+  top: -8px;
+  right: 0;
+  left: 0;
+  height: 8px;
+}
+
+/*
+ * The pair as a whole rises above the page while the card is down; within the pair the card stays
+ * under Compact. Raising the card itself put it over Compact as it slid past, where it took the
+ * click meant for Compact.
+ */
+.compact-menu.down {
+  z-index: 30;
+}
+
+.compact-menu.down .compact-drop {
+  max-width: 240px;
+  overflow: visible;
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(calc(100% + 5px)) scale(1);
+}
+
+.compact-drop button {
+  width: 100%;
+  white-space: nowrap;
+  background: var(--surface-3);
+  box-shadow: var(--shadow-lg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .compact-drop {
+    transition: none;
+  }
+}
+
+/*
+ * A disabled button is normally see-through, which let the card tucked behind Compact show through
+ * it, label and all. Here it stays solid and only its label dims; and the tucked card's own label
+ * is not drawn until it has come down.
+ */
+.compact-menu > button:disabled {
+  opacity: 1;
+  color: var(--text-faint);
+}
+
+.compact-drop button,
+.compact-drop button:disabled {
+  color: transparent;
+  opacity: 1;
+  transition: color var(--dur) var(--ease);
+}
+
+.compact-menu.down .compact-drop button {
+  color: var(--text);
+}
+
+.compact-menu.down .compact-drop button:disabled {
+  color: var(--text-faint);
+}
+
+/* The strengths of a quick compact, each with the size it would leave. */
+.quick-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 12px 0;
+}
+
+.quick-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  cursor: pointer;
+}
+
+.quick-option:hover {
+  background: var(--surface-1);
+}
+
+.quick-option.chosen {
+  background: var(--surface-2);
+}
+
+.quick-option input {
+  margin-top: 3px;
+}
+
+.quick-option-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: var(--fs-sm);
+}
+
+.quick-option-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.quick-option-size {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/*
+ * Where nothing can be hovered (a phone over remote access), the second card is simply shown
+ * beside Compact: tapping Compact to reveal it would start the slow compaction.
+ */
+@media (hover: none) {
+  .compact-menu {
+    gap: 6px;
+  }
+
+  .compact-drop,
+  .compact-menu.down .compact-drop {
+    position: static;
+    max-width: none;
+    overflow: visible;
+    opacity: 1;
+    pointer-events: auto;
+    transform: none;
+  }
+
+  .compact-drop button,
+  .compact-drop button:disabled {
+    color: inherit;
+    box-shadow: none;
+  }
+
+  .compact-drop::before {
+    display: none;
+  }
+}
